@@ -66,7 +66,7 @@ func TestE2E_FullPipeline(t *testing.T) {
 	// --- Initialize components ---
 	authenticator := auth.NewAuthenticator(users, logger)
 	trafficLogger := traffic.NewTrafficLogger(users, store, logger)
-	routerEngine := router.NewRouter(logger)
+	routerEngine := router.NewRouter(users, logger)
 	outboundFactory := router.NewOutboundFactory(nodes, logger)
 	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
 	eventLogger := event.NewEventLogger(routingOutbound, logger)
@@ -190,7 +190,11 @@ func TestE2E_MultiUserRouting(t *testing.T) {
 
 	nodes := map[string]config.NodeConfig{}
 
-	routerEngine := router.NewRouter(logger)
+	multiUsers := map[string]config.UserConfig{
+		"alice": {Password: "p", Routes: []string{"direct"}},
+		"bob":   {Password: "p", Routes: []string{"direct"}},
+	}
+	routerEngine := router.NewRouter(multiUsers, logger)
 	outboundFactory := router.NewOutboundFactory(nodes, logger)
 	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
 	eventLogger := event.NewEventLogger(routingOutbound, logger)

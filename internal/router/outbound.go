@@ -190,19 +190,19 @@ func (ro *RoutingOutbound) TCP(reqAddr string) (net.Conn, error) {
 
 	ob, err := ro.GetOutboundForID(id)
 	if err != nil {
-		ro.logger.Error("failed to get outbound for user",
-			zap.String("id", id),
-			zap.String("reqAddr", reqAddr),
-			zap.Error(err),
-		)
-		return ro.defaultOutbound.TCP(reqAddr)
+		return ro.fallbackTCP(id, reqAddr, err)
 	}
 
 	ro.logger.Debug("routing TCP request",
 		zap.String("id", id),
 		zap.String("reqAddr", reqAddr),
 	)
-	return ob.TCP(reqAddr)
+
+	conn, err := ob.TCP(reqAddr)
+	if err != nil {
+		return ro.fallbackTCP(id, reqAddr, err)
+	}
+	return conn, nil
 }
 
 // UDP implements server.Outbound.
@@ -217,19 +217,71 @@ func (ro *RoutingOutbound) UDP(reqAddr string) (hyServer.UDPConn, error) {
 
 	ob, err := ro.GetOutboundForID(id)
 	if err != nil {
-		ro.logger.Error("failed to get outbound for user",
-			zap.String("id", id),
-			zap.String("reqAddr", reqAddr),
-			zap.Error(err),
-		)
-		return ro.defaultOutbound.UDP(reqAddr)
+		return ro.fallbackUDP(id, reqAddr, err)
 	}
 
 	ro.logger.Debug("routing UDP request",
 		zap.String("id", id),
 		zap.String("reqAddr", reqAddr),
 	)
-	return ob.UDP(reqAddr)
+
+	conn, err := ob.UDP(reqAddr)
+	if err != nil {
+		return ro.fallbackUDP(id, reqAddr, err)
+	}
+	return conn, nil
+}
+
+// fallbackTCP attempts the fallback route for a failed TCP request.
+func (ro *RoutingOutbound) fallbackTCP(id, reqAddr string, originalErr error) (net.Conn, error) {
+	fb := ro.router.GetFallback(id)
+	if fb == "reject" {
+		ro.logger.Error("outbound failed, no fallback configured",
+			zap.String("id", id),
+			zap.String("reqAddr", reqAddr),
+			zap.Error(originalErr),
+		)
+		return nil, originalErr
+	}
+
+	ro.logger.Warn("outbound failed, using fallback",
+		zap.String("id", id),
+		zap.String("reqAddr", reqAddr),
+		zap.String("fallback", fb),
+		zap.Error(originalErr),
+	)
+
+	fbOb, err := ro.factory.Get(fb)
+	if err != nil {
+		return nil, fmt.Errorf("fallback %q also failed: %w (original: %v)", fb, err, originalErr)
+	}
+	return fbOb.TCP(reqAddr)
+}
+
+// fallbackUDP attempts the fallback route for a failed UDP request.
+func (ro *RoutingOutbound) fallbackUDP(id, reqAddr string, originalErr error) (hyServer.UDPConn, error) {
+	fb := ro.router.GetFallback(id)
+	if fb == "reject" {
+		ro.logger.Error("outbound failed, no fallback configured",
+			zap.String("id", id),
+			zap.String("reqAddr", reqAddr),
+			zap.Error(originalErr),
+		)
+		return nil, originalErr
+	}
+
+	ro.logger.Warn("outbound failed, using fallback",
+		zap.String("id", id),
+		zap.String("reqAddr", reqAddr),
+		zap.String("fallback", fb),
+		zap.Error(originalErr),
+	)
+
+	fbOb, err := ro.factory.Get(fb)
+	if err != nil {
+		return nil, fmt.Errorf("fallback %q also failed: %w (original: %v)", fb, err, originalErr)
+	}
+	return fbOb.UDP(reqAddr)
 }
 
 // requestCtx maps a request key to id ("username:node_name").

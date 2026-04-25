@@ -123,7 +123,9 @@ func TestRoutingOutbound_UserContext(t *testing.T) {
 	logger := zap.NewNop()
 	nodes := map[string]config.NodeConfig{}
 
-	r := NewRouter(logger)
+	r := NewRouter(map[string]config.UserConfig{
+		"alice": {Password: "p", Routes: []string{"direct"}},
+	}, logger)
 	f := NewOutboundFactory(nodes, logger)
 	ro := NewRoutingOutbound(r, f, logger)
 

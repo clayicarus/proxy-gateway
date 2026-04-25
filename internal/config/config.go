@@ -92,6 +92,9 @@ type UserConfig struct {
 	// Routes is the list of outbound node names this user can access.
 	// "direct" is a special value meaning direct connection.
 	Routes []string `yaml:"routes"`
+	// Fallback is the outbound to use when the primary route is unavailable.
+	// Can be "direct", another node name, or "reject" (default) to return error.
+	Fallback string `yaml:"fallback,omitempty"`
 	// MaxBytes is the maximum total traffic (tx+rx) in bytes across all nodes. 0 means unlimited.
 	MaxBytes uint64 `yaml:"maxBytes,omitempty"`
 	// SpeedLimit in bytes per second. 0 means unlimited.
@@ -206,6 +209,12 @@ func (c *Config) validate() error {
 				if _, ok := c.Nodes[route]; !ok {
 					return fmt.Errorf("user %q references unknown node %q", name, route)
 				}
+			}
+		}
+		// Validate fallback reference
+		if user.Fallback != "" && user.Fallback != "reject" && user.Fallback != "direct" {
+			if _, ok := c.Nodes[user.Fallback]; !ok {
+				return fmt.Errorf("user %q fallback references unknown node %q", name, user.Fallback)
 			}
 		}
 	}
