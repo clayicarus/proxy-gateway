@@ -121,18 +121,16 @@ func TestOutboundFactory_Unknown(t *testing.T) {
 
 func TestRoutingOutbound_UserContext(t *testing.T) {
 	logger := zap.NewNop()
-	users := map[string]config.UserConfig{
-		"alice": {Password: "p", Route: "direct"},
-	}
 	nodes := map[string]config.NodeConfig{}
 
-	r := NewRouter(users, logger)
+	r := NewRouter(logger)
 	f := NewOutboundFactory(nodes, logger)
 	ro := NewRoutingOutbound(r, f, logger)
 
 	addr := &net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 12345}
 
-	ro.SetUserContext(addr, "alice")
+	// ID is now "username:node_name"
+	ro.SetUserContext(addr, "alice:direct")
 
 	// Create a local listener for the test
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -149,7 +147,7 @@ func TestRoutingOutbound_UserContext(t *testing.T) {
 	}()
 
 	// Set request context (simulating EventLogger.TCPRequest)
-	SetRequestContext(addr, "alice", ln.Addr().String())
+	SetRequestContext(addr, "alice:direct", ln.Addr().String())
 
 	conn, err := ro.TCP(ln.Addr().String())
 	if err != nil {

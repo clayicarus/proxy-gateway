@@ -92,14 +92,14 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 
 	// --- 3. Initialize gateway components ---
 	users := map[string]config.UserConfig{
-		"alice": {Password: "pass123", Route: "direct", MaxBytes: 10000000},
-		"bob":   {Password: "secret", Route: "direct"},
+		"alice": {Password: "pass123", Routes: []string{"direct"}, MaxBytes: 10000000},
+		"bob":   {Password: "secret", Routes: []string{"direct"}},
 	}
 	nodes := map[string]config.NodeConfig{}
 
 	authenticator := auth.NewAuthenticator(users, logger)
 	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
-	routerEngine := router.NewRouter(users, logger)
+	routerEngine := router.NewRouter(logger)
 	outboundFactory := router.NewOutboundFactory(nodes, logger)
 	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
 	eventLogger := event.NewEventLogger(routingOutbound, logger)
@@ -136,11 +136,12 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// --- 5. Connect with Hysteria2 client (alice) ---
+	// Auth format: username:node_name:password
 	t.Run("alice_auth_and_proxy", func(t *testing.T) {
 		sAddr, _ := net.ResolveUDPAddr("udp", serverAddr)
 		client, info, err := hyClient.NewClient(&hyClient.Config{
 			ServerAddr: sAddr,
-			Auth:       "alice:pass123",
+			Auth:       "alice:direct:pass123",
 			TLSConfig: hyClient.TLSConfig{
 				ServerName:         "localhost",
 				InsecureSkipVerify: true,
@@ -188,7 +189,7 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 		sAddr, _ := net.ResolveUDPAddr("udp", serverAddr)
 		_, _, err := hyClient.NewClient(&hyClient.Config{
 			ServerAddr: sAddr,
-			Auth:       "alice:wrongpass",
+			Auth:       "alice:direct:wrongpass",
 			TLSConfig: hyClient.TLSConfig{
 				ServerName:         "localhost",
 				InsecureSkipVerify: true,
@@ -206,7 +207,7 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 		sAddr, _ := net.ResolveUDPAddr("udp", serverAddr)
 		client, _, err := hyClient.NewClient(&hyClient.Config{
 			ServerAddr: sAddr,
-			Auth:       "bob:secret",
+			Auth:       "bob:direct:secret",
 			TLSConfig: hyClient.TLSConfig{
 				ServerName:         "localhost",
 				InsecureSkipVerify: true,
@@ -249,24 +250,25 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 		// Give a moment for traffic to be logged
 		time.Sleep(200 * time.Millisecond)
 
-		aliceSnap := trafficLogger.GetSnapshot("alice")
+		// Traffic is now tracked per (user, node)
+		aliceSnap := trafficLogger.GetSnapshot("alice:direct")
 		if aliceSnap == nil {
-			t.Fatal("expected traffic snapshot for alice")
+			t.Fatal("expected traffic snapshot for alice:direct")
 		}
-		t.Logf("alice traffic: tx=%d rx=%d", aliceSnap.TxBytes, aliceSnap.RxBytes)
+		t.Logf("alice:direct traffic: tx=%d rx=%d", aliceSnap.TxBytes, aliceSnap.RxBytes)
 
 		if aliceSnap.TxBytes == 0 && aliceSnap.RxBytes == 0 {
-			t.Error("expected non-zero traffic for alice")
+			t.Error("expected non-zero traffic for alice:direct")
 		}
 
-		bobSnap := trafficLogger.GetSnapshot("bob")
+		bobSnap := trafficLogger.GetSnapshot("bob:direct")
 		if bobSnap == nil {
-			t.Fatal("expected traffic snapshot for bob")
+			t.Fatal("expected traffic snapshot for bob:direct")
 		}
-		t.Logf("bob traffic: tx=%d rx=%d", bobSnap.TxBytes, bobSnap.RxBytes)
+		t.Logf("bob:direct traffic: tx=%d rx=%d", bobSnap.TxBytes, bobSnap.RxBytes)
 
 		if bobSnap.TxBytes == 0 && bobSnap.RxBytes == 0 {
-			t.Error("expected non-zero traffic for bob")
+			t.Error("expected non-zero traffic for bob:direct")
 		}
 	})
 }
@@ -281,13 +283,13 @@ func TestHy2E2E_UnknownUser(t *testing.T) {
 	}
 
 	users := map[string]config.UserConfig{
-		"alice": {Password: "pass123", Route: "direct"},
+		"alice": {Password: "pass123", Routes: []string{"direct"}},
 	}
 	nodes := map[string]config.NodeConfig{}
 
 	authenticator := auth.NewAuthenticator(users, logger)
 	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
-	routerEngine := router.NewRouter(users, logger)
+	routerEngine := router.NewRouter(logger)
 	outboundFactory := router.NewOutboundFactory(nodes, logger)
 	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
 	eventLogger := event.NewEventLogger(routingOutbound, logger)
@@ -321,7 +323,7 @@ func TestHy2E2E_UnknownUser(t *testing.T) {
 
 	_, _, err = hyClient.NewClient(&hyClient.Config{
 		ServerAddr: sAddr,
-		Auth:       "unknown:whatever",
+		Auth:       "unknown:direct:whatever",
 		TLSConfig: hyClient.TLSConfig{
 			ServerName:         "localhost",
 			InsecureSkipVerify: true,

@@ -34,25 +34,31 @@ tls:
 
 # ============================================================
 # 用户配置
-# 每个用户有独立的密码、路由策略和流量配额
-# 客户端 auth 字段格式: "username:password"
+# 每个用户有独立的密码、可用节点列表和流量配额
+# 客户端 auth 字段格式: "username:node_name:password"
+# 例如: "alice:node_tokyo:alice_secure_pass_123"
 # ============================================================
 users:
   alice:
     password: "alice_secure_pass_123"
-    route: "node_tokyo"          # 路由到东京节点
-    maxBytes: 107374182400       # 100GB 流量限制
-    speedLimit: 52428800         # 50MB/s 速度限制
+    routes:                          # 可用节点列表
+      - node_tokyo
+      - node_sg
+      - direct
+    maxBytes: 107374182400           # 100GB 流量限制（所有节点合计）
+    speedLimit: 52428800             # 50MB/s 速度限制
 
   bob:
     password: "bob_secure_pass_456"
-    route: "direct"              # 直连出站
-    maxBytes: 0                  # 不限流量
+    routes:
+      - direct                       # 仅直连
+    maxBytes: 0                      # 不限流量
 
   charlie:
     password: "charlie_pass_789"
-    route: "node_sg"             # 路由到新加坡节点
-    maxBytes: 53687091200        # 50GB 流量限制
+    routes:
+      - node_sg                      # 仅新加坡节点
+    maxBytes: 53687091200            # 50GB 流量限制
 
 # ============================================================
 # 出站节点配置
@@ -92,3 +98,16 @@ api:
 
 # 流量统计刷新间隔
 trafficFlushInterval: 10s
+
+# ============================================================
+# 订阅配置（用于生成 Clash.Meta 客户端配置）
+# ============================================================
+sub:
+  # 用于生成用户 token 的密钥（留空则复用 api.secret）
+  # secret: "your_sub_secret"
+  # 客户端连接的公网地址（必填）
+  serverAddr: "your.domain.com:8443"
+  # SNI（可选，默认使用 serverAddr 的 host 部分）
+  # sni: "your.domain.com"
+  # 自签证书时设为 true
+  # insecure: false

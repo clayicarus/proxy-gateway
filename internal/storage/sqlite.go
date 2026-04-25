@@ -13,6 +13,7 @@ import (
 // TrafficRecord represents a single traffic record for persistence.
 type TrafficRecord struct {
 	UserID    string
+	NodeID    string
 	TxBytes   uint64
 	RxBytes   uint64
 	Timestamp time.Time
@@ -47,19 +48,22 @@ func (s *SQLiteStore) migrate() error {
 	CREATE TABLE IF NOT EXISTS traffic_logs (
 		id         INTEGER PRIMARY KEY AUTOINCREMENT,
 		user_id    TEXT    NOT NULL,
+		node_id    TEXT    NOT NULL DEFAULT '',
 		tx_bytes   INTEGER NOT NULL DEFAULT 0,
 		rx_bytes   INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME NOT NULL DEFAULT (datetime('now'))
 	);
 
-	CREATE INDEX IF NOT EXISTS idx_traffic_logs_user_id ON traffic_logs(user_id);
+	CREATE INDEX IF NOT EXISTS idx_traffic_logs_user_node ON traffic_logs(user_id, node_id);
 	CREATE INDEX IF NOT EXISTS idx_traffic_logs_created_at ON traffic_logs(created_at);
 
 	CREATE TABLE IF NOT EXISTS traffic_summary (
-		user_id    TEXT PRIMARY KEY,
+		user_id    TEXT NOT NULL,
+		node_id    TEXT NOT NULL DEFAULT '',
 		tx_total   INTEGER NOT NULL DEFAULT 0,
 		rx_total   INTEGER NOT NULL DEFAULT 0,
-		updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		updated_at DATETIME NOT NULL DEFAULT (datetime('now')),
+		PRIMARY KEY (user_id, node_id)
 	);
 	`
 	_, err := s.db.Exec(schema)
@@ -79,8 +83,8 @@ func (s *SQLiteStore) FlushTraffic(records []TrafficRecord) error {
 	defer tx.Rollback()
 
 	insertLog, err := tx.Prepare(`
-		INSERT INTO traffic_logs (user_id, tx_bytes, rx_bytes, created_at)
-		VALUES (?, ?, ?, ?)
+		INSERT INTO traffic_logs (user_id, node_id, tx_bytes, rx_bytes, created_at)
+		VALUES (?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare insert log: %w", err)
@@ -88,9 +92,9 @@ func (s *SQLiteStore) FlushTraffic(records []TrafficRecord) error {
 	defer insertLog.Close()
 
 	upsertSummary, err := tx.Prepare(`
-		INSERT INTO traffic_summary (user_id, tx_total, rx_total, updated_at)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT(user_id) DO UPDATE SET
+		INSERT INTO traffic_summary (user_id, node_id, tx_total, rx_total, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(user_id, node_id) DO UPDATE SET
 			tx_total = tx_total + excluded.tx_total,
 			rx_total = rx_total + excluded.rx_total,
 			updated_at = excluded.updated_at
@@ -109,20 +113,23 @@ func (s *SQLiteStore) FlushTraffic(records []TrafficRecord) error {
 		if ts.IsZero() {
 			ts = now
 		}
-		if _, err := insertLog.Exec(r.UserID, r.TxBytes, r.RxBytes, ts); err != nil {
-			return fmt.Errorf("insert log for %s: %w", r.UserID, err)
+		if _, err := insertLog.Exec(r.UserID, r.NodeID, r.TxBytes, r.RxBytes, ts); err != nil {
+			return fmt.Errorf("insert log for %s/%s: %w", r.UserID, r.NodeID, err)
 		}
-		if _, err := upsertSummary.Exec(r.UserID, r.TxBytes, r.RxBytes, ts); err != nil {
-			return fmt.Errorf("upsert summary for %s: %w", r.UserID, err)
+		if _, err := upsertSummary.Exec(r.UserID, r.NodeID, r.TxBytes, r.RxBytes, ts); err != nil {
+			return fmt.Errorf("upsert summary for %s/%s: %w", r.UserID, r.NodeID, err)
 		}
 	}
 
 	return tx.Commit()
 }
 
-// GetSummary returns the cumulative traffic for a user.
-func (s *SQLiteStore) GetSummary(userID string) (txTotal, rxTotal uint64, err error) {
-	row := s.db.QueryRow(`SELECT tx_total, rx_total FROM traffic_summary WHERE user_id = ?`, userID)
+// GetSummary returns the cumulative traffic for a (user, node) pair.
+func (s *SQLiteStore) GetSummary(userID, nodeID string) (txTotal, rxTotal uint64, err error) {
+	row := s.db.QueryRow(
+		`SELECT tx_total, rx_total FROM traffic_summary WHERE user_id = ? AND node_id = ?`,
+		userID, nodeID,
+	)
 	err = row.Scan(&txTotal, &rxTotal)
 	if err == sql.ErrNoRows {
 		return 0, 0, nil
@@ -130,9 +137,12 @@ func (s *SQLiteStore) GetSummary(userID string) (txTotal, rxTotal uint64, err er
 	return
 }
 
-// GetAllSummaries returns cumulative traffic for all users.
-func (s *SQLiteStore) GetAllSummaries() (map[string][2]uint64, error) {
-	rows, err := s.db.Query(`SELECT user_id, tx_total, rx_total FROM traffic_summary`)
+// GetUserSummaries returns cumulative traffic for all nodes of a given user.
+func (s *SQLiteStore) GetUserSummaries(userID string) (map[string][2]uint64, error) {
+	rows, err := s.db.Query(
+		`SELECT node_id, tx_total, rx_total FROM traffic_summary WHERE user_id = ?`,
+		userID,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -140,19 +150,46 @@ func (s *SQLiteStore) GetAllSummaries() (map[string][2]uint64, error) {
 
 	result := make(map[string][2]uint64)
 	for rows.Next() {
-		var userID string
+		var nodeID string
 		var tx, rx uint64
-		if err := rows.Scan(&userID, &tx, &rx); err != nil {
+		if err := rows.Scan(&nodeID, &tx, &rx); err != nil {
 			return nil, err
 		}
-		result[userID] = [2]uint64{tx, rx}
+		result[nodeID] = [2]uint64{tx, rx}
 	}
 	return result, rows.Err()
 }
 
-// LoadSummaryForUser loads persisted totals so the in-memory counter can resume.
-func (s *SQLiteStore) LoadSummaryForUser(userID string) (tx, rx uint64, err error) {
-	return s.GetSummary(userID)
+// GetAllSummaries returns cumulative traffic for all (user, node) pairs.
+func (s *SQLiteStore) GetAllSummaries() ([]TrafficSummaryRow, error) {
+	rows, err := s.db.Query(`SELECT user_id, node_id, tx_total, rx_total FROM traffic_summary`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []TrafficSummaryRow
+	for rows.Next() {
+		var row TrafficSummaryRow
+		if err := rows.Scan(&row.UserID, &row.NodeID, &row.TxTotal, &row.RxTotal); err != nil {
+			return nil, err
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
+// TrafficSummaryRow represents a row from the traffic_summary table.
+type TrafficSummaryRow struct {
+	UserID  string `json:"userId"`
+	NodeID  string `json:"nodeId"`
+	TxTotal uint64 `json:"txTotal"`
+	RxTotal uint64 `json:"rxTotal"`
+}
+
+// LoadSummaryForUserNode loads persisted totals so the in-memory counter can resume.
+func (s *SQLiteStore) LoadSummaryForUserNode(userID, nodeID string) (tx, rx uint64, err error) {
+	return s.GetSummary(userID, nodeID)
 }
 
 // Close closes the database connection.

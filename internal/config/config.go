@@ -29,6 +29,9 @@ type Config struct {
 	// Management API
 	API APIConfig `yaml:"api"`
 
+	// Subscription config for generating client configs
+	Sub *SubConfig `yaml:"sub,omitempty"`
+
 	// Bandwidth limit (server-wide, optional)
 	Bandwidth *BandwidthConfig `yaml:"bandwidth,omitempty"`
 
@@ -86,9 +89,10 @@ type MasqueradeConfig struct {
 // UserConfig defines per-user settings.
 type UserConfig struct {
 	Password string `yaml:"password"`
-	// Route is the name of the outbound node, or "direct" for direct connection.
-	Route    string `yaml:"route"`
-	// MaxBytes is the maximum total traffic (tx+rx) in bytes. 0 means unlimited.
+	// Routes is the list of outbound node names this user can access.
+	// "direct" is a special value meaning direct connection.
+	Routes []string `yaml:"routes"`
+	// MaxBytes is the maximum total traffic (tx+rx) in bytes across all nodes. 0 means unlimited.
 	MaxBytes uint64 `yaml:"maxBytes,omitempty"`
 	// SpeedLimit in bytes per second. 0 means unlimited.
 	SpeedLimit uint64 `yaml:"speedLimit,omitempty"`
@@ -143,6 +147,20 @@ type APIConfig struct {
 	Secret string `yaml:"secret"`
 }
 
+// SubConfig defines subscription endpoint settings.
+type SubConfig struct {
+	// Secret used to generate per-user tokens (HMAC key).
+	// If empty, falls back to api.secret.
+	Secret string `yaml:"secret,omitempty"`
+	// ServerAddr is the public address of the gateway that clients connect to,
+	// e.g. "your.domain.com:8443". Used in generated proxy configs.
+	ServerAddr string `yaml:"serverAddr"`
+	// SNI override for the generated client config (optional).
+	SNI string `yaml:"sni,omitempty"`
+	// Insecure skips TLS verification in generated client config (for self-signed certs).
+	Insecure bool `yaml:"insecure,omitempty"`
+}
+
 // Load reads and parses the configuration file.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -179,13 +197,15 @@ func (c *Config) validate() error {
 		if user.Password == "" {
 			return fmt.Errorf("user %q has no password", name)
 		}
-		if user.Route == "" {
-			return fmt.Errorf("user %q has no route", name)
+		if len(user.Routes) == 0 {
+			return fmt.Errorf("user %q has no routes", name)
 		}
 		// Validate route references
-		if user.Route != "direct" {
-			if _, ok := c.Nodes[user.Route]; !ok {
-				return fmt.Errorf("user %q references unknown node %q", name, user.Route)
+		for _, route := range user.Routes {
+			if route != "direct" {
+				if _, ok := c.Nodes[route]; !ok {
+					return fmt.Errorf("user %q references unknown node %q", name, route)
+				}
 			}
 		}
 	}

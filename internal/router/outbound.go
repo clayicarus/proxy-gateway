@@ -134,12 +134,12 @@ func (f *OutboundFactory) Close() {
 //
 //   handleTCPRequest() calls EventLogger.TCPRequest() BEFORE Outbound.TCP()
 //
-// So we record (clientAddr, reqAddr) → userId in TCPRequest,
-// then look it up in TCP().
+// So we record (clientAddr, reqAddr) → id in TCPRequest,
+// then look it up in TCP(). The id is "username:node_name".
 type RoutingOutbound struct {
 	router  *Router
 	factory *OutboundFactory
-	// connCtx maps clientAddr -> userId for active connections
+	// connCtx maps clientAddr -> id for active connections
 	connCtx sync.Map
 	// Default outbound when user context is unavailable
 	defaultOutbound hyServer.Outbound
@@ -158,11 +158,11 @@ func NewRoutingOutbound(router *Router, factory *OutboundFactory, logger *zap.Lo
 
 // SetUserContext records the mapping from client address to user ID.
 // Called by EventLogger.Connect.
-func (ro *RoutingOutbound) SetUserContext(addr net.Addr, userId string) {
-	ro.connCtx.Store(addr.String(), userId)
+func (ro *RoutingOutbound) SetUserContext(addr net.Addr, id string) {
+	ro.connCtx.Store(addr.String(), id)
 	ro.logger.Debug("user context set",
 		zap.String("addr", addr.String()),
-		zap.String("userId", userId),
+		zap.String("id", id),
 	)
 }
 
@@ -172,29 +172,26 @@ func (ro *RoutingOutbound) ClearUserContext(addr net.Addr) {
 	ro.connCtx.Delete(addr.String())
 }
 
-// GetOutboundForUser returns the appropriate outbound for a user.
-func (ro *RoutingOutbound) GetOutboundForUser(userId string) (hyServer.Outbound, error) {
-	route, err := ro.router.GetRoute(userId)
-	if err != nil {
-		return nil, err
-	}
+// GetOutboundForID returns the appropriate outbound for an authenticated ID.
+func (ro *RoutingOutbound) GetOutboundForID(id string) (hyServer.Outbound, error) {
+	route := ro.router.GetRoute(id)
 	return ro.factory.Get(route)
 }
 
 // TCP implements server.Outbound.
 func (ro *RoutingOutbound) TCP(reqAddr string) (net.Conn, error) {
-	userId := ro.getCurrentUser(reqAddr)
-	if userId == "" {
+	id := ro.getCurrentUser(reqAddr)
+	if id == "" {
 		ro.logger.Warn("no user context for TCP request, using default outbound",
 			zap.String("reqAddr", reqAddr),
 		)
 		return ro.defaultOutbound.TCP(reqAddr)
 	}
 
-	ob, err := ro.GetOutboundForUser(userId)
+	ob, err := ro.GetOutboundForID(id)
 	if err != nil {
 		ro.logger.Error("failed to get outbound for user",
-			zap.String("userId", userId),
+			zap.String("id", id),
 			zap.String("reqAddr", reqAddr),
 			zap.Error(err),
 		)
@@ -202,7 +199,7 @@ func (ro *RoutingOutbound) TCP(reqAddr string) (net.Conn, error) {
 	}
 
 	ro.logger.Debug("routing TCP request",
-		zap.String("userId", userId),
+		zap.String("id", id),
 		zap.String("reqAddr", reqAddr),
 	)
 	return ob.TCP(reqAddr)
@@ -210,18 +207,18 @@ func (ro *RoutingOutbound) TCP(reqAddr string) (net.Conn, error) {
 
 // UDP implements server.Outbound.
 func (ro *RoutingOutbound) UDP(reqAddr string) (hyServer.UDPConn, error) {
-	userId := ro.getCurrentUser(reqAddr)
-	if userId == "" {
+	id := ro.getCurrentUser(reqAddr)
+	if id == "" {
 		ro.logger.Warn("no user context for UDP request, using default outbound",
 			zap.String("reqAddr", reqAddr),
 		)
 		return ro.defaultOutbound.UDP(reqAddr)
 	}
 
-	ob, err := ro.GetOutboundForUser(userId)
+	ob, err := ro.GetOutboundForID(id)
 	if err != nil {
 		ro.logger.Error("failed to get outbound for user",
-			zap.String("userId", userId),
+			zap.String("id", id),
 			zap.String("reqAddr", reqAddr),
 			zap.Error(err),
 		)
@@ -229,21 +226,21 @@ func (ro *RoutingOutbound) UDP(reqAddr string) (hyServer.UDPConn, error) {
 	}
 
 	ro.logger.Debug("routing UDP request",
-		zap.String("userId", userId),
+		zap.String("id", id),
 		zap.String("reqAddr", reqAddr),
 	)
 	return ob.UDP(reqAddr)
 }
 
-// requestCtx maps a request key to userId.
+// requestCtx maps a request key to id ("username:node_name").
 // Set by EventLogger before Outbound is called.
 var requestCtx sync.Map
 
 // SetRequestContext is called by EventLogger.TCPRequest/UDPRequest
 // to associate a request with a user before the Outbound is invoked.
-func SetRequestContext(addr net.Addr, userId, reqAddr string) {
+func SetRequestContext(addr net.Addr, id, reqAddr string) {
 	key := fmt.Sprintf("%s->%s", addr.String(), reqAddr)
-	requestCtx.Store(key, userId)
+	requestCtx.Store(key, id)
 }
 
 // ClearRequestContext removes the request context after use.

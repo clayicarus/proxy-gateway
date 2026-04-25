@@ -21,37 +21,56 @@ func TestSQLiteStore_FlushAndQuery(t *testing.T) {
 
 	// Flush some traffic
 	records := []TrafficRecord{
-		{UserID: "alice", TxBytes: 1000, RxBytes: 2000, Timestamp: time.Now()},
-		{UserID: "bob", TxBytes: 500, RxBytes: 300, Timestamp: time.Now()},
+		{UserID: "alice", NodeID: "node1", TxBytes: 1000, RxBytes: 2000, Timestamp: time.Now()},
+		{UserID: "alice", NodeID: "node2", TxBytes: 300, RxBytes: 400, Timestamp: time.Now()},
+		{UserID: "bob", NodeID: "node1", TxBytes: 500, RxBytes: 300, Timestamp: time.Now()},
 	}
 	if err := store.FlushTraffic(records); err != nil {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	// Query alice
-	tx, rx, err := store.GetSummary("alice")
+	// Query alice:node1
+	tx, rx, err := store.GetSummary("alice", "node1")
 	if err != nil {
 		t.Fatalf("get summary failed: %v", err)
 	}
 	if tx != 1000 || rx != 2000 {
-		t.Errorf("alice: expected tx=1000 rx=2000, got tx=%d rx=%d", tx, rx)
+		t.Errorf("alice/node1: expected tx=1000 rx=2000, got tx=%d rx=%d", tx, rx)
 	}
 
-	// Flush more for alice
+	// Query alice:node2
+	tx, rx, err = store.GetSummary("alice", "node2")
+	if err != nil {
+		t.Fatalf("get summary failed: %v", err)
+	}
+	if tx != 300 || rx != 400 {
+		t.Errorf("alice/node2: expected tx=300 rx=400, got tx=%d rx=%d", tx, rx)
+	}
+
+	// Flush more for alice:node1
 	records2 := []TrafficRecord{
-		{UserID: "alice", TxBytes: 500, RxBytes: 100, Timestamp: time.Now()},
+		{UserID: "alice", NodeID: "node1", TxBytes: 500, RxBytes: 100, Timestamp: time.Now()},
 	}
 	if err := store.FlushTraffic(records2); err != nil {
 		t.Fatalf("flush2 failed: %v", err)
 	}
 
 	// Should be cumulative
-	tx, rx, err = store.GetSummary("alice")
+	tx, rx, err = store.GetSummary("alice", "node1")
 	if err != nil {
 		t.Fatalf("get summary2 failed: %v", err)
 	}
 	if tx != 1500 || rx != 2100 {
-		t.Errorf("alice cumulative: expected tx=1500 rx=2100, got tx=%d rx=%d", tx, rx)
+		t.Errorf("alice/node1 cumulative: expected tx=1500 rx=2100, got tx=%d rx=%d", tx, rx)
+	}
+
+	// Query all summaries for alice
+	userSums, err := store.GetUserSummaries("alice")
+	if err != nil {
+		t.Fatalf("get user summaries failed: %v", err)
+	}
+	if len(userSums) != 2 {
+		t.Errorf("expected 2 nodes for alice, got %d", len(userSums))
 	}
 
 	// Query all
@@ -59,11 +78,8 @@ func TestSQLiteStore_FlushAndQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get all summaries failed: %v", err)
 	}
-	if len(all) != 2 {
-		t.Errorf("expected 2 users, got %d", len(all))
-	}
-	if all["bob"][0] != 500 || all["bob"][1] != 300 {
-		t.Errorf("bob: expected [500, 300], got %v", all["bob"])
+	if len(all) != 3 {
+		t.Errorf("expected 3 rows, got %d", len(all))
 	}
 }
 
@@ -78,7 +94,7 @@ func TestSQLiteStore_UnknownUser(t *testing.T) {
 	}
 	defer store.Close()
 
-	tx, rx, err := store.GetSummary("nobody")
+	tx, rx, err := store.GetSummary("nobody", "node1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -100,7 +116,7 @@ func TestSQLiteStore_SkipZeroRecords(t *testing.T) {
 
 	// Zero records should be skipped
 	records := []TrafficRecord{
-		{UserID: "alice", TxBytes: 0, RxBytes: 0, Timestamp: time.Now()},
+		{UserID: "alice", NodeID: "node1", TxBytes: 0, RxBytes: 0, Timestamp: time.Now()},
 	}
 	if err := store.FlushTraffic(records); err != nil {
 		t.Fatalf("flush failed: %v", err)
@@ -111,6 +127,6 @@ func TestSQLiteStore_SkipZeroRecords(t *testing.T) {
 		t.Fatalf("get all summaries failed: %v", err)
 	}
 	if len(all) != 0 {
-		t.Errorf("expected 0 users (zero records skipped), got %d", len(all))
+		t.Errorf("expected 0 rows (zero records skipped), got %d", len(all))
 	}
 }

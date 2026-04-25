@@ -14,11 +14,14 @@ tls:
 users:
   alice:
     password: "pass123"
-    route: "direct"
+    routes:
+      - direct
     maxBytes: 1000000
   bob:
     password: "secret"
-    route: "node1"
+    routes:
+      - node1
+      - direct
 nodes:
   node1:
     type: socks5
@@ -44,8 +47,11 @@ dbPath: "test.db"
 	if cfg.Users["alice"].MaxBytes != 1000000 {
 		t.Errorf("expected alice maxBytes=1000000, got %d", cfg.Users["alice"].MaxBytes)
 	}
-	if cfg.Users["bob"].Route != "node1" {
-		t.Errorf("expected bob route=node1, got %s", cfg.Users["bob"].Route)
+	if len(cfg.Users["bob"].Routes) != 2 {
+		t.Errorf("expected bob to have 2 routes, got %d", len(cfg.Users["bob"].Routes))
+	}
+	if cfg.Users["bob"].Routes[0] != "node1" {
+		t.Errorf("expected bob routes[0]=node1, got %s", cfg.Users["bob"].Routes[0])
 	}
 	if cfg.DBPath != "test.db" {
 		t.Errorf("expected dbPath=test.db, got %s", cfg.DBPath)
@@ -60,7 +66,8 @@ tls:
 users:
   alice:
     password: "pass123"
-    route: "direct"
+    routes:
+      - direct
 api:
   listen: ":9090"
 `
@@ -83,7 +90,8 @@ func TestLoad_MissingTLS(t *testing.T) {
 users:
   alice:
     password: "pass123"
-    route: "direct"
+    routes:
+      - direct
 `
 	path := writeTempFile(t, content)
 	_, err := Load(path)
@@ -106,6 +114,23 @@ users: {}
 	}
 }
 
+func TestLoad_NoRoutes(t *testing.T) {
+	content := `
+tls:
+  cert: test.crt
+  key: test.key
+users:
+  alice:
+    password: "pass123"
+    routes: []
+`
+	path := writeTempFile(t, content)
+	_, err := Load(path)
+	if err == nil {
+		t.Error("expected error for empty routes")
+	}
+}
+
 func TestLoad_InvalidRoute(t *testing.T) {
 	content := `
 tls:
@@ -114,7 +139,8 @@ tls:
 users:
   alice:
     password: "pass123"
-    route: "nonexistent_node"
+    routes:
+      - nonexistent_node
 `
 	path := writeTempFile(t, content)
 	_, err := Load(path)
@@ -131,7 +157,8 @@ tls:
 users:
   alice:
     password: "pass123"
-    route: "hy2_node"
+    routes:
+      - hy2_node
 nodes:
   hy2_node:
     type: hysteria2
@@ -154,6 +181,42 @@ api:
 	}
 	if node.Hysteria2.Addr != "remote.example.com:443" {
 		t.Errorf("expected addr remote.example.com:443, got %s", node.Hysteria2.Addr)
+	}
+}
+
+func TestLoad_MultipleRoutes(t *testing.T) {
+	content := `
+tls:
+  cert: test.crt
+  key: test.key
+users:
+  alice:
+    password: "pass123"
+    routes:
+      - node_tokyo
+      - node_sg
+      - direct
+nodes:
+  node_tokyo:
+    type: socks5
+    socks5:
+      addr: "tokyo.example.com:1080"
+  node_sg:
+    type: socks5
+    socks5:
+      addr: "sg.example.com:1080"
+api:
+  listen: ":9090"
+`
+	path := writeTempFile(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+
+	alice := cfg.Users["alice"]
+	if len(alice.Routes) != 3 {
+		t.Errorf("expected 3 routes, got %d", len(alice.Routes))
 	}
 }
 

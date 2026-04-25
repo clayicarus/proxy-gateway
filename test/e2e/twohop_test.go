@@ -59,7 +59,6 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 	}
 
 	// --- 3. Start Node (remote hy2 server) ---
-	// The node is a plain hy2 server with password auth and direct outbound.
 	nodeUDP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
 		t.Fatalf("failed to listen node UDP: %v", err)
@@ -74,7 +73,6 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 		},
 		Conn:          nodeUDP,
 		Authenticator: nodeAuthenticator,
-		// Default outbound (direct) is used when Outbound is nil
 	})
 	if err != nil {
 		t.Fatalf("failed to create node server: %v", err)
@@ -85,9 +83,8 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// --- 4. Start Gateway ---
-	// Gateway uses Hysteria2Outbound to connect to the node.
 	users := map[string]config.UserConfig{
-		"alice": {Password: "alice_pass", Route: "node1"},
+		"alice": {Password: "alice_pass", Routes: []string{"node1"}},
 	}
 	nodes := map[string]config.NodeConfig{
 		"node1": {
@@ -102,7 +99,7 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 
 	authenticator := auth.NewAuthenticator(users, logger)
 	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
-	routerEngine := router.NewRouter(users, logger)
+	routerEngine := router.NewRouter(logger)
 	outboundFactory := router.NewOutboundFactory(nodes, logger)
 	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
 	eventLogger := event.NewEventLogger(routingOutbound, logger)
@@ -134,11 +131,12 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// --- 5. Connect with hy2 client as end user ---
+	// Auth format: username:node_name:password
 	t.Run("two_hop_tcp_proxy", func(t *testing.T) {
 		sAddr, _ := net.ResolveUDPAddr("udp", gatewayAddr)
 		client, _, err := hyClient.NewClient(&hyClient.Config{
 			ServerAddr: sAddr,
-			Auth:       "alice:alice_pass",
+			Auth:       "alice:node1:alice_pass",
 			TLSConfig: hyClient.TLSConfig{
 				ServerName:         "localhost",
 				InsecureSkipVerify: true,
@@ -149,7 +147,6 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 		}
 		defer client.Close()
 
-		// Proxy TCP: user → gateway → node → target
 		conn, err := client.TCP(targetAddr)
 		if err != nil {
 			t.Fatalf("client TCP failed: %v", err)
@@ -180,13 +177,13 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 	// --- 6. Verify traffic was logged ---
 	t.Run("traffic_logged", func(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
-		snap := trafficLogger.GetSnapshot("alice")
+		snap := trafficLogger.GetSnapshot("alice:node1")
 		if snap == nil {
-			t.Fatal("expected traffic snapshot for alice")
+			t.Fatal("expected traffic snapshot for alice:node1")
 		}
-		t.Logf("alice traffic: tx=%d rx=%d", snap.TxBytes, snap.RxBytes)
+		t.Logf("alice:node1 traffic: tx=%d rx=%d", snap.TxBytes, snap.RxBytes)
 		if snap.TxBytes == 0 && snap.RxBytes == 0 {
-			t.Error("expected non-zero traffic for alice")
+			t.Error("expected non-zero traffic for alice:node1")
 		}
 	})
 
@@ -195,7 +192,7 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 		sAddr, _ := net.ResolveUDPAddr("udp", gatewayAddr)
 		_, _, err := hyClient.NewClient(&hyClient.Config{
 			ServerAddr: sAddr,
-			Auth:       "alice:wrong_pass",
+			Auth:       "alice:node1:wrong_pass",
 			TLSConfig: hyClient.TLSConfig{
 				ServerName:         "localhost",
 				InsecureSkipVerify: true,
@@ -210,7 +207,6 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 }
 
 // simpleAuthenticator is a minimal authenticator for the node server.
-// It accepts any username with the configured password.
 type simpleAuthenticator struct {
 	password string
 }

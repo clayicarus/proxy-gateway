@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/hy2-gateway/internal/config"
 	"github.com/hy2-gateway/internal/traffic"
 	"go.uber.org/zap"
 )
@@ -12,14 +13,16 @@ import (
 // Server provides an HTTP API for managing the gateway.
 type Server struct {
 	trafficLogger *traffic.TrafficLogger
+	subHandler    *SubscriptionHandler
 	secret        string
 	logger        *zap.Logger
 }
 
 // NewServer creates a new API server.
-func NewServer(trafficLogger *traffic.TrafficLogger, secret string, logger *zap.Logger) *Server {
+func NewServer(cfg *config.Config, trafficLogger *traffic.TrafficLogger, secret string, logger *zap.Logger) *Server {
 	return &Server{
 		trafficLogger: trafficLogger,
+		subHandler:    NewSubscriptionHandler(cfg, logger),
 		secret:        secret,
 		logger:        logger,
 	}
@@ -32,6 +35,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/traffic/", s.authMiddleware(s.handleTrafficUser))
 	mux.HandleFunc("/traffic/reset", s.authMiddleware(s.handleTrafficReset))
 	mux.HandleFunc("/health", s.handleHealth)
+
+	// Subscription endpoints
+	mux.HandleFunc("/sub/", s.subHandler.HandleSubscription)
+	mux.HandleFunc("/sub/tokens", s.authMiddleware(s.subHandler.HandleTokenList))
+
 	return mux
 }
 
@@ -117,4 +125,8 @@ func (s *Server) handleTrafficReset(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	json.NewEncoder(w).Encode(v)
 }

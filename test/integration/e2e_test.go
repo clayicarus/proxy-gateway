@@ -23,9 +23,6 @@ import (
 //
 //	Client auth → EventLogger.Connect → EventLogger.TCPRequest →
 //	RoutingOutbound.TCP → TrafficLogger.LogTraffic → SQLite persistence
-//
-// This doesn't use the actual Hysteria2 QUIC transport, but exercises
-// all the business logic components in the correct call order.
 func TestE2E_FullPipeline(t *testing.T) {
 	logger := zap.NewNop()
 
@@ -61,15 +58,15 @@ func TestE2E_FullPipeline(t *testing.T) {
 
 	// --- Setup config ---
 	users := map[string]config.UserConfig{
-		"alice": {Password: "pass123", Route: "direct", MaxBytes: 1000000},
-		"bob":   {Password: "secret", Route: "direct", MaxBytes: 500},
+		"alice": {Password: "pass123", Routes: []string{"direct"}, MaxBytes: 1000000},
+		"bob":   {Password: "secret", Routes: []string{"direct"}, MaxBytes: 500},
 	}
 	nodes := map[string]config.NodeConfig{}
 
 	// --- Initialize components ---
 	authenticator := auth.NewAuthenticator(users, logger)
 	trafficLogger := traffic.NewTrafficLogger(users, store, logger)
-	routerEngine := router.NewRouter(users, logger)
+	routerEngine := router.NewRouter(logger)
 	outboundFactory := router.NewOutboundFactory(nodes, logger)
 	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
 	eventLogger := event.NewEventLogger(routingOutbound, logger)
@@ -77,9 +74,9 @@ func TestE2E_FullPipeline(t *testing.T) {
 	// --- Simulate client connection ---
 	clientAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 54321}
 
-	// Step 1: Authentication
-	ok, id := authenticator.Authenticate(clientAddr, "alice:pass123", 1000000)
-	if !ok || id != "alice" {
+	// Step 1: Authentication (new format: username:node_name:password)
+	ok, id := authenticator.Authenticate(clientAddr, "alice:direct:pass123", 1000000)
+	if !ok || id != "alice:direct" {
 		t.Fatalf("auth failed: ok=%v id=%s", ok, id)
 	}
 
@@ -107,16 +104,16 @@ func TestE2E_FullPipeline(t *testing.T) {
 	}
 	conn.Close()
 
-	// Step 6: Log traffic
+	// Step 6: Log traffic (id is "alice:direct")
 	ok = trafficLogger.LogTraffic(id, 100, uint64(n))
 	if !ok {
 		t.Error("expected LogTraffic to return true (under quota)")
 	}
 
 	// Step 7: Verify in-memory stats
-	snap := trafficLogger.GetSnapshot("alice")
+	snap := trafficLogger.GetSnapshot("alice:direct")
 	if snap == nil {
-		t.Fatal("expected snapshot for alice")
+		t.Fatal("expected snapshot for alice:direct")
 	}
 	if snap.TxBytes != 100 {
 		t.Errorf("expected tx=100, got %d", snap.TxBytes)
@@ -125,8 +122,8 @@ func TestE2E_FullPipeline(t *testing.T) {
 	// Step 8: Flush to SQLite
 	trafficLogger.Flush()
 
-	// Step 9: Verify SQLite persistence
-	tx, rx, err := store.GetSummary("alice")
+	// Step 9: Verify SQLite persistence (now per user+node)
+	tx, rx, err := store.GetSummary("alice", "direct")
 	if err != nil {
 		t.Fatalf("get summary failed: %v", err)
 	}
@@ -140,7 +137,7 @@ func TestE2E_FullPipeline(t *testing.T) {
 	// Step 10: Disconnect
 	eventLogger.Disconnect(clientAddr, id, nil)
 
-	t.Logf("E2E pipeline completed: alice sent %d bytes, received %d bytes", tx, rx)
+	t.Logf("E2E pipeline completed: alice:direct sent %d bytes, received %d bytes", tx, rx)
 }
 
 // TestE2E_QuotaEnforcement tests that a user gets disconnected when quota is exceeded.
@@ -148,13 +145,13 @@ func TestE2E_QuotaEnforcement(t *testing.T) {
 	logger := zap.NewNop()
 
 	users := map[string]config.UserConfig{
-		"bob": {Password: "secret", Route: "direct", MaxBytes: 500},
+		"bob": {Password: "secret", Routes: []string{"direct"}, MaxBytes: 500},
 	}
 
 	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
 
-	// Log traffic that exceeds quota
-	ok := trafficLogger.LogTraffic("bob", 300, 300) // total = 600 > 500
+	// Log traffic that exceeds quota (total across all nodes)
+	ok := trafficLogger.LogTraffic("bob:direct", 300, 300) // total = 600 > 500
 	if ok {
 		t.Error("expected LogTraffic to return false (quota exceeded)")
 	}
@@ -191,21 +188,17 @@ func TestE2E_MultiUserRouting(t *testing.T) {
 		}
 	}()
 
-	users := map[string]config.UserConfig{
-		"alice": {Password: "p", Route: "direct"},
-		"bob":   {Password: "p", Route: "direct"},
-	}
 	nodes := map[string]config.NodeConfig{}
 
-	routerEngine := router.NewRouter(users, logger)
+	routerEngine := router.NewRouter(logger)
 	outboundFactory := router.NewOutboundFactory(nodes, logger)
 	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
 	eventLogger := event.NewEventLogger(routingOutbound, logger)
 
-	// Alice connects and requests target1
+	// Alice connects (id = "alice:direct") and requests target1
 	aliceAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 11111}
-	eventLogger.Connect(aliceAddr, "alice", 0)
-	eventLogger.TCPRequest(aliceAddr, "alice", target1Ln.Addr().String())
+	eventLogger.Connect(aliceAddr, "alice:direct", 0)
+	eventLogger.TCPRequest(aliceAddr, "alice:direct", target1Ln.Addr().String())
 
 	conn1, err := routingOutbound.TCP(target1Ln.Addr().String())
 	if err != nil {
@@ -218,10 +211,10 @@ func TestE2E_MultiUserRouting(t *testing.T) {
 	}
 	conn1.Close()
 
-	// Bob connects and requests target2
+	// Bob connects (id = "bob:direct") and requests target2
 	bobAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 22222}
-	eventLogger.Connect(bobAddr, "bob", 0)
-	eventLogger.TCPRequest(bobAddr, "bob", target2Ln.Addr().String())
+	eventLogger.Connect(bobAddr, "bob:direct", 0)
+	eventLogger.TCPRequest(bobAddr, "bob:direct", target2Ln.Addr().String())
 
 	conn2, err := routingOutbound.TCP(target2Ln.Addr().String())
 	if err != nil {
@@ -234,21 +227,25 @@ func TestE2E_MultiUserRouting(t *testing.T) {
 	}
 	conn2.Close()
 
-	eventLogger.Disconnect(aliceAddr, "alice", nil)
-	eventLogger.Disconnect(bobAddr, "bob", nil)
+	eventLogger.Disconnect(aliceAddr, "alice:direct", nil)
+	eventLogger.Disconnect(bobAddr, "bob:direct", nil)
 }
 
 // TestE2E_APITrafficQuery tests the management API for traffic stats.
 func TestE2E_APITrafficQuery(t *testing.T) {
 	logger := zap.NewNop()
 
-	users := map[string]config.UserConfig{
-		"alice": {Password: "p", Route: "direct"},
+	cfg := &config.Config{
+		TLS:   config.TLSConfig{Cert: "test.crt", Key: "test.key"},
+		Users: map[string]config.UserConfig{
+			"alice": {Password: "p", Routes: []string{"direct"}},
+		},
+		API: config.APIConfig{Listen: ":9090", Secret: "test_secret"},
 	}
-	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
-	trafficLogger.LogTraffic("alice", 1000, 2000)
+	trafficLogger := traffic.NewTrafficLogger(cfg.Users, nil, logger)
+	trafficLogger.LogTraffic("alice:direct", 1000, 2000)
 
-	apiServer := api.NewServer(trafficLogger, "test_secret", logger)
+	apiServer := api.NewServer(cfg, trafficLogger, "test_secret", logger)
 
 	// Start HTTP server
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -292,12 +289,12 @@ func TestE2E_APITrafficQuery(t *testing.T) {
 		t.Fatalf("decode failed: %v", err)
 	}
 
-	if result["alice"] == nil {
-		t.Fatal("expected alice in traffic stats")
+	if result["alice:direct"] == nil {
+		t.Fatal("expected alice:direct in traffic stats")
 	}
-	if result["alice"].TxBytes != 1000 || result["alice"].RxBytes != 2000 {
+	if result["alice:direct"].TxBytes != 1000 || result["alice:direct"].RxBytes != 2000 {
 		t.Errorf("expected tx=1000 rx=2000, got tx=%d rx=%d",
-			result["alice"].TxBytes, result["alice"].RxBytes)
+			result["alice:direct"].TxBytes, result["alice:direct"].RxBytes)
 	}
 
 	// Test health endpoint (no auth needed)

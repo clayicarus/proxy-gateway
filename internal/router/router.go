@@ -1,52 +1,31 @@
 package router
 
 import (
-	"fmt"
-	"sync"
-
-	"github.com/hy2-gateway/internal/config"
+	"github.com/hy2-gateway/internal/auth"
 	"go.uber.org/zap"
 )
 
-// Router manages the mapping from user IDs to outbound nodes.
+// Router resolves the outbound node from the authenticated ID.
+// Since the auth format is now "username:node_name:password",
+// the ID returned by Authenticator is "username:node_name",
+// so the route is directly embedded in the ID.
 type Router struct {
-	// userRoutes maps userId -> node name (or "direct")
-	userRoutes map[string]string
-	mu         sync.RWMutex
-	logger     *zap.Logger
+	logger *zap.Logger
 }
 
-// NewRouter creates a new Router from user configs.
-func NewRouter(users map[string]config.UserConfig, logger *zap.Logger) *Router {
-	routes := make(map[string]string, len(users))
-	for name, u := range users {
-		routes[name] = u.Route
-	}
+// NewRouter creates a new Router.
+func NewRouter(logger *zap.Logger) *Router {
 	return &Router{
-		userRoutes: routes,
-		logger:     logger,
+		logger: logger,
 	}
 }
 
-// GetRoute returns the outbound node name for a given user.
-func (r *Router) GetRoute(userId string) (string, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	route, ok := r.userRoutes[userId]
-	if !ok {
-		return "", fmt.Errorf("no route configured for user %q", userId)
+// GetRoute extracts the node name from the authenticated ID ("username:node_name").
+func (r *Router) GetRoute(id string) string {
+	_, nodeName := auth.ParseID(id)
+	if nodeName == "" {
+		r.logger.Warn("no node in ID, defaulting to direct", zap.String("id", id))
+		return "direct"
 	}
-	return route, nil
-}
-
-// UpdateRoutes replaces the routing table (for hot-reload).
-func (r *Router) UpdateRoutes(users map[string]config.UserConfig) {
-	routes := make(map[string]string, len(users))
-	for name, u := range users {
-		routes[name] = u.Route
-	}
-	r.mu.Lock()
-	r.userRoutes = routes
-	r.mu.Unlock()
+	return nodeName
 }

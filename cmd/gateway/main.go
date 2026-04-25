@@ -61,7 +61,7 @@ func main() {
 	// Initialize components
 	authenticator := auth.NewAuthenticator(cfg.Users, logger)
 	trafficLogger := traffic.NewTrafficLogger(cfg.Users, store, logger)
-	routerEngine := router.NewRouter(cfg.Users, logger)
+	routerEngine := router.NewRouter(logger)
 	outboundFactory := router.NewOutboundFactory(cfg.Nodes, logger)
 	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
 	eventLogger := event.NewEventLogger(routingOutbound, logger)
@@ -73,7 +73,7 @@ func main() {
 
 	// Start management API
 	if cfg.API.Listen != "" {
-		apiServer := api.NewServer(trafficLogger, cfg.API.Secret, logger)
+		apiServer := api.NewServer(cfg, trafficLogger, cfg.API.Secret, logger)
 		httpServer := &http.Server{
 			Addr:    cfg.API.Listen,
 			Handler: apiServer.Handler(),
