@@ -6,8 +6,9 @@
 
 ## 功能
 
-- **多用户认证**：`username:password` 模式，标准 hy2 客户端直接连接
-- **按用户路由**：不同用户的流量路由到不同的出口节点
+- **多用户认证**：`username:node:password` 模式，标准 hy2 客户端直接连接
+- **按用户路由**：不同用户的流量路由到不同的出口节点，支持多节点选择
+- **Fallback 策略**：节点不可用时可配置 fallback 到其他节点、直连或拒绝
 - **流量统计**：按用户实时统计 tx/rx，支持配额限制（超额自动断开）
 - **SQLite 持久化**：流量数据定时写入 SQLite，进程重启不丢失
 - **hy2 Client Pool**：Gateway 到 Node 使用 QUIC 长连接，自动重连
@@ -63,11 +64,16 @@ tls:
 users:
   alice:
     password: "alice_password"
-    route: "node1"
-    maxBytes: 107374182400      # 100GB
+    routes:
+      - node1
+      - direct
+    fallback: "direct"            # node1 不可用时走直连
+    maxBytes: 107374182400        # 100GB
   bob:
     password: "bob_password"
-    route: "direct"             # 直连出站
+    routes:
+      - node1
+    fallback: "node2"             # node1 不可用时走 node2
 
 nodes:
   node1:
@@ -75,7 +81,13 @@ nodes:
     hysteria2:
       addr: "node1.example.com:443"
       auth: "node1_secret"
-      insecure: true            # Node 用自签证书时
+      insecure: true
+  node2:
+    type: hysteria2
+    hysteria2:
+      addr: "node2.example.com:443"
+      auth: "node2_secret"
+      insecure: true
 
 api:
   listen: "127.0.0.1:9090"
@@ -93,11 +105,11 @@ mkdir -p /var/lib/hy2-gateway
 
 ### 3. 客户端连接
 
-标准 Hysteria2 客户端，auth 格式为 `username:password`：
+标准 Hysteria2 客户端，auth 格式为 `username:node:password`：
 
 ```yaml
 server: your.gateway.com:8443
-auth: alice:alice_password
+auth: alice:node1:alice_password
 bandwidth:
   up: 50 mbps
   down: 100 mbps
@@ -122,7 +134,8 @@ sqlite3 /var/lib/hy2-gateway/traffic.db "SELECT * FROM traffic_summary;"
 | `listen` | 监听地址，默认 `:443` |
 | `tls.cert` / `tls.key` | TLS 证书和私钥路径 |
 | `users.<name>.password` | 用户密码 |
-| `users.<name>.route` | 路由目标，`direct` 或 nodes 中的名称 |
+| `users.<name>.routes` | 可用节点列表，`direct` 或 nodes 中的名称 |
+| `users.<name>.fallback` | 节点不可用时的策略：`reject`（默认）/ `direct` / 其他节点名 |
 | `users.<name>.maxBytes` | 流量配额（字节），0 为不限 |
 | `nodes.<name>.type` | 出站类型：`direct` / `socks5` / `http` / `hysteria2` |
 | `api.listen` | 管理 API 监听地址，建议只绑定 127.0.0.1 |

@@ -79,13 +79,18 @@ tls:
 users:
   alice:
     password: "change_me_alice"
-    route: "node1"
-    maxBytes: 107374182400    # 100GB
+    routes:
+      - node1
+      - node2
+    fallback: "direct"          # node 不可用时走直连
+    maxBytes: 107374182400      # 100GB
 
   bob:
     password: "change_me_bob"
-    route: "node2"
-    maxBytes: 0               # 不限
+    routes:
+      - node1
+    fallback: "node2"           # node1 不可用时走 node2
+    maxBytes: 0                 # 不限
 
 nodes:
   node1:
@@ -245,7 +250,7 @@ PostDown = ip rule del from <node_public_ip> table main priority 10
 ```yaml
 server: your.gateway.com:8443
 
-auth: alice:change_me_alice
+auth: alice:node1:change_me_alice
 
 tls:
   sni: your.gateway.com

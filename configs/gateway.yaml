@@ -1,7 +1,7 @@
 # Hy2-Gateway 示例配置
 
 # 监听地址
-listen: :443
+listen: :8443
 
 # TLS 配置（二选一：tls 或 acme）
 tls:
@@ -34,53 +34,60 @@ tls:
 
 # ============================================================
 # 用户配置
-# 每个用户有独立的密码、可用节点列表和流量配额
+# 每个用户有独立的密码、可用节点列表、fallback 策略和流量配额
 # 客户端 auth 字段格式: "username:node_name:password"
-# 例如: "alice:node_tokyo:alice_secure_pass_123"
+# 例如: "alice:node1:alice_secure_pass_123"
 # ============================================================
 users:
   alice:
     password: "alice_secure_pass_123"
     routes:                          # 可用节点列表
-      - node_tokyo
-      - node_sg
+      - node1
+      - node2
       - direct
+    fallback: "direct"               # node 不可用时走直连
     maxBytes: 107374182400           # 100GB 流量限制（所有节点合计）
     speedLimit: 52428800             # 50MB/s 速度限制
 
   bob:
     password: "bob_secure_pass_456"
     routes:
-      - direct                       # 仅直连
+      - node1
+    fallback: "node2"                # node1 不可用时走 node2
     maxBytes: 0                      # 不限流量
 
   charlie:
     password: "charlie_pass_789"
     routes:
-      - node_sg                      # 仅新加坡节点
+      - node2
+    # 不配 fallback，默认 "reject"：node 不可用时直接报错给客户端
     maxBytes: 53687091200            # 50GB 流量限制
 
 # ============================================================
 # 出站节点配置
 # ============================================================
 nodes:
-  node_tokyo:
-    type: socks5
-    socks5:
-      addr: "tokyo-proxy.example.com:1080"
-      username: "proxy_user"
-      password: "proxy_pass"
+  node1:
+    type: hysteria2
+    hysteria2:
+      addr: "node1.example.com:443"
+      auth: "node1_secret_key"
+      insecure: true                 # Node 用自签证书时
 
-  node_sg:
-    type: socks5
-    socks5:
-      addr: "sg-proxy.example.com:1080"
+  node2:
+    type: hysteria2
+    hysteria2:
+      addr: "node2.example.com:443"
+      auth: "node2_secret_key"
+      insecure: true
 
-  # HTTP 代理节点示例
-  # node_us:
-  #   type: http
-  #   http:
-  #     url: "http://us-proxy.example.com:8080"
+  # SOCKS5 代理节点示例
+  # node_socks:
+  #   type: socks5
+  #   socks5:
+  #     addr: "proxy.example.com:1080"
+  #     username: "proxy_user"
+  #     password: "proxy_pass"
 
   # 直连节点（可以绑定特定网卡/IP）
   # node_direct_v4:
@@ -93,21 +100,19 @@ nodes:
 # 管理 API
 # ============================================================
 api:
-  listen: ":9090"
+  listen: "127.0.0.1:9090"          # 只监听本地，不暴露到公网
   secret: "your_api_secret_here"
+
+# SQLite 数据库路径
+dbPath: /var/lib/hy2-gateway/traffic.db
 
 # 流量统计刷新间隔
 trafficFlushInterval: 10s
 
 # ============================================================
-# 订阅配置（用于生成 Clash.Meta 客户端配置）
+# 订阅配置（用于生成客户端配置）
 # ============================================================
-sub:
-  # 用于生成用户 token 的密钥（留空则复用 api.secret）
-  # secret: "your_sub_secret"
-  # 客户端连接的公网地址（必填）
-  serverAddr: "your.domain.com:8443"
-  # SNI（可选，默认使用 serverAddr 的 host 部分）
-  # sni: "your.domain.com"
-  # 自签证书时设为 true
-  # insecure: false
+# sub:
+#   serverAddr: "your.domain.com:8443"
+#   sni: "your.domain.com"
+#   insecure: false
