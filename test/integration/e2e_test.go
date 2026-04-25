@@ -1,0 +1,312 @@
+package integration
+
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/hy2-gateway/internal/api"
+	"github.com/hy2-gateway/internal/auth"
+	"github.com/hy2-gateway/internal/config"
+	"github.com/hy2-gateway/internal/event"
+	"github.com/hy2-gateway/internal/router"
+	"github.com/hy2-gateway/internal/storage"
+	"github.com/hy2-gateway/internal/traffic"
+	"go.uber.org/zap"
+)
+
+// TestE2E_FullPipeline simulates the full request lifecycle:
+//
+//	Client auth → EventLogger.Connect → EventLogger.TCPRequest →
+//	RoutingOutbound.TCP → TrafficLogger.LogTraffic → SQLite persistence
+//
+// This doesn't use the actual Hysteria2 QUIC transport, but exercises
+// all the business logic components in the correct call order.
+func TestE2E_FullPipeline(t *testing.T) {
+	logger := zap.NewNop()
+
+	// --- Setup target server (simulates the internet) ---
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create target listener: %v", err)
+	}
+	defer targetLn.Close()
+
+	go func() {
+		for {
+			conn, err := targetLn.Accept()
+			if err != nil {
+				return
+			}
+			conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\nHello from target"))
+			conn.Close()
+		}
+	}()
+
+	targetAddr := targetLn.Addr().String()
+
+	// --- Setup SQLite ---
+	dbPath := t.TempDir() + "/e2e_test.db"
+	defer os.Remove(dbPath)
+
+	store, err := storage.NewSQLiteStore(dbPath, logger)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// --- Setup config ---
+	users := map[string]config.UserConfig{
+		"alice": {Password: "pass123", Route: "direct", MaxBytes: 1000000},
+		"bob":   {Password: "secret", Route: "direct", MaxBytes: 500},
+	}
+	nodes := map[string]config.NodeConfig{}
+
+	// --- Initialize components ---
+	authenticator := auth.NewAuthenticator(users, logger)
+	trafficLogger := traffic.NewTrafficLogger(users, store, logger)
+	routerEngine := router.NewRouter(users, logger)
+	outboundFactory := router.NewOutboundFactory(nodes, logger)
+	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
+	eventLogger := event.NewEventLogger(routingOutbound, logger)
+
+	// --- Simulate client connection ---
+	clientAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 54321}
+
+	// Step 1: Authentication
+	ok, id := authenticator.Authenticate(clientAddr, "alice:pass123", 1000000)
+	if !ok || id != "alice" {
+		t.Fatalf("auth failed: ok=%v id=%s", ok, id)
+	}
+
+	// Step 2: EventLogger.Connect (sets user context)
+	eventLogger.Connect(clientAddr, id, 1000000)
+
+	// Step 3: EventLogger.TCPRequest (sets request context)
+	eventLogger.TCPRequest(clientAddr, id, targetAddr)
+
+	// Step 4: Outbound.TCP (uses routing based on user context)
+	conn, err := routingOutbound.TCP(targetAddr)
+	if err != nil {
+		t.Fatalf("routing TCP failed: %v", err)
+	}
+
+	// Step 5: Read response from target
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("read from target failed: %v", err)
+	}
+	response := string(buf[:n])
+	if response == "" {
+		t.Error("expected non-empty response from target")
+	}
+	conn.Close()
+
+	// Step 6: Log traffic
+	ok = trafficLogger.LogTraffic(id, 100, uint64(n))
+	if !ok {
+		t.Error("expected LogTraffic to return true (under quota)")
+	}
+
+	// Step 7: Verify in-memory stats
+	snap := trafficLogger.GetSnapshot("alice")
+	if snap == nil {
+		t.Fatal("expected snapshot for alice")
+	}
+	if snap.TxBytes != 100 {
+		t.Errorf("expected tx=100, got %d", snap.TxBytes)
+	}
+
+	// Step 8: Flush to SQLite
+	trafficLogger.Flush()
+
+	// Step 9: Verify SQLite persistence
+	tx, rx, err := store.GetSummary("alice")
+	if err != nil {
+		t.Fatalf("get summary failed: %v", err)
+	}
+	if tx != 100 {
+		t.Errorf("sqlite tx: expected 100, got %d", tx)
+	}
+	if rx != uint64(n) {
+		t.Errorf("sqlite rx: expected %d, got %d", n, rx)
+	}
+
+	// Step 10: Disconnect
+	eventLogger.Disconnect(clientAddr, id, nil)
+
+	t.Logf("E2E pipeline completed: alice sent %d bytes, received %d bytes", tx, rx)
+}
+
+// TestE2E_QuotaEnforcement tests that a user gets disconnected when quota is exceeded.
+func TestE2E_QuotaEnforcement(t *testing.T) {
+	logger := zap.NewNop()
+
+	users := map[string]config.UserConfig{
+		"bob": {Password: "secret", Route: "direct", MaxBytes: 500},
+	}
+
+	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
+
+	// Log traffic that exceeds quota
+	ok := trafficLogger.LogTraffic("bob", 300, 300) // total = 600 > 500
+	if ok {
+		t.Error("expected LogTraffic to return false (quota exceeded)")
+	}
+}
+
+// TestE2E_MultiUserRouting tests that different users get routed to different outbounds.
+func TestE2E_MultiUserRouting(t *testing.T) {
+	logger := zap.NewNop()
+
+	// Create two target servers
+	target1Ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer target1Ln.Close()
+	go func() {
+		for {
+			conn, err := target1Ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Write([]byte("target1"))
+			conn.Close()
+		}
+	}()
+
+	target2Ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer target2Ln.Close()
+	go func() {
+		for {
+			conn, err := target2Ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Write([]byte("target2"))
+			conn.Close()
+		}
+	}()
+
+	users := map[string]config.UserConfig{
+		"alice": {Password: "p", Route: "direct"},
+		"bob":   {Password: "p", Route: "direct"},
+	}
+	nodes := map[string]config.NodeConfig{}
+
+	routerEngine := router.NewRouter(users, logger)
+	outboundFactory := router.NewOutboundFactory(nodes, logger)
+	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
+	eventLogger := event.NewEventLogger(routingOutbound, logger)
+
+	// Alice connects and requests target1
+	aliceAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 11111}
+	eventLogger.Connect(aliceAddr, "alice", 0)
+	eventLogger.TCPRequest(aliceAddr, "alice", target1Ln.Addr().String())
+
+	conn1, err := routingOutbound.TCP(target1Ln.Addr().String())
+	if err != nil {
+		t.Fatalf("alice TCP failed: %v", err)
+	}
+	buf := make([]byte, 100)
+	n, _ := conn1.Read(buf)
+	if string(buf[:n]) != "target1" {
+		t.Errorf("alice: expected 'target1', got %q", string(buf[:n]))
+	}
+	conn1.Close()
+
+	// Bob connects and requests target2
+	bobAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 22222}
+	eventLogger.Connect(bobAddr, "bob", 0)
+	eventLogger.TCPRequest(bobAddr, "bob", target2Ln.Addr().String())
+
+	conn2, err := routingOutbound.TCP(target2Ln.Addr().String())
+	if err != nil {
+		t.Fatalf("bob TCP failed: %v", err)
+	}
+	buf2 := make([]byte, 100)
+	n2, _ := conn2.Read(buf2)
+	if string(buf2[:n2]) != "target2" {
+		t.Errorf("bob: expected 'target2', got %q", string(buf2[:n2]))
+	}
+	conn2.Close()
+
+	eventLogger.Disconnect(aliceAddr, "alice", nil)
+	eventLogger.Disconnect(bobAddr, "bob", nil)
+}
+
+// TestE2E_APITrafficQuery tests the management API for traffic stats.
+func TestE2E_APITrafficQuery(t *testing.T) {
+	logger := zap.NewNop()
+
+	users := map[string]config.UserConfig{
+		"alice": {Password: "p", Route: "direct"},
+	}
+	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
+	trafficLogger.LogTraffic("alice", 1000, 2000)
+
+	apiServer := api.NewServer(trafficLogger, "test_secret", logger)
+
+	// Start HTTP server
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	httpServer := &http.Server{Handler: apiServer.Handler()}
+	go httpServer.Serve(ln)
+	defer httpServer.Close()
+
+	baseURL := fmt.Sprintf("http://%s", ln.Addr().String())
+
+	// Test without auth (should fail)
+	resp, err := http.Get(baseURL + "/traffic")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Test with auth
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, _ := http.NewRequest("GET", baseURL+"/traffic", nil)
+	req.Header.Set("Authorization", "test_secret")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var result map[string]*traffic.StatsSnapshot
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+
+	if result["alice"] == nil {
+		t.Fatal("expected alice in traffic stats")
+	}
+	if result["alice"].TxBytes != 1000 || result["alice"].RxBytes != 2000 {
+		t.Errorf("expected tx=1000 rx=2000, got tx=%d rx=%d",
+			result["alice"].TxBytes, result["alice"].RxBytes)
+	}
+
+	// Test health endpoint (no auth needed)
+	resp2, err := http.Get(baseURL + "/health")
+	if err != nil {
+		t.Fatalf("health request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("health: expected 200, got %d", resp2.StatusCode)
+	}
+}

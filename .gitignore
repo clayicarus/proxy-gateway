@@ -1,0 +1,11 @@
+build/
+*.exe
+*.test
+*.out
+.env
+*.pem
+*.crt
+*.key
+gateway
+hy2-gateway
+*.db

@@ -1,0 +1,94 @@
+# Hy2-Gateway 示例配置
+
+# 监听地址
+listen: :443
+
+# TLS 配置（二选一：tls 或 acme）
+tls:
+  cert: /etc/hy2-gateway/cert.pem
+  key: /etc/hy2-gateway/key.pem
+
+# ACME 自动证书（与 tls 二选一）
+# acme:
+#   domains:
+#     - your.domain.com
+#   email: [email protected]
+
+# 混淆（可选，需要客户端也配置相同密码）
+# obfs:
+#   type: salamander
+#   salamander:
+#     password: your_obfs_password
+
+# QUIC 参数调优（可选）
+# quic:
+#   maxIdleTimeout: 30s
+#   maxIncomingStreams: 1024
+
+# 伪装（可选，用于抗审查）
+# masquerade:
+#   type: proxy
+#   proxy:
+#     url: https://www.bing.com
+#     rewriteHost: true
+
+# ============================================================
+# 用户配置
+# 每个用户有独立的密码、路由策略和流量配额
+# 客户端 auth 字段格式: "username:password"
+# ============================================================
+users:
+  alice:
+    password: "alice_secure_pass_123"
+    route: "node_tokyo"          # 路由到东京节点
+    maxBytes: 107374182400       # 100GB 流量限制
+    speedLimit: 52428800         # 50MB/s 速度限制
+
+  bob:
+    password: "bob_secure_pass_456"
+    route: "direct"              # 直连出站
+    maxBytes: 0                  # 不限流量
+
+  charlie:
+    password: "charlie_pass_789"
+    route: "node_sg"             # 路由到新加坡节点
+    maxBytes: 53687091200        # 50GB 流量限制
+
+# ============================================================
+# 出站节点配置
+# ============================================================
+nodes:
+  node_tokyo:
+    type: socks5
+    socks5:
+      addr: "tokyo-proxy.example.com:1080"
+      username: "proxy_user"
+      password: "proxy_pass"
+
+  node_sg:
+    type: socks5
+    socks5:
+      addr: "sg-proxy.example.com:1080"
+
+  # HTTP 代理节点示例
+  # node_us:
+  #   type: http
+  #   http:
+  #     url: "http://us-proxy.example.com:8080"
+
+  # 直连节点（可以绑定特定网卡/IP）
+  # node_direct_v4:
+  #   type: direct
+  #   direct:
+  #     mode: "4"
+  #     bindIPv4: "1.2.3.4"
+
+# ============================================================
+# 管理 API
+# ============================================================
+api:
+  listen: ":9090"
+  secret: "your_api_secret_here"
+
+# 流量统计刷新间隔
+trafficFlushInterval: 10s
