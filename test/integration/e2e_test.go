@@ -311,3 +311,189 @@ func TestE2E_APITrafficQuery(t *testing.T) {
 		t.Errorf("health: expected 200, got %d", resp2.StatusCode)
 	}
 }
+
+// TestE2E_FallbackReject tests that when a node is unavailable and fallback is "reject",
+// the request returns an error to the client.
+func TestE2E_FallbackReject(t *testing.T) {
+	logger := zap.NewNop()
+
+	users := map[string]config.UserConfig{
+		"alice": {
+			Password: "pass",
+			Routes:   []string{"broken_node"},
+			// No fallback configured → defaults to "reject"
+		},
+	}
+	nodes := map[string]config.NodeConfig{
+		"broken_node": {
+			Type: "hysteria2",
+			Hysteria2: &config.Hysteria2OutboundConfig{
+				Addr:     "127.0.0.1:1", // unreachable port
+				Auth:     "wrong_auth",
+				Insecure: true,
+			},
+		},
+	}
+
+	routerEngine := router.NewRouter(users, logger)
+	outboundFactory := router.NewOutboundFactory(nodes, logger)
+	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
+	eventLogger := event.NewEventLogger(routingOutbound, logger)
+
+	clientAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 54321}
+	eventLogger.Connect(clientAddr, "alice:broken_node", 0)
+	eventLogger.TCPRequest(clientAddr, "alice:broken_node", "example.com:443")
+
+	_, err := routingOutbound.TCP("example.com:443")
+	if err == nil {
+		t.Fatal("expected error when node is unreachable and fallback is reject")
+	}
+	t.Logf("correctly got error: %v", err)
+
+	eventLogger.Disconnect(clientAddr, "alice:broken_node", nil)
+}
+
+// TestE2E_FallbackDirect tests that when a node is unavailable and fallback is "direct",
+// the request falls back to a direct connection.
+func TestE2E_FallbackDirect(t *testing.T) {
+	logger := zap.NewNop()
+
+	// Start a target server that we can reach via direct
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create target listener: %v", err)
+	}
+	defer targetLn.Close()
+
+	go func() {
+		for {
+			conn, err := targetLn.Accept()
+			if err != nil {
+				return
+			}
+			conn.Write([]byte("fallback-ok"))
+			conn.Close()
+		}
+	}()
+
+	targetAddr := targetLn.Addr().String()
+
+	users := map[string]config.UserConfig{
+		"bob": {
+			Password: "pass",
+			Routes:   []string{"broken_node"},
+			Fallback: "direct", // fallback to direct when node is down
+		},
+	}
+	nodes := map[string]config.NodeConfig{
+		"broken_node": {
+			Type: "hysteria2",
+			Hysteria2: &config.Hysteria2OutboundConfig{
+				Addr:     "127.0.0.1:1", // unreachable port
+				Auth:     "wrong_auth",
+				Insecure: true,
+			},
+		},
+	}
+
+	routerEngine := router.NewRouter(users, logger)
+	outboundFactory := router.NewOutboundFactory(nodes, logger)
+	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
+	eventLogger := event.NewEventLogger(routingOutbound, logger)
+
+	clientAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 54322}
+	eventLogger.Connect(clientAddr, "bob:broken_node", 0)
+	eventLogger.TCPRequest(clientAddr, "bob:broken_node", targetAddr)
+
+	conn, err := routingOutbound.TCP(targetAddr)
+	if err != nil {
+		t.Fatalf("expected fallback to direct to succeed, got error: %v", err)
+	}
+	defer conn.Close()
+
+	buf := make([]byte, 100)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if string(buf[:n]) != "fallback-ok" {
+		t.Errorf("expected 'fallback-ok', got %q", string(buf[:n]))
+	}
+
+	t.Logf("fallback to direct succeeded")
+	eventLogger.Disconnect(clientAddr, "bob:broken_node", nil)
+}
+
+// TestE2E_FallbackToAnotherNode tests that when a node is unavailable,
+// the request falls back to another configured node.
+func TestE2E_FallbackToAnotherNode(t *testing.T) {
+	logger := zap.NewNop()
+
+	// Start a target server reachable via direct (simulating the backup node's behavior)
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create target listener: %v", err)
+	}
+	defer targetLn.Close()
+
+	go func() {
+		for {
+			conn, err := targetLn.Accept()
+			if err != nil {
+				return
+			}
+			conn.Write([]byte("backup-node-ok"))
+			conn.Close()
+		}
+	}()
+
+	targetAddr := targetLn.Addr().String()
+
+	users := map[string]config.UserConfig{
+		"charlie": {
+			Password: "pass",
+			Routes:   []string{"broken_node", "backup_node"},
+			Fallback: "backup_node", // fallback to backup_node
+		},
+	}
+	nodes := map[string]config.NodeConfig{
+		"broken_node": {
+			Type: "hysteria2",
+			Hysteria2: &config.Hysteria2OutboundConfig{
+				Addr:     "127.0.0.1:1", // unreachable
+				Auth:     "wrong_auth",
+				Insecure: true,
+			},
+		},
+		"backup_node": {
+			Type: "direct", // use direct as a stand-in for a working backup node
+		},
+	}
+
+	routerEngine := router.NewRouter(users, logger)
+	outboundFactory := router.NewOutboundFactory(nodes, logger)
+	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
+	eventLogger := event.NewEventLogger(routingOutbound, logger)
+
+	clientAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 54323}
+	eventLogger.Connect(clientAddr, "charlie:broken_node", 0)
+	eventLogger.TCPRequest(clientAddr, "charlie:broken_node", targetAddr)
+
+	conn, err := routingOutbound.TCP(targetAddr)
+	if err != nil {
+		t.Fatalf("expected fallback to backup_node to succeed, got error: %v", err)
+	}
+	defer conn.Close()
+
+	buf := make([]byte, 100)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if string(buf[:n]) != "backup-node-ok" {
+		t.Errorf("expected 'backup-node-ok', got %q", string(buf[:n]))
+	}
+
+	t.Logf("fallback to backup_node succeeded")
+	eventLogger.Disconnect(clientAddr, "charlie:broken_node", nil)
+}
