@@ -127,6 +127,64 @@ curl -H "Authorization: your_api_secret" http://127.0.0.1:9090/traffic
 sqlite3 /var/lib/hy2-gateway/traffic.db "SELECT * FROM traffic_summary;"
 ```
 
+## 数据库表结构
+
+SQLite 中有两张表：
+
+**traffic_summary** — 每个用户+节点的累计流量汇总
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `user_id` | TEXT | 用户名 |
+| `node_id` | TEXT | 节点名 |
+| `tx_total` | INTEGER | 累计上传字节数（服务端→目标） |
+| `rx_total` | INTEGER | 累计下载字节数（目标→服务端） |
+| `updated_at` | DATETIME | 最后更新时间 |
+
+**traffic_logs** — 增量流量明细（每次 flush 写入一条）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | INTEGER | 自增主键 |
+| `user_id` | TEXT | 用户名 |
+| `node_id` | TEXT | 节点名 |
+| `tx_bytes` | INTEGER | 本次增量上传字节数 |
+| `rx_bytes` | INTEGER | 本次增量下载字节数 |
+| `created_at` | DATETIME | 记录时间 |
+
+### 常用查询
+
+```sql
+-- 所有用户累计流量
+SELECT user_id, node_id, tx_total, rx_total FROM traffic_summary;
+
+-- 某用户累计流量
+SELECT node_id, tx_total, rx_total FROM traffic_summary WHERE user_id = 'alice';
+
+-- 某用户今天的流量
+SELECT SUM(tx_bytes) AS tx, SUM(rx_bytes) AS rx
+FROM traffic_logs
+WHERE user_id = 'alice' AND created_at >= date('now');
+
+-- 某用户本月每天的流量
+SELECT date(created_at) AS day, SUM(tx_bytes) AS tx, SUM(rx_bytes) AS rx
+FROM traffic_logs
+WHERE user_id = 'alice' AND created_at >= date('now', 'start of month')
+GROUP BY day ORDER BY day;
+
+-- 某用户按节点分组的今日流量
+SELECT node_id, SUM(tx_bytes) AS tx, SUM(rx_bytes) AS rx
+FROM traffic_logs
+WHERE user_id = 'alice' AND created_at >= date('now')
+GROUP BY node_id;
+
+-- 所有用户今日流量排行
+SELECT user_id, SUM(tx_bytes + rx_bytes) AS total
+FROM traffic_logs
+WHERE created_at >= date('now')
+GROUP BY user_id ORDER BY total DESC;
+```
+
 ## 配置说明
 
 | 字段 | 说明 |

@@ -164,7 +164,7 @@ func (h *SubscriptionHandler) buildTemplateData(username string, userCfg config.
 		auth := fmt.Sprintf("%s:%s:%s", username, route, userCfg.Password)
 
 		proxy := clashProxyData{
-			Name:     route, // use node name as proxy name
+			Name:     h.resolveNodeAlias(route), // use alias if available
 			Server:   host,
 			Port:     port,
 			Auth:     auth,
@@ -194,6 +194,14 @@ func (h *SubscriptionHandler) buildUserinfo(username string) string {
 	return fmt.Sprintf("upload=0; download=0; total=%d", userCfg.MaxBytes)
 }
 
+// resolveNodeAlias returns the alias for a node if configured, otherwise the node name itself.
+func (h *SubscriptionHandler) resolveNodeAlias(nodeName string) string {
+	if node, ok := h.cfg.Nodes[nodeName]; ok && node.Alias != "" {
+		return node.Alias
+	}
+	return nodeName
+}
+
 // splitHostPort splits "host:port" or ":port". If no port, defaults to "443".
 func splitHostPort(addr string) (host, port string) {
 	if idx := strings.LastIndex(addr, ":"); idx >= 0 {
@@ -209,30 +217,12 @@ func splitHostPort(addr string) (host, port string) {
 	return
 }
 
-const clashTemplate = `# Clash.Meta (mihomo) 配置
-# 自动生成，请勿手动修改
-# 用户: {{.Username}}
-
-mixed-port: 7890
-allow-lan: false
-mode: rule
+const clashTemplate = `# 用户: {{.Username}}
+ipv6: false
 log-level: info
-unified-delay: true
-tcp-concurrent: true
-
-dns:
-  enable: true
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  nameserver:
-    - https://dns.alidns.com/dns-query
-    - https://doh.pub/dns-query
-  fallback:
-    - https://dns.google/dns-query
-    - https://cloudflare-dns.com/dns-query
-  fallback-filter:
-    geoip: true
-    geoip-code: CN
+mode: global
+port: 7890
+socks-port: 7891
 
 proxies:
 {{- range .Proxies}}
@@ -252,36 +242,4 @@ proxies:
     obfs-password: "{{.ObfsPasswd}}"
 {{- end}}
 {{- end}}
-
-proxy-groups:
-  - name: "Proxy"
-    type: select
-    proxies:
-{{- range .Proxies}}
-      - "{{.Name}}"
-{{- end}}
-      - DIRECT
-
-  - name: "Auto"
-    type: url-test
-    proxies:
-{{- range .Proxies}}
-      - "{{.Name}}"
-{{- end}}
-    url: https://www.gstatic.com/generate_204
-    interval: 300
-
-rules:
-  # 私有地址直连
-  - IP-CIDR,127.0.0.0/8,DIRECT
-  - IP-CIDR,192.168.0.0/16,DIRECT
-  - IP-CIDR,10.0.0.0/8,DIRECT
-  - IP-CIDR,172.16.0.0/12,DIRECT
-
-  # 国内域名直连
-  - GEOSITE,cn,DIRECT
-  - GEOIP,CN,DIRECT
-
-  # 其余走代理
-  - MATCH,Proxy
 `

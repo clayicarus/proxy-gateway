@@ -106,6 +106,10 @@ type NodeConfig struct {
 	// Type: "direct", "socks5", "http", "hysteria2"
 	Type string `yaml:"type"`
 
+	// Alias is an optional display name used in generated subscription configs.
+	// If empty, the node key name is used.
+	Alias string `yaml:"alias,omitempty"`
+
 	// Direct outbound options
 	Direct *DirectConfig `yaml:"direct,omitempty"`
 
