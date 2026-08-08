@@ -100,20 +100,6 @@ users:
 	}
 }
 
-func TestLoad_RejectsACMEWithoutCertificateFiles(t *testing.T) {
-	content := `
-acme:
-  domains:
-    - gateway.example.com
-  email: admin@example.com
-`
-	path := writeTempFile(t, content)
-	_, err := Load(path)
-	if err == nil {
-		t.Error("expected error because embedded ACME is not implemented")
-	}
-}
-
 func TestLoad_AllowsEmptyRuntimeDatabase(t *testing.T) {
 	content := `
 tls:

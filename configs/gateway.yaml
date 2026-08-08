@@ -3,7 +3,7 @@
 # 监听地址
 listen: :8443
 
-# TLS 证书文件。可由 certbot/acme.sh 等外部工具签发和续期。
+# TLS 证书文件
 tls:
   cert: ./cert.pem
   key: ./key.pem

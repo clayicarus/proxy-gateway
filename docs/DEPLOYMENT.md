@@ -23,13 +23,7 @@ CGO_ENABLED=1 go test ./...
 
 ## 2. TLS 证书
 
-Gateway 当前只加载已有的 `tls.cert` 和 `tls.key` 文件，内置 ACME 尚未实现。可以用 certbot、acme.sh 等外部工具签发和续期。例如：
-
-```bash
-acme.sh --issue -d gateway.example.com --standalone
-```
-
-部署时把最终证书和私钥放到 service 用户可读的位置。使用自签证书测试时，生成的订阅必须配置 `sub.insecure: true`，或让客户端信任该证书：
+Gateway 只加载 YAML 中 `tls.cert` 和 `tls.key` 指定的证书文件。部署时把证书和私钥放到 service 用户可读的位置。使用自签证书测试时，生成的订阅必须配置 `sub.insecure: true`，或让客户端信任该证书：
 
 ```bash
 openssl ecparam -genkey -name prime256v1 -out key.pem

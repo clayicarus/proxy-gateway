@@ -10,7 +10,7 @@ Gateway 仍是一个单进程服务：QUIC Gateway、本地管理 Web、订阅�
 
 YAML 仅保存无法安全或合理地存入运行时数据库的启动配置：
 
-- Gateway UDP 监听、TLS 证书文件、QUIC、混淆和伪装参数。证书签发与续期由外部工具负责，内置 ACME 尚未实现。
+- Gateway UDP 监听、TLS 证书文件、QUIC、混淆和伪装参数。
 - SQLite 路径、流量 flush 间隔和自然月时区。
 - 本地管理 Web 监听地址，必须为 loopback 地址。
 - 订阅端点监听地址、对外 Gateway 地址、SNI 和订阅迁移密钥。

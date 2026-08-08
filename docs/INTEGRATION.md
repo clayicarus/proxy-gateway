@@ -46,7 +46,7 @@ server, err := hyServer.NewServer(&hyServer.Config{
 })
 ```
 
-TLS 证书由 `tls.LoadX509KeyPair` 从 YAML 指定的文件加载。项目当前没有把 ACME provider 接入 Hysteria2 server。
+TLS 证书由 `tls.LoadX509KeyPair` 从 YAML 指定的 `tls.cert` 与 `tls.key` 文件加载。
 
 ## 认证 ID
 

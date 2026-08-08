@@ -67,7 +67,7 @@ systemd:
   watchdog: true
 ```
 
-TLS 证书必须由外部工具准备。内置 ACME 尚未实现。`listen` 是 Hysteria2 的 UDP 端口；`admin.listen` 和 `sub.listen` 是两个独立的 HTTP/TCP 端口。`sub.publicURL` 是用户获取订阅的 URL 前缀，`sub.serverAddr` 则是订阅内容中客户端连接 Gateway 的地址。
+必须提供 `tls.cert` 与 `tls.key` 证书文件。`listen` 是 Hysteria2 的 UDP 端口；`admin.listen` 和 `sub.listen` 是两个独立的 HTTP/TCP 端口。`sub.publicURL` 是用户获取订阅的 URL 前缀，`sub.serverAddr` 则是订阅内容中客户端连接 Gateway 的地址。
 
 用户和节点不写在正常运行 YAML 中。首次启动后通过管理后台创建。
 
