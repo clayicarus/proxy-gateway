@@ -4,6 +4,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hy2-gateway/internal/config"
 	"go.uber.org/zap"
@@ -13,6 +14,8 @@ import (
 type userEntry struct {
 	password string
 	routes   map[string]bool // set of allowed node names
+	disabled bool
+	expires  *time.Time
 }
 
 // Authenticator implements server.Authenticator from the Hysteria2 core library.
@@ -57,6 +60,13 @@ func (a *Authenticator) Authenticate(addr net.Addr, auth string, tx uint64) (boo
 
 	if !exists {
 		a.logger.Warn("auth failed: unknown user",
+			zap.String("addr", addr.String()),
+			zap.String("username", username),
+		)
+		return false, ""
+	}
+	if entry.disabled || (entry.expires != nil && !entry.expires.After(time.Now())) {
+		a.logger.Warn("auth failed: inactive user",
 			zap.String("addr", addr.String()),
 			zap.String("username", username),
 		)
@@ -107,6 +117,8 @@ func buildUserEntries(users map[string]config.UserConfig) map[string]*userEntry 
 		m[name] = &userEntry{
 			password: u.Password,
 			routes:   routes,
+			disabled: u.Disabled,
+			expires:  u.ExpiresAt,
 		}
 	}
 	return m

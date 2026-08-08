@@ -1,316 +1,166 @@
 # Hy2-Gateway 架构设计
 
-## 概述
+## 系统边界
 
-Hy2-Gateway 是一个基于 Hysteria2 协议的网关服务，在 Hysteria2 核心库之上构建，
-实现按用户名路由、鉴权和流量统计等业务功能。
-
-不修改 Hysteria2 源码，而是通过实现其暴露的接口（Authenticator / Outbound / TrafficLogger / EventLogger）注入业务逻辑。
-
-## 整体架构
+Hy2-Gateway 在 Hysteria2 核心库之上实现多用户入口、显式节点路由、流量策略和 SQLite 控制面。Gateway、本地管理 Web、公开订阅 HTTP 服务、重启调度器和 watchdog 都运行在同一进程中；systemd 负责进程守护和异常重启。
 
 ```mermaid
-graph TB
-    subgraph 用户侧
-        UA[用户 A<br/>hy2 客户端]
-        UB[用户 B<br/>hy2 客户端]
-        UC[用户 C<br/>hy2 客户端]
+flowchart LR
+    C[Clash.Meta / hy2 客户端]
+    A[管理员浏览器]
+    SSH[SSH 本地端口转发]
+    N[Nginx / TLS 反向代理]
+
+    subgraph Gateway 主机
+        G[Hysteria2 Gateway<br/>UDP :8443]
+        W[管理 Web<br/>TCP 127.0.0.1:9090]
+        S[订阅服务<br/>TCP 127.0.0.1:9091]
+        DB[(SQLite)]
+        SD[systemd]
     end
 
-    subgraph Gateway
-        HY2S[hy2 Server<br/>:8443<br/>多用户认证 + 流量统计]
-        subgraph hy2 Client Pool
-            HC1[hy2 Client → node1<br/>QUIC 长连接<br/>预建立 + 自动重连]
-            HC2[hy2 Client → node2<br/>QUIC 长连接<br/>预建立 + 自动重连]
-        end
-        ROUTER[路由分发<br/>用户→node 映射]
+    subgraph 出站
+        D[direct]
+        P[SOCKS5 / HTTP 代理]
+        H[远端 Hysteria2 Node]
+        I[互联网]
     end
 
-    subgraph Node1
-        N1HY2[usque hy2<br/>hy2 Server]
-        N1TUN[netstack<br/>虚拟网卡]
-        N1MASQUE[MASQUE 隧道]
-    end
-
-    subgraph Node2
-        N2HY2[usque hy2<br/>hy2 Server]
-        N2TUN[netstack<br/>虚拟网卡]
-        N2MASQUE[MASQUE 隧道]
-    end
-
-    subgraph Cloudflare
-        CF[WARP 网络]
-        INET[互联网]
-    end
-
-    UA -->|QUIC 连接| HY2S
-    UB -->|QUIC 连接| HY2S
-    UC -->|QUIC 连接| HY2S
-
-    HY2S --> ROUTER
-    ROUTER --> HC1
-    ROUTER --> HC2
-
-    HC1 -->|QUIC 长连接| N1HY2
-    HC2 -->|QUIC 长连接| N2HY2
-
-    N1HY2 --> N1TUN --> N1MASQUE
-    N2HY2 --> N2TUN --> N2MASQUE
-
-    N1MASQUE --> CF
-    N2MASQUE --> CF
-    CF --> INET
+    C -->|QUIC / UDP| G
+    A --> SSH --> W
+    C -->|HTTPS /sub/token| N --> S
+    W --> DB
+    S --> DB
+    G --> DB
+    W -->|受限 D-Bus 重启| SD
+    SD -->|守护 / watchdog| G
+    G --> D --> I
+    G --> P --> I
+    G -->|QUIC / UDP| H --> I
 ```
 
-## TCP 数据流
+三个监听端口互不复用：
+
+- `listen` 是 Hysteria2 QUIC/UDP 入口。
+- `admin.listen` 是仅本机访问的管理 HTTP/TCP 入口。
+- `sub.listen` 是可由 Nginx 发布到公网的订阅 HTTP/TCP 入口。
+
+## 配置来源
+
+YAML 只保存启动前必须知道的参数：UDP/TLS/QUIC、管理和订阅监听、SQLite 路径、自然月时区、流量 flush 周期和 systemd 设置。TLS 使用已有的证书和私钥文件，证书签发与续期由外部工具完成。
+
+SQLite 保存：
+
+- 用户密码、软删除、到期时间、月额度、下载限速和订阅 token 哈希。
+- 节点定义、启用状态和用户节点授权。
+- 配置 revision、流量明细与汇总、重启任务和进程运行历史。
+
+进程启动时读取用户、节点和授权快照。节点定义及用户节点授权修改后增加保存 revision，必须重启才能成为运行 revision。用户密码、软删除、到期、额度和限速每 2 秒从 SQLite 刷新；新建用户在重启前没有启动快照，因此也不会提前获得运行权限。
+
+旧 YAML 的 `users`、`nodes`、`sub.secret` 和 `api.secret` 仅供显式 `migrate` 命令读取，不属于正常运行配置。
+
+## 认证与路由
+
+客户端 auth 格式为：
+
+```text
+username:node:password
+```
+
+第一个冒号前是用户名，第二段是客户端明确选择的节点，剩余内容是密码，因此密码可以包含冒号。Authenticator 同时检查用户状态、到期时间、密码和节点授权，成功后返回 `username:node` 作为连接 ID。
+
+Hysteria2 的 `Outbound` 接口只携带目标地址，不携带连接 ID。上游当前调用顺序是：
+
+```text
+EventLogger.TCPRequest(addr, id, target)
+Outbound.TCP(target)
+```
+
+UDP 请求也遵循对应顺序。EventLogger 将 `{protocol, id, target}` 放入容量为 1 的 channel，紧随其后的 RoutingOutbound 取出并校验协议和目标，再从 ID 解析节点。这个短交接段会串行化，实际拨号和数据转发仍然并发。
 
 ```mermaid
 sequenceDiagram
-    participant U as 用户 A
-    participant GS as Gateway<br/>hy2 Server
-    participant GC as Gateway<br/>hy2 Client
-    participant NS as Node<br/>hy2 Server
-    participant TUN as Node<br/>netstack
-    participant W as WARP
+    participant C as 客户端
+    participant A as Authenticator
+    participant E as EventLogger
+    participant R as RoutingOutbound
+    participant O as 显式节点 Outbound
 
-    Note over GC,NS: 预建立阶段（启动时）
-    GC->>NS: QUIC 握手 + TLS 1.3
-    GC->>NS: POST /auth (node 密码)
-    NS-->>GC: 233 HyOK
-    Note over GC,NS: QUIC 长连接就绪，后续复用
-
-    Note over U,W: 用户请求阶段
-    U->>GS: QUIC stream: TCPRequest<br/>目标 google.com:443
-
-    Note over GS: 认证: 查用户密码<br/>统计: rx += 请求字节数<br/>路由: 用户A → node1
-
-    GS->>GC: 转发请求
-    GC->>NS: 在已有 QUIC 连接上<br/>开新 stream: TCPRequest<br/>目标 google.com:443
-    NS->>TUN: DialContext("tcp", "google.com:443")
-    TUN->>W: IP 包 → MASQUE datagram
-    W-->>TUN: 响应 IP 包
-    TUN-->>NS: 连接建立
-    NS-->>GC: TCPResponse OK
-    GC-->>GS: 转发响应
-    GS-->>U: TCPResponse OK
-
-    Note over U,W: 双向数据 relay
-    U->>GS: 数据流
-    GS->>GC: relay（统计字节数）
-    GC->>NS: relay
-    NS->>TUN: relay
-    TUN->>W: MASQUE
-    W-->>TUN: 回程
-    TUN-->>NS: relay
-    NS-->>GC: relay
-    GC-->>GS: relay（统计字节数）
-    GS-->>U: 数据流
+    C->>A: auth = alice:node1:password
+    A-->>C: id = alice:node1
+    C->>E: TCPRequest(target, id)
+    E->>R: handoff(protocol, id, target)
+    C->>R: TCP(target)
+    R->>R: 校验 handoff 并解析 node1
+    R->>O: TCP(target)
+    O-->>C: 双向 relay
 ```
 
-## Gateway 内部组件
+路由采用 fail-closed：上下文缺失或错配、ID 缺少节点、节点不存在、节点未授权或拨号失败都直接报错。服务端不会替换为 `direct`，也不会自动选择其他节点。客户端可在订阅中拿到多个获授权的代理条目，并在客户端侧配置选择或故障切换。
 
-```
-┌──────────────────────────────────────────────────────┐
-│                   Hy2-Gateway                        │
-│                                                      │
-│  ┌──────────────┐  ┌───────────────┐  ┌───────────┐ │
-│  │ Authenticator │  │ TrafficLogger │  │ EventLogger│ │
-│  │ 用户鉴权      │  │ 流量统计+配额  │  │ 上下文桥接 │ │
-│  └──────┬───────┘  └───────┬───────┘  └─────┬─────┘ │
-│         │                  │                │       │
-│  ┌──────▼──────────────────▼────────────────▼─────┐ │
-│  │              RoutingOutbound                    │ │
-│  │         按用户名选择出站策略                      │ │
-│  └──────┬──────────────┬──────────────┬───────────┘ │
-│         │              │              │             │
-│  ┌──────▼─────┐ ┌──────▼─────┐ ┌─────▼──────┐     │
-│  │  Direct    │ │ SOCKS5/HTTP│ │ hy2 Client │     │
-│  │  直连出站   │ │ 代理出站    │ │ Pool       │     │
-│  └────────────┘ └────────────┘ │ 预建立+重连  │     │
-│                                └─────────────┘     │
-│                                                      │
-│  ┌──────────────┐  ┌───────────────┐                │
-│  │ SQLite Store │  │ Management API│                │
-│  │ 流量持久化    │  │ :9090         │                │
-│  └──────────────┘  └───────────────┘                │
-└──────────────────────────────────────────────────────┘
-```
+## 出站生命周期
 
-## Hysteria2 核心接口
+`OutboundFactory` 持有启动时加载的节点定义，并按需创建、缓存每个节点的一个 outbound：
 
-### 1. Authenticator
+- `direct`、SOCKS5 和 HTTP CONNECT 在第一次使用时创建。
+- Hysteria2 outbound 也在第一次使用该节点时创建；创建时其 `ReconnectableClient` 立即建立一条 QUIC 连接，之后自动重连并复用 stream。
+- Gateway 停机时关闭所有已缓存且支持关闭的 outbound。
 
-```go
-type Authenticator interface {
-    Authenticate(addr net.Addr, auth string, tx uint64) (ok bool, id string)
-}
-```
+这不是多连接池，也不会在 Gateway 启动时预连接全部节点。当前一个 Hysteria2 节点对应一个缓存 client。
 
-- 客户端连接时调用
-- `auth` 字段格式为 `username:password`（userpass 模式）
-- 返回 `ok` 表示是否通过认证，`id` 作为用户标识贯穿整个连接生命周期
+## 流量、配额和连接
 
-### 2. Outbound
+Hysteria2 将认证 ID、`tx` 和 `rx` 交给 TrafficLogger。Gateway 按 `username + node` 维护内存累计值，定期把增量写入 `traffic_logs` 并更新 `traffic_summary`。
 
-```go
-type Outbound interface {
-    TCP(reqAddr string) (net.Conn, error)
-    UDP(reqAddr string) (UDPConn, error)
-}
-```
+- `tx`：客户端经 Gateway 发往 Node 或目标。
+- `rx`：Node 或目标经 Gateway 发往客户端。
+- 用户自然月额度：该用户所有节点的 `tx + rx`。
+- 用户下载限速：该用户所有连接共享的 `rx` 令牌桶。
 
-- 每个代理请求都会调用此接口建立到目标的连接
-- **关键限制**：原生 Outbound 接口不携带用户信息
+数据库时间统一为 UTC Unix 秒；自然月边界按 YAML `timezone` 换算到 UTC 查询。异常退出最多损失一个 flush 周期的内存增量。
 
-### 3. TrafficLogger
+停用、到期或超额后，Authenticator 拒绝新连接；TrafficLogger 在已有会话产生下一笔流量时返回 false，使 Hysteria2 关闭整条客户端 QUIC 连接。密码重置只影响后续认证。
 
-```go
-type TrafficLogger interface {
-    LogTraffic(id string, tx, rx uint64) (ok bool)
-    LogOnlineState(id string, online bool)
-    TraceStream(stream HyStream, stats *StreamStats)
-    UntraceStream(stream HyStream)
-}
+`TraceStream`、`UntraceStream` 与 EventLogger 共同维护内存中的连接和目标快照，管理后台的 `/live` 每 2 秒读取该快照。连接明细不持久化。
+
+## 管理与订阅
+
+管理 Web 使用服务端模板和表单，不提供通用管理 JSON API。`/live` 和 `/traffic-range` 是同一后台页面使用的只读数据端点；写操作只能 POST，并要求进程启动时生成的 CSRF token。后台没有登录鉴权，因此监听地址会被强制校验为 loopback。
+
+订阅服务是独立 handler。URL token 是 bearer credential：新 token 随机生成，数据库只保存 SHA-256 哈希；重置后旧链接立即失效。订阅从数据库读取用户当前密码和生命周期状态，但只下发进程启动时已加载的节点与授权快照，防止待重启配置提前暴露。
+
+`sub.publicURL` 只决定后台展示的订阅 URL，`sub.serverAddr` 决定生成配置中每个 Hysteria2 代理连接的 Gateway 地址。所有代理都先连接 Gateway，不会把远端 Node 地址直接发给用户。
+
+## systemd 与停机
+
+后台通过 godbus 调用 systemd D-Bus，只请求 YAML 中固定 unit 的重启，不执行 shell 命令。计划任务存入 SQLite；调度器每 5 秒领取到期任务。
+
+启用 watchdog 时，应用仅在 Gateway serve loop 正常且 SQLite `Ping` 成功时发送心跳。Node 不可用不会触发整个 Gateway 重启。`ExecStopPost` 使用轻量的 `record-exit` 子命令写入 systemd 的 `SERVICE_RESULT`、`EXIT_CODE` 和 `EXIT_STATUS`，供故障分析页面展示。
+
+收到 SIGINT/SIGTERM 后，进程依次停止后台刷新和调度、关闭两个 HTTP server、关闭 QUIC server、关闭缓存出站、flush 流量并关闭 SQLite。systemd 的 `TimeoutStopSec` 应大于应用内部关闭宽限时间。
+
+## 模块
+
+```text
+cmd/gateway/          进程入口、migrate、record-exit 和生命周期
+internal/api/         管理 Web、静态资源和订阅 handler
+internal/auth/        auth 解析、鉴权和用户快照更新
+internal/config/      启动 YAML 与旧 YAML 类型
+internal/connection/  活跃连接和请求追踪
+internal/event/       上游事件和请求上下文交接
+internal/router/      路由决策、出站工厂与出站实现
+internal/storage/     SQLite schema、迁移和查询
+internal/subtoken/    随机 token 与旧 HMAC token
+internal/systemd/     D-Bus 和 sd_notify
+internal/traffic/     计量、配额、限速和 flush
+test/integration/     组件集成测试
+test/e2e/             真实 Hysteria2 请求链路测试
 ```
 
-- `id` 就是 Authenticator 返回的用户标识
-- `LogTraffic` 返回 false 可以断开用户连接（用于限流/封禁）
-- `TraceStream`/`UntraceStream` 用于 stream 级别的追踪
+## 关键约束
 
-### 4. EventLogger
-
-```go
-type EventLogger interface {
-    Connect(addr net.Addr, id string, tx uint64)
-    Disconnect(addr net.Addr, id string, err error)
-    TCPRequest(addr net.Addr, id, reqAddr string)
-    TCPError(addr net.Addr, id, reqAddr string, err error)
-    UDPRequest(addr net.Addr, id string, sessionID uint32, reqAddr string)
-    UDPError(addr net.Addr, id string, sessionID uint32, err error)
-}
-```
-
-## 按用户路由的实现
-
-### 问题
-
-Hysteria2 的 `Outbound` 接口只接收 `reqAddr`（目标地址），不携带用户信息。
-在 Outbound 层面无法直接知道当前请求属于哪个用户。
-
-### 解决方案：EventLogger 时序桥接
-
-通过阅读 Hysteria2 源码（`server.go` 的 `handleTCPRequest`），确认了关键时序：
-
-```
-EventLogger.TCPRequest(addr, id, reqAddr)   ← 先调用，携带用户 ID
-Outbound.TCP(reqAddr)                        ← 后调用，不携带用户 ID
-```
-
-利用这个时序，在 `EventLogger.TCPRequest` 中将 `(addr, reqAddr) → userId` 写入并发安全的映射，
-然后在 `RoutingOutbound.TCP` 中查找该映射获取用户 ID，再根据用户的路由配置选择对应的出站。
-
-```
-Connect(addr, id="alice")
-  → connCtx[addr] = "alice"
-
-TCPRequest(addr, id="alice", reqAddr="google.com:443")
-  → requestCtx[addr+"->"+reqAddr] = "alice"
-
-Outbound.TCP("google.com:443")
-  → 查 requestCtx 得到 "alice"
-  → 查路由表: alice → node1
-  → 通过 hy2 Client Pool 中 node1 的长连接转发
-```
-
-### hy2 Client Pool 设计要点
-
-- **预建立**：Gateway 启动时即与所有配置的 node 建立 QUIC 长连接
-- **自动重连**：使用 hysteria2 client 库的 `ReconnectableClient`，断线自动恢复
-- **Stream 复用**：每个用户请求在已有 QUIC 连接上开新 stream，无需重新握手
-- **连接池化**：同一个 node 可以维护多条 QUIC 连接以提高并发吞吐
-
-## 模块划分
-
-```
-hy2-gateway/
-├── cmd/
-│   └── gateway/              # 入口
-│       └── main.go
-├── internal/
-│   ├── config/               # 配置解析
-│   │   └── config.go
-│   ├── auth/                 # 鉴权模块
-│   │   └── authenticator.go
-│   ├── router/               # 路由模块
-│   │   ├── router.go         # 路由决策引擎
-│   │   ├── outbound.go       # RoutingOutbound（核心）
-│   │   ├── direct.go         # 直连出站
-│   │   ├── socks5.go         # SOCKS5 代理出站
-│   │   ├── http.go           # HTTP CONNECT 代理出站
-│   │   └── hysteria2.go      # hy2 客户端出站
-│   ├── traffic/              # 流量统计
-│   │   └── logger.go
-│   ├── storage/              # 持久化
-│   │   └── sqlite.go
-│   ├── event/                # 事件日志
-│   │   └── logger.go
-│   └── api/                  # 管理 API
-│       └── server.go
-├── test/
-│   ├── integration/          # 组件级集成测试
-│   │   └── e2e_test.go
-│   └── e2e/                  # 真实 hy2 客户端连通测试
-│       └── hy2_e2e_test.go
-├── configs/
-│   └── gateway.yaml          # 示例配置
-├── docs/
-│   ├── ARCHITECTURE.md       # 本文档
-│   ├── INTEGRATION.md        # Hysteria2 核心库集成指南
-│   └── ROADMAP.md            # 开发路线图
-├── Dockerfile
-├── Makefile
-├── go.mod
-└── go.sum
-```
-
-## 配置设计
-
-```yaml
-listen: :8443
-
-tls:
-  cert: /path/to/cert.pem
-  key: /path/to/key.pem
-
-users:
-  alice:
-    password: "alice_pass"
-    route: "node1"              # 路由到 node1
-    maxBytes: 107374182400      # 100GB 流量限制
-  bob:
-    password: "bob_pass"
-    route: "node2"              # 路由到 node2
-    maxBytes: 0                 # 不限流量
-  charlie:
-    password: "charlie_pass"
-    route: "direct"             # 直连出站
-
-nodes:
-  node1:
-    type: hysteria2
-    hysteria2:
-      addr: "node1.example.com:443"
-      auth: "node1_auth_string"
-  node2:
-    type: hysteria2
-    hysteria2:
-      addr: "node2.example.com:443"
-      auth: "node2_auth_string"
-
-api:
-  listen: ":9090"
-  secret: "admin_secret"
-
-dbPath: "hy2-gateway.db"
-trafficFlushInterval: 10s
-```
+- Hysteria2 上游若改变 EventLogger 与 Outbound 的调用时序，必须重新验证上下文交接。
+- SQLite 是单实例控制面，不支持多个 Gateway 进程共享运行配置。
+- 节点和授权不是热更新，后台必须清楚展示保存 revision 与运行 revision。
+- `direct` 是特殊的显式节点，不存入 `managed_nodes`。
+- Gateway 和 Node 的成本值都是有效负载估算，不含协议开销和重传。

@@ -132,65 +132,54 @@ func (f *OutboundFactory) Close() {
 // we use the EventLogger callbacks to set user context before
 // each outbound call. The key insight from reading the hy2 source:
 //
-//   handleTCPRequest() calls EventLogger.TCPRequest() BEFORE Outbound.TCP()
+//	handleTCPRequest() calls EventLogger.TCPRequest() BEFORE Outbound.TCP()
 //
-// So we record (clientAddr, reqAddr) → id in TCPRequest,
-// then look it up in TCP(). The id is "username:node_name".
+// The event callback hands one context to the immediately following outbound
+// call. The one-slot channel serializes this handoff so concurrent requests to
+// the same target cannot exchange identities.
 type RoutingOutbound struct {
-	router  *Router
-	factory *OutboundFactory
-	// connCtx maps clientAddr -> id for active connections
-	connCtx sync.Map
-	// Default outbound when user context is unavailable
-	defaultOutbound hyServer.Outbound
-	logger          *zap.Logger
+	router         *Router
+	factory        *OutboundFactory
+	requestContext chan outboundRequestContext
+	logger         *zap.Logger
+}
+
+type outboundRequestContext struct {
+	clientAddr string
+	id         string
+	reqAddr    string
+	network    string
 }
 
 // NewRoutingOutbound creates a new routing-aware outbound.
 func NewRoutingOutbound(router *Router, factory *OutboundFactory, logger *zap.Logger) *RoutingOutbound {
 	return &RoutingOutbound{
-		router:          router,
-		factory:         factory,
-		defaultOutbound: &DirectOutbound{logger: logger},
-		logger:          logger,
+		router:         router,
+		factory:        factory,
+		requestContext: make(chan outboundRequestContext, 1),
+		logger:         logger,
 	}
-}
-
-// SetUserContext records the mapping from client address to user ID.
-// Called by EventLogger.Connect.
-func (ro *RoutingOutbound) SetUserContext(addr net.Addr, id string) {
-	ro.connCtx.Store(addr.String(), id)
-	ro.logger.Debug("user context set",
-		zap.String("addr", addr.String()),
-		zap.String("id", id),
-	)
-}
-
-// ClearUserContext removes the mapping for a client address.
-// Called by EventLogger.Disconnect.
-func (ro *RoutingOutbound) ClearUserContext(addr net.Addr) {
-	ro.connCtx.Delete(addr.String())
 }
 
 // GetOutboundForID returns the appropriate outbound for an authenticated ID.
 func (ro *RoutingOutbound) GetOutboundForID(id string) (hyServer.Outbound, error) {
-	route := ro.router.GetRoute(id)
+	route, err := ro.router.GetRoute(id)
+	if err != nil {
+		return nil, err
+	}
 	return ro.factory.Get(route)
 }
 
 // TCP implements server.Outbound.
 func (ro *RoutingOutbound) TCP(reqAddr string) (net.Conn, error) {
-	id := ro.getCurrentUser(reqAddr)
-	if id == "" {
-		ro.logger.Warn("no user context for TCP request, using default outbound",
-			zap.String("reqAddr", reqAddr),
-		)
-		return ro.defaultOutbound.TCP(reqAddr)
+	id, err := ro.takeRequestContext("tcp", reqAddr)
+	if err != nil {
+		return nil, err
 	}
 
 	ob, err := ro.GetOutboundForID(id)
 	if err != nil {
-		return ro.fallbackTCP(id, reqAddr, err)
+		return nil, err
 	}
 
 	ro.logger.Debug("routing TCP request",
@@ -200,24 +189,21 @@ func (ro *RoutingOutbound) TCP(reqAddr string) (net.Conn, error) {
 
 	conn, err := ob.TCP(reqAddr)
 	if err != nil {
-		return ro.fallbackTCP(id, reqAddr, err)
+		return nil, err
 	}
 	return conn, nil
 }
 
 // UDP implements server.Outbound.
 func (ro *RoutingOutbound) UDP(reqAddr string) (hyServer.UDPConn, error) {
-	id := ro.getCurrentUser(reqAddr)
-	if id == "" {
-		ro.logger.Warn("no user context for UDP request, using default outbound",
-			zap.String("reqAddr", reqAddr),
-		)
-		return ro.defaultOutbound.UDP(reqAddr)
+	id, err := ro.takeRequestContext("udp", reqAddr)
+	if err != nil {
+		return nil, err
 	}
 
 	ob, err := ro.GetOutboundForID(id)
 	if err != nil {
-		return ro.fallbackUDP(id, reqAddr, err)
+		return nil, err
 	}
 
 	ro.logger.Debug("routing UDP request",
@@ -227,92 +213,44 @@ func (ro *RoutingOutbound) UDP(reqAddr string) (hyServer.UDPConn, error) {
 
 	conn, err := ob.UDP(reqAddr)
 	if err != nil {
-		return ro.fallbackUDP(id, reqAddr, err)
+		return nil, err
 	}
 	return conn, nil
 }
 
-// fallbackTCP attempts the fallback route for a failed TCP request.
-func (ro *RoutingOutbound) fallbackTCP(id, reqAddr string, originalErr error) (net.Conn, error) {
-	fb := ro.router.GetFallback(id)
-	if fb == "reject" {
-		ro.logger.Error("outbound failed, no fallback configured",
-			zap.String("id", id),
-			zap.String("reqAddr", reqAddr),
-			zap.Error(originalErr),
-		)
-		return nil, originalErr
-	}
-
-	ro.logger.Warn("outbound failed, using fallback",
-		zap.String("id", id),
-		zap.String("reqAddr", reqAddr),
-		zap.String("fallback", fb),
-		zap.Error(originalErr),
-	)
-
-	fbOb, err := ro.factory.Get(fb)
-	if err != nil {
-		return nil, fmt.Errorf("fallback %q also failed: %w (original: %v)", fb, err, originalErr)
-	}
-	return fbOb.TCP(reqAddr)
-}
-
-// fallbackUDP attempts the fallback route for a failed UDP request.
-func (ro *RoutingOutbound) fallbackUDP(id, reqAddr string, originalErr error) (hyServer.UDPConn, error) {
-	fb := ro.router.GetFallback(id)
-	if fb == "reject" {
-		ro.logger.Error("outbound failed, no fallback configured",
-			zap.String("id", id),
-			zap.String("reqAddr", reqAddr),
-			zap.Error(originalErr),
-		)
-		return nil, originalErr
-	}
-
-	ro.logger.Warn("outbound failed, using fallback",
-		zap.String("id", id),
-		zap.String("reqAddr", reqAddr),
-		zap.String("fallback", fb),
-		zap.Error(originalErr),
-	)
-
-	fbOb, err := ro.factory.Get(fb)
-	if err != nil {
-		return nil, fmt.Errorf("fallback %q also failed: %w (original: %v)", fb, err, originalErr)
-	}
-	return fbOb.UDP(reqAddr)
-}
-
-// requestCtx maps a request key to id ("username:node_name").
-// Set by EventLogger before Outbound is called.
-var requestCtx sync.Map
-
 // SetRequestContext is called by EventLogger.TCPRequest/UDPRequest
-// to associate a request with a user before the Outbound is invoked.
-func SetRequestContext(addr net.Addr, id, reqAddr string) {
-	key := fmt.Sprintf("%s->%s", addr.String(), reqAddr)
-	requestCtx.Store(key, id)
+// to associate exactly one request with the immediately following Outbound
+// call. A single-slot handoff prevents concurrent requests for the same target
+// from consuming each other's user identity.
+func (ro *RoutingOutbound) SetRequestContext(addr net.Addr, id, network, reqAddr string) {
+	ro.requestContext <- outboundRequestContext{
+		clientAddr: addr.String(),
+		id:         id,
+		reqAddr:    reqAddr,
+		network:    network,
+	}
 }
 
-// ClearRequestContext removes the request context after use.
-func ClearRequestContext(addr net.Addr, reqAddr string) {
-	key := fmt.Sprintf("%s->%s", addr.String(), reqAddr)
-	requestCtx.Delete(key)
-}
-
-// getCurrentUser tries to find the user for the current request.
-func (ro *RoutingOutbound) getCurrentUser(reqAddr string) string {
-	var found string
-	requestCtx.Range(func(key, value any) bool {
-		k := key.(string)
-		suffix := "->" + reqAddr
-		if len(k) > len(suffix) && k[len(k)-len(suffix):] == suffix {
-			found = value.(string)
-			requestCtx.Delete(key)
-			return false
+func (ro *RoutingOutbound) takeRequestContext(network, reqAddr string) (string, error) {
+	select {
+	case current := <-ro.requestContext:
+		if current.network != network || current.reqAddr != reqAddr {
+			ro.logger.Error("routing request context mismatch",
+				zap.String("clientAddr", current.clientAddr),
+				zap.String("id", current.id),
+				zap.String("contextNetwork", current.network),
+				zap.String("requestNetwork", network),
+				zap.String("contextAddr", current.reqAddr),
+				zap.String("requestAddr", reqAddr),
+			)
+			return "", fmt.Errorf("routing request context mismatch")
 		}
-		return true
-	})
-	return found
+		return current.id, nil
+	default:
+		ro.logger.Error("routing request context missing",
+			zap.String("network", network),
+			zap.String("reqAddr", reqAddr),
+		)
+		return "", fmt.Errorf("routing request context missing")
+	}
 }

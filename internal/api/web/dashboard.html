@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Hy2 Gateway 管理</title>
+  <link rel="stylesheet" href="/assets/admin.css?v=4">
+  <script src="/assets/admin.js?v=4" defer></script>
+</head>
+<body>
+  <!-- Icons are from Lucide (ISC License). -->
+  <svg class="icon-sprite" aria-hidden="true">
+    <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+    <symbol id="i-dashboard" viewBox="0 0 24 24"><rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/></symbol>
+    <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M18 17V9M13 17V5M8 17v-3"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.46 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4M12 17h.01"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14M12 5v14"/></symbol>
+    <symbol id="i-server" viewBox="0 0 24 24"><rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><path d="M6 6h.01M6 18h.01"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><path d="m15.5 7.5 2.3 2.3a1 1 0 0 0 1.4 0l2.1-2.1a1 1 0 0 0 0-1.4L19 4"/><path d="m21 2-9.6 9.6"/><circle cx="7.5" cy="15.5" r="5.5"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M19 6l-1 14H6L5 6M8 6V4h8v2M10 11v5M14 11v5"/></symbol>
+    <symbol id="i-restore" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M20 7h-9M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></symbol>
+    <symbol id="i-calendar" viewBox="0 0 24 24"><path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h5.5M16 2v4M8 2v4M3 10h8"/><circle cx="18" cy="18" r="4"/><path d="M18 16.5V18l1 1"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 12h16M4 6h16M4 18h16"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/></symbol>
+    <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/></symbol>
+    <symbol id="i-dollar" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8M12 18V6"/></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24"><path d="m18 15-6-6-6 6"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3Z"/><path d="m9 12 2 2 4-4"/></symbol>
+    <symbol id="i-network" viewBox="0 0 24 24"><rect width="6" height="6" x="9" y="2" rx="1"/><rect width="6" height="6" x="2" y="16" rx="1"/><rect width="6" height="6" x="16" y="16" rx="1"/><path d="M12 8v4M5 16v-2h14v2"/></symbol>
+  </svg>
+
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-mark">H2</div>
+        <div><strong>Hy2 Gateway</strong><span>Control plane</span></div>
+      </div>
+      <nav class="primary-nav" aria-label="管理板块">
+        <a href="#overview" data-nav="overview" class="active"><svg class="icon"><use href="#i-dashboard"/></svg><span>基本信息</span></a>
+        <a href="#users" data-nav="users"><svg class="icon"><use href="#i-users"/></svg><span>用户管理</span></a>
+        <a href="#connections" data-nav="connections"><svg class="icon"><use href="#i-network"/></svg><span>活跃连接</span></a>
+        <a href="#costs" data-nav="costs"><svg class="icon"><use href="#i-chart"/></svg><span>成本分析</span></a>
+        <a href="#faults" data-nav="faults"><svg class="icon"><use href="#i-alert"/></svg><span>故障分析</span></a>
+      </nav>
+      <div class="sidebar-status">
+        <span class="live-dot" data-live-dot></span>
+        <div><strong data-live-label>实时数据连接中</strong><span>每 2 秒采样</span></div>
+      </div>
+    </aside>
+    <div class="sidebar-backdrop" data-sidebar-backdrop></div>
+
+    <main class="workspace">
+      <header class="topbar">
+        <button class="icon-button mobile-menu" type="button" data-menu-toggle aria-label="打开导航" title="打开导航"><svg class="icon"><use href="#i-menu"/></svg></button>
+        <div><p class="eyebrow" id="section-kicker">运行概览</p><h1 id="section-title">基本信息</h1></div>
+        <div class="revision"><span>保存版本 {{.State.Revision}}</span><span>运行版本 {{.State.ActiveRevision}}</span></div>
+      </header>
+
+      {{if ne .State.Revision .State.ActiveRevision}}<div class="banner warning"><svg class="icon"><use href="#i-alert"/></svg><span>节点或用户授权已经保存，Gateway 重启后生效。</span><a href="#faults" data-jump="faults">安排重启</a></div>{{end}}
+      {{if .Flash}}<div class="banner info"><svg class="icon"><use href="#i-shield"/></svg><span>{{.Flash}}</span></div>{{end}}
+
+      <section class="view active" data-view="overview" aria-labelledby="overview-heading">
+        <div class="section-heading"><div><p class="eyebrow">运行概览</p><h2 id="overview-heading">基本信息</h2></div><span class="section-meta">{{.MonthLabel}} · {{.Timezone}}</span></div>
+
+        <div class="metric-grid">
+          <article class="metric"><div class="metric-icon teal"><svg class="icon"><use href="#i-users"/></svg></div><div><span>有效用户</span><strong>{{.ActiveUsers}}</strong><small>共 {{.TotalUsers}} 个账户</small></div></article>
+          <article class="metric"><div class="metric-icon blue"><svg class="icon"><use href="#i-server"/></svg></div><div><span>启用节点</span><strong>{{.EnabledNodes}}</strong><small>配置后重启生效</small></div></article>
+          <article class="metric"><div class="metric-icon amber"><svg class="icon"><use href="#i-activity"/></svg></div><div><span>在线连接</span><strong id="live-online">{{.OnlineCount}}</strong><small data-sampled-at>等待实时采样</small></div></article>
+          <article class="metric"><div class="metric-icon red"><svg class="icon"><use href="#i-dollar"/></svg></div><div><span>本月 Gateway 流量</span><strong>{{bytes .MonthlyTotal}}</strong><small>有效负载 tx + rx</small></div></article>
+        </div>
+
+        <div class="panel live-panel">
+          <div class="panel-heading"><div><h3>当前有效负载速度</h3><p>所有用户与节点的实时聚合</p></div><span class="live-badge"><span class="live-dot" data-live-dot></span>LIVE</span></div>
+          <div class="speed-grid">
+            <div class="speed-stat"><svg class="icon tx"><use href="#i-up"/></svg><div><span>上传 tx</span><strong id="total-tx-speed">0 B/s</strong></div></div>
+            <div class="speed-stat"><svg class="icon rx"><use href="#i-down"/></svg><div><span>下载 rx</span><strong id="total-rx-speed">0 B/s</strong></div></div>
+          </div>
+        </div>
+
+        <div class="two-column">
+          <div class="panel">
+            <div class="panel-heading"><div><h3>服务配置</h3><p>当前进程读取的启动参数</p></div><svg class="panel-icon"><use href="#i-settings"/></svg></div>
+            <dl class="facts">
+              <div><dt>Gateway QUIC</dt><dd>{{.GatewayListen}}</dd></div>
+              <div><dt>管理后台</dt><dd>{{.AdminListen}}</dd></div>
+              <div><dt>订阅服务</dt><dd>{{.SubscriptionListen}}</dd></div>
+              <div><dt>数据库</dt><dd title="{{.DBPath}}">{{.DBPath}}</dd></div>
+              <div><dt>写入周期</dt><dd>{{.FlushInterval}}</dd></div>
+              <div><dt>自然月时区</dt><dd>{{.Timezone}}</dd></div>
+            </dl>
+          </div>
+
+          <div class="panel">
+            <div class="panel-heading"><div><h3>节点配置</h3><p>启停和内容修改均需重启</p></div><button class="button secondary" type="button" data-open-dialog="node-dialog"><svg class="icon"><use href="#i-plus"/></svg>新增或更新</button></div>
+            <div class="compact-list">
+              {{range .Nodes}}<div class="compact-row"><div class="node-avatar"><svg class="icon"><use href="#i-server"/></svg></div><div class="grow"><strong>{{.Name}}</strong><span>{{.Config.Type}}{{if .Config.Alias}} · {{.Config.Alias}}{{end}}</span></div><span class="badge {{if .Enabled}}success{{else}}neutral{{end}}">{{if .Enabled}}启用{{else}}停用{{end}}</span>{{if .Enabled}}<form method="post" action="/nodes/{{.Name}}/disable" data-confirm-title="停用节点 {{.Name}}？" data-confirm-summary="节点将在下次 Gateway 重启后停止提供出站服务。" data-confirm-risk="重启会中断全部活跃连接；仍选择该节点的旧客户端配置可能认证失败。" data-confirm-label="确认停用" data-confirm-tone="danger"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button class="icon-button danger" aria-label="停用 {{.Name}}" title="停用节点"><svg class="icon"><use href="#i-x"/></svg></button></form>{{end}}</div>{{else}}<div class="empty-state">尚未配置远端节点</div>{{end}}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" data-view="users" aria-labelledby="users-heading">
+        <div class="section-heading"><div><p class="eyebrow">账户与策略</p><h2 id="users-heading">用户管理</h2></div><button class="button primary" type="button" data-open-dialog="user-dialog"><svg class="icon"><use href="#i-plus"/></svg>创建用户</button></div>
+        <div class="panel table-panel">
+          <div class="table-toolbar"><div><strong>{{.TotalUsers}} 个用户</strong><span>速度为当前有效负载，月流量按 tx + rx 统计</span></div></div>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>用户</th><th>状态</th><th>当前速度</th><th>本月流量</th><th>额度 / 下载限速</th><th>授权节点</th><th class="actions-column">操作</th></tr></thead>
+              <tbody>
+              {{range .Users}}{{$user := .}}{{$usage := index $.Monthly .Username}}{{$used := add (index $usage 0) (index $usage 1)}}
+                <tr data-user-row="{{.Username}}">
+                  <td><div class="identity"><span class="avatar">{{printf "%.1s" .Username}}</span><div><strong>{{.Username}}</strong><span>更新于 {{timefmt .UpdatedAt}}</span></div></div></td>
+                  <td>{{if .DeletedAt}}<span class="badge danger">已停用</span>{{else if expired .ExpiresAt $.Now}}<span class="badge warning">已过期</span>{{else}}<span class="badge success">有效</span>{{end}}<div class="cell-note">{{date .ExpiresAt}}</div></td>
+                  <td><div class="speed-cell" data-user-speed="{{.Username}}"><span class="tx">↑ <b data-tx>0 B/s</b></span><span class="rx">↓ <b data-rx>0 B/s</b></span><small><b data-online>0</b> 在线</small></div></td>
+                  <td><strong>{{bytes $used}}</strong>{{if .MonthlyBytes}}<progress max="100" value="{{percent $used .MonthlyBytes}}"></progress><span class="cell-note">{{percent $used .MonthlyBytes}}%</span>{{else}}<span class="cell-note">不限额度</span>{{end}}</td>
+                  <td><span>{{if .MonthlyBytes}}{{bytes .MonthlyBytes}}{{else}}不限{{end}}</span><div class="cell-note">rx {{if .DownloadSpeed}}{{bytes .DownloadSpeed}}/s{{else}}不限速{{end}}</div></td>
+                  <td><div class="chips">{{range .Routes}}<span>{{.}}</span>{{else}}<span class="muted-chip">无授权</span>{{end}}</div></td>
+                  <td><div class="row-actions">
+                    <details class="action-menu"><summary class="icon-button" title="编辑用户" aria-label="编辑用户"><svg class="icon"><use href="#i-settings"/></svg></summary><div class="action-popover"><form method="post" action="/users/{{.Username}}/save" data-confirm-title="保存 {{.Username}} 的策略？" data-confirm-summary="月额度、下载限速和到期时间将影响后续流量及新连接。" data-confirm-risk="若当前月用量已超过新额度，连接会在产生下一笔流量时断开；授权节点变更必须重启 Gateway。" data-confirm-label="确认保存"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="username" value="{{.Username}}"><label class="field">月额度（字节）<input name="monthly_bytes" value="{{.MonthlyBytes}}" inputmode="numeric"></label><label class="field">下载限速（字节/秒）<input name="download_speed" value="{{.DownloadSpeed}}" inputmode="numeric"></label><label class="field">到期时间<input type="datetime-local" name="expires_at" value="{{datetime .ExpiresAt}}"></label><fieldset><legend>授权节点</legend><div class="choice-grid">{{range $.Nodes}}<label><input type="checkbox" name="routes" value="{{.Name}}" {{if contains $user.Routes .Name}}checked{{end}} {{if not .Enabled}}disabled{{end}}> {{.Name}}</label>{{end}}<label><input type="checkbox" name="routes" value="direct" {{if contains $user.Routes "direct"}}checked{{end}}> direct</label></div></fieldset><button class="button primary" type="submit">保存配置</button></form></div></details>
+                    <form method="post" action="/users/{{.Username}}/password" data-confirm-title="重置 {{.Username}} 的密码？" data-confirm-summary="旧密码将立即不能用于建立新连接，已有连接不会中断。" data-confirm-risk="新密码只展示一次，管理员必须妥善记录并重新分发给用户。" data-confirm-label="确认重置" data-confirm-tone="danger"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button class="icon-button" aria-label="重置密码" title="重置密码"><svg class="icon"><use href="#i-key"/></svg></button></form>
+                    <form method="post" action="/users/{{.Username}}/token" data-confirm-title="重置 {{.Username}} 的订阅链接？" data-confirm-summary="旧订阅 URL 将立即失效，代理连接密码保持不变。" data-confirm-risk="所有使用旧 URL 的客户端都需要更新；已有代理连接不会中断。" data-confirm-label="确认重置" data-confirm-tone="danger"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button class="icon-button" aria-label="重置订阅链接" title="重置订阅链接"><svg class="icon"><use href="#i-refresh"/></svg></button></form>
+                    {{if .DeletedAt}}<form method="post" action="/users/{{.Username}}/restore" data-confirm-title="启用用户 {{.Username}}？" data-confirm-summary="该用户将重新能够建立新连接并获取订阅。" data-confirm-risk="原有密码、额度、到期时间和节点授权都会继续使用；尚未应用的授权变更仍需重启 Gateway。" data-confirm-label="确认启用"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button class="icon-button" aria-label="启用用户" title="启用用户"><svg class="icon"><use href="#i-restore"/></svg></button></form>{{else}}<form method="post" action="/users/{{.Username}}/delete" data-confirm-title="停用用户 {{.Username}}？" data-confirm-summary="该用户将无法建立新连接或获取订阅。" data-confirm-risk="已有会话会在下一笔流量时关闭整条 QUIC 连接；用户配置和历史流量会保留，可稍后重新启用。" data-confirm-label="确认停用" data-confirm-tone="danger"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button class="icon-button danger" aria-label="停用用户" title="停用用户"><svg class="icon"><use href="#i-x"/></svg></button></form>{{end}}
+                  </div></td>
+                </tr>
+              {{else}}<tr><td colspan="7"><div class="empty-state">尚未创建用户</div></td></tr>{{end}}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" data-view="connections" aria-labelledby="connections-heading">
+        <div class="section-heading"><div><p class="eyebrow">实时会话</p><h2 id="connections-heading">活跃连接</h2></div><span class="section-meta"><b id="connection-count">0</b> 个客户端会话</span></div>
+        <div class="panel table-panel">
+          <div class="panel-heading"><div><h3>当前客户端</h3><p>会话与代理请求只保留在当前进程内存</p></div><span class="live-badge"><span class="live-dot" data-live-dot></span>LIVE</span></div>
+          <div class="table-scroll"><table data-sort-table><thead><tr><th>客户端 IP</th><th>源地址</th><th>用户</th><th>访问节点</th><th data-sort-type="number">连接时长</th><th data-sort-type="number">代理请求</th><th>当前目标</th></tr></thead><tbody id="connection-rows"><tr><td colspan="7"><div class="empty-state">暂无活跃连接</div></td></tr></tbody></table></div>
+        </div>
+      </section>
+
+      <section class="view" data-view="costs" aria-labelledby="costs-heading">
+        <div class="section-heading"><div><p class="eyebrow">{{.MonthLabel}}</p><h2 id="costs-heading">成本分析</h2></div><span class="section-meta">有效负载估算，不含 QUIC/IP 包头与重传</span></div>
+        <div class="metric-grid cost-metrics">
+          <article class="metric"><div class="metric-icon teal"><svg class="icon"><use href="#i-dollar"/></svg></div><div><span>Gateway 估算出站</span><strong>{{bytes .MonthlyTotal}}</strong><small>全部用户 tx + rx</small></div></article>
+          <article class="metric"><div class="metric-icon red"><svg class="icon"><use href="#i-server"/></svg></div><div><span>Node 估算出站</span><strong>{{bytes .NodeEgressTotal}}</strong><small>非 direct 节点 tx + rx</small></div></article>
+          <article class="metric"><div class="metric-icon blue"><svg class="icon"><use href="#i-up"/></svg></div><div><span>当前上传</span><strong id="cost-tx-speed">0 B/s</strong><small>Gateway → Node / 目标</small></div></article>
+          <article class="metric"><div class="metric-icon amber"><svg class="icon"><use href="#i-down"/></svg></div><div><span>当前下载</span><strong id="cost-rx-speed">0 B/s</strong><small>Gateway → 客户端</small></div></article>
+        </div>
+        <div class="panel range-panel">
+          <div class="panel-heading"><div><h3>时间范围分析</h3><p id="range-timezone">查询时区：{{.Timezone}}</p></div><div class="preset-actions"><button class="button secondary" type="button" data-range-preset="day">24 小时</button><button class="button secondary" type="button" data-range-preset="week">7 天</button><button class="button secondary" type="button" data-range-preset="month">本月</button></div></div>
+          <form class="range-form" id="traffic-range-form"><label class="field">开始时间<input type="datetime-local" name="start" required></label><label class="field">结束时间<input type="datetime-local" name="end" required></label><button class="button primary" type="submit"><svg class="icon"><use href="#i-chart"/></svg>查询</button></form>
+          <div class="range-summary">
+            <div><span>Gateway 估算出站</span><strong id="range-gateway">—</strong></div>
+            <div><span>Node 估算出站</span><strong id="range-node">—</strong></div>
+            <div><span>小时流量峰值</span><strong id="range-peak">—</strong><small id="range-peak-time">等待查询</small></div>
+          </div>
+          <div class="hourly-chart" id="hourly-chart" aria-label="每小时流量"></div>
+          <div class="table-scroll"><table data-sort-table><thead><tr><th>类型</th><th>名称</th><th data-sort-type="number">上传 tx</th><th data-sort-type="number">下载 rx</th><th data-sort-type="number">合计</th><th data-sort-type="number">估算出口</th></tr></thead><tbody id="range-breakdown"><tr><td colspan="6"><div class="empty-state">选择时间范围后查询</div></td></tr></tbody></table></div>
+        </div>
+        <div class="panel table-panel">
+          <div class="panel-heading"><div><h3>节点成本拆分</h3><p>远端节点与 Gateway 分别产生一次出站，direct 只计 Gateway</p></div></div>
+          <div class="table-scroll"><table data-sort-table><thead><tr><th>节点</th><th>当前速度</th><th data-sort-type="number">用户上传 tx</th><th data-sort-type="number">用户下载 rx</th><th data-sort-type="number">Gateway 估算出站</th><th data-sort-type="number">Node 估算出站</th></tr></thead><tbody>{{range $name, $usage := .NodeMonthly}}<tr><td><div class="identity"><span class="node-avatar"><svg class="icon"><use href="#i-server"/></svg></span><strong>{{$name}}</strong></div></td><td><div class="speed-cell horizontal" data-node-speed="{{$name}}"><span class="tx">↑ <b data-tx>0 B/s</b></span><span class="rx">↓ <b data-rx>0 B/s</b></span></div></td><td data-sort-value="{{index $usage 0}}">{{bytes (index $usage 0)}}</td><td data-sort-value="{{index $usage 1}}">{{bytes (index $usage 1)}}</td><td data-sort-value="{{add (index $usage 0) (index $usage 1)}}"><strong>{{bytes (add (index $usage 0) (index $usage 1))}}</strong></td><td data-sort-value="{{if eq $name "direct"}}0{{else}}{{add (index $usage 0) (index $usage 1)}}{{end}}">{{if eq $name "direct"}}<span class="badge neutral">不适用</span>{{else}}<strong>{{bytes (add (index $usage 0) (index $usage 1))}}</strong>{{end}}</td></tr>{{else}}<tr><td colspan="6"><div class="empty-state">本月暂无节点流量</div></td></tr>{{end}}</tbody></table></div>
+        </div>
+        <div class="panel table-panel">
+          <div class="panel-heading"><div><h3>用户月流量</h3><p>用于月额度执行与 Gateway 成本归集</p></div></div>
+          <div class="table-scroll"><table data-sort-table><thead><tr><th>用户</th><th data-sort-type="number">上传 tx</th><th data-sort-type="number">下载 rx</th><th data-sort-type="number">合计</th><th data-sort-type="number">月额度</th></tr></thead><tbody>{{range .Users}}{{$usage := index $.Monthly .Username}}{{$used := add (index $usage 0) (index $usage 1)}}<tr><td><strong>{{.Username}}</strong></td><td data-sort-value="{{index $usage 0}}">{{bytes (index $usage 0)}}</td><td data-sort-value="{{index $usage 1}}">{{bytes (index $usage 1)}}</td><td data-sort-value="{{$used}}"><strong>{{bytes $used}}</strong></td><td data-sort-value="{{.MonthlyBytes}}">{{if .MonthlyBytes}}{{bytes .MonthlyBytes}} · {{percent $used .MonthlyBytes}}%{{else}}不限{{end}}</td></tr>{{else}}<tr><td colspan="5"><div class="empty-state">暂无用户数据</div></td></tr>{{end}}</tbody></table></div>
+        </div>
+      </section>
+
+      <section class="view" data-view="faults" aria-labelledby="faults-heading">
+        <div class="section-heading"><div><p class="eyebrow">运行诊断</p><h2 id="faults-heading">故障分析</h2></div></div>
+        <div class="panel service-health">
+          <div class="health-indicator {{if .SystemdConfigured}}configured{{end}}"><svg class="icon"><use href="#i-shield"/></svg></div>
+          <div class="grow"><span>systemd 服务状态</span><strong>{{.SystemdInfo}}</strong><small>配置版本 {{.State.Revision}} / 运行版本 {{.State.ActiveRevision}}</small></div>
+          {{if .SystemdConfigured}}<form class="restart-form" method="post" action="/restart" data-confirm-title="安排 Gateway 重启？" data-confirm-summary="留空执行时间时，将在几秒内重启；指定时间时会创建持久化任务。" data-confirm-risk="重启会断开全部活跃连接，客户端需要重新连接；待应用配置会由新进程加载。" data-confirm-label="确认安排重启" data-confirm-tone="danger"><input type="hidden" name="csrf" value="{{.CSRF}}"><label class="field">执行时间<input type="datetime-local" name="run_at"></label><button class="button primary" type="submit"><svg class="icon"><use href="#i-refresh"/></svg>安排重启</button></form>{{end}}
+        </div>
+        <div class="two-column fault-columns">
+          <div class="panel table-panel">
+            <div class="panel-heading"><div><h3>进程运行记录</h3><p>退出原因由 systemd ExecStopPost 写入</p></div></div>
+            <div class="table-scroll"><table><thead><tr><th>启动时间</th><th>PID</th><th>版本</th><th>启动来源</th><th>结果</th><th>退出码</th></tr></thead><tbody>{{range .ProcessRuns}}<tr><td>{{timefmt .StartedAt}}</td><td class="mono">{{.PID}}</td><td>{{.ConfigRevision}}</td><td>{{.Trigger}}</td><td>{{if .StoppedAt}}<span class="badge {{if eq .SystemdResult "success"}}success{{else}}warning{{end}}">{{if .SystemdResult}}{{.SystemdResult}}{{else}}已退出{{end}}</span>{{else}}<span class="badge success">运行中</span>{{end}}</td><td class="mono">{{if .ExitCode}}{{.ExitCode}} / {{.ExitStatus}}{{else}}—{{end}}</td></tr>{{else}}<tr><td colspan="6"><div class="empty-state">暂无进程记录</div></td></tr>{{end}}</tbody></table></div>
+          </div>
+          <div class="panel table-panel">
+            <div class="panel-heading"><div><h3>重启任务</h3><p>后台提交的即时与定时任务</p></div></div>
+            <div class="table-scroll"><table><thead><tr><th>计划时间</th><th>状态</th><th>来源</th></tr></thead><tbody>{{range .RestartJobs}}<tr><td>{{timefmt .RunAt}}</td><td><span class="badge {{if eq .Status "completed"}}success{{else if eq .Status "failed"}}danger{{else}}warning{{end}}">{{.Status}}</span></td><td>{{.Trigger}}</td></tr>{{else}}<tr><td colspan="3"><div class="empty-state">暂无重启任务</div></td></tr>{{end}}</tbody></table></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="confirm-dialog" class="modal confirm-modal" aria-labelledby="confirm-title">
+    <div class="modal-heading"><div><p class="eyebrow">操作确认</p><h2 id="confirm-title" data-confirm-title>确认操作</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="关闭" title="关闭"><svg class="icon"><use href="#i-x"/></svg></button></div>
+    <div class="confirm-content"><div class="confirm-icon"><svg class="icon"><use href="#i-alert"/></svg></div><div><p data-confirm-summary></p><div class="risk-box"><strong>风险</strong><span data-confirm-risk></span></div></div></div>
+    <div class="modal-actions confirm-actions"><button class="button secondary" type="button" data-close-dialog>取消</button><button class="button primary" type="button" data-confirm-submit>确认操作</button></div>
+  </dialog>
+
+  <dialog id="user-dialog" class="modal">
+    <div class="modal-heading"><div><p class="eyebrow">新账户</p><h2>创建用户</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="关闭" title="关闭"><svg class="icon"><use href="#i-x"/></svg></button></div>
+    <form method="post" action="/users"><input type="hidden" name="csrf" value="{{.CSRF}}"><div class="form-grid"><label class="field">用户名<input name="username" required autocomplete="off"></label><label class="field">月额度（字节，0 不限）<input name="monthly_bytes" value="0" inputmode="numeric"></label><label class="field">下载总限速（字节/秒）<input name="download_speed" value="0" inputmode="numeric"></label><label class="field">到期时间（{{.Timezone}}）<input type="datetime-local" name="expires_at"></label></div><fieldset><legend>授权节点</legend><div class="choice-grid">{{range .Nodes}}<label><input type="checkbox" name="routes" value="{{.Name}}" {{if not .Enabled}}disabled{{end}}> {{.Name}}{{if .Config.Alias}} · {{.Config.Alias}}{{end}}</label>{{end}}<label><input type="checkbox" name="routes" value="direct"> direct</label></div></fieldset><div class="modal-actions"><button class="button secondary" type="button" data-close-dialog>取消</button><button class="button primary" type="submit"><svg class="icon"><use href="#i-plus"/></svg>创建并生成凭据</button></div></form>
+  </dialog>
+
+  <dialog id="node-dialog" class="modal">
+    <div class="modal-heading"><div><p class="eyebrow">出站配置</p><h2>新增或更新节点</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="关闭" title="关闭"><svg class="icon"><use href="#i-x"/></svg></button></div>
+    <form method="post" action="/nodes"><input type="hidden" name="csrf" value="{{.CSRF}}"><div class="form-grid"><label class="field">节点名<input name="name" required autocomplete="off"></label><label class="field">显示名<input name="alias"></label><label class="field">类型<select name="type" data-node-type-select><option value="hysteria2">Hysteria2</option><option value="socks5">SOCKS5</option><option value="http">HTTP</option><option value="direct">Direct</option></select></label><label class="field" data-node-field="hysteria2 socks5">地址<input name="addr" placeholder="host:port"></label><label class="field" data-node-field="hysteria2">Hy2 Auth<input name="auth"></label><label class="field" data-node-field="hysteria2">SNI<input name="sni"></label><label class="field" data-node-field="http">HTTP URL<input name="url" placeholder="https://proxy.example"></label><label class="field" data-node-field="socks5">SOCKS 用户名<input name="proxy_username"></label><label class="field" data-node-field="socks5">SOCKS 密码<input name="proxy_password" type="password"></label></div><fieldset><legend>节点选项</legend><div class="choice-grid"><label><input type="checkbox" name="enabled" checked> 启用</label><label data-node-field="hysteria2 http"><input type="checkbox" name="insecure"> 跳过 TLS 验证</label></div></fieldset><div class="modal-actions"><button class="button secondary" type="button" data-close-dialog>取消</button><button class="button primary" type="submit"><svg class="icon"><use href="#i-server"/></svg>保存节点</button></div></form>
+  </dialog>
+</body>
+</html>

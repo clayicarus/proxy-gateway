@@ -12,7 +12,6 @@ import (
 type Config struct {
 	Listen string    `yaml:"listen"`
 	TLS    TLSConfig `yaml:"tls"`
-	ACME   *ACMEConfig `yaml:"acme,omitempty"`
 
 	// Obfuscation (optional, must match client)
 	Obfs *ObfsConfig `yaml:"obfs,omitempty"`
@@ -21,19 +20,26 @@ type Config struct {
 	QUIC *QUICConfig `yaml:"quic,omitempty"`
 
 	// Users with per-user routing and quota
+	//
+	// Deprecated: only read by the explicit `migrate` command. Runtime users
+	// are stored in SQLite.
 	Users map[string]UserConfig `yaml:"users"`
 
 	// Outbound nodes
+	//
+	// Deprecated: only read by the explicit `migrate` command. Runtime nodes
+	// are stored in SQLite.
 	Nodes map[string]NodeConfig `yaml:"nodes"`
 
-	// Management API
+	// API is retained only for legacy listener and subscription-secret migration.
 	API APIConfig `yaml:"api"`
+
+	// Admin is the loopback-only management web listener. API is retained so
+	// legacy configurations can be migrated without losing their listener.
+	Admin AdminConfig `yaml:"admin,omitempty"`
 
 	// Subscription config for generating client configs
 	Sub *SubConfig `yaml:"sub,omitempty"`
-
-	// Bandwidth limit (server-wide, optional)
-	Bandwidth *BandwidthConfig `yaml:"bandwidth,omitempty"`
 
 	// Masquerade (optional)
 	Masquerade *MasqueradeConfig `yaml:"masquerade,omitempty"`
@@ -43,17 +49,18 @@ type Config struct {
 
 	// Traffic stats flush interval
 	TrafficFlushInterval time.Duration `yaml:"trafficFlushInterval,omitempty"`
+
+	// Timezone controls natural-month usage boundaries. Timestamps in SQLite
+	// are always stored as UTC Unix timestamps.
+	Timezone string `yaml:"timezone,omitempty"`
+
+	// Optional systemd integration for restart requests and watchdog support.
+	Systemd *SystemdConfig `yaml:"systemd,omitempty"`
 }
 
 type TLSConfig struct {
 	Cert string `yaml:"cert"`
 	Key  string `yaml:"key"`
-}
-
-type ACMEConfig struct {
-	Domains []string `yaml:"domains"`
-	Email   string   `yaml:"email"`
-	CA      string   `yaml:"ca,omitempty"`
 }
 
 type ObfsConfig struct {
@@ -64,18 +71,13 @@ type ObfsConfig struct {
 }
 
 type QUICConfig struct {
-	InitStreamReceiveWindow     uint64        `yaml:"initStreamReceiveWindow,omitempty"`
-	MaxStreamReceiveWindow      uint64        `yaml:"maxStreamReceiveWindow,omitempty"`
-	InitConnReceiveWindow       uint64        `yaml:"initConnReceiveWindow,omitempty"`
-	MaxConnReceiveWindow        uint64        `yaml:"maxConnReceiveWindow,omitempty"`
-	MaxIdleTimeout              time.Duration `yaml:"maxIdleTimeout,omitempty"`
-	MaxIncomingStreams           int64         `yaml:"maxIncomingStreams,omitempty"`
-	DisablePathMTUDiscovery     bool          `yaml:"disablePathMTUDiscovery,omitempty"`
-}
-
-type BandwidthConfig struct {
-	Up   string `yaml:"up,omitempty"`
-	Down string `yaml:"down,omitempty"`
+	InitStreamReceiveWindow uint64        `yaml:"initStreamReceiveWindow,omitempty"`
+	MaxStreamReceiveWindow  uint64        `yaml:"maxStreamReceiveWindow,omitempty"`
+	InitConnReceiveWindow   uint64        `yaml:"initConnReceiveWindow,omitempty"`
+	MaxConnReceiveWindow    uint64        `yaml:"maxConnReceiveWindow,omitempty"`
+	MaxIdleTimeout          time.Duration `yaml:"maxIdleTimeout,omitempty"`
+	MaxIncomingStreams      int64         `yaml:"maxIncomingStreams,omitempty"`
+	DisablePathMTUDiscovery bool          `yaml:"disablePathMTUDiscovery,omitempty"`
 }
 
 type MasqueradeConfig struct {
@@ -89,12 +91,12 @@ type MasqueradeConfig struct {
 // UserConfig defines per-user settings.
 type UserConfig struct {
 	Password string `yaml:"password"`
+	// Disabled and ExpiresAt are runtime-only fields populated from SQLite.
+	Disabled  bool       `yaml:"-"`
+	ExpiresAt *time.Time `yaml:"-"`
 	// Routes is the list of outbound node names this user can access.
 	// "direct" is a special value meaning direct connection.
 	Routes []string `yaml:"routes"`
-	// Fallback is the outbound to use when the primary route is unavailable.
-	// Can be "direct", another node name, or "reject" (default) to return error.
-	Fallback string `yaml:"fallback,omitempty"`
 	// MaxBytes is the maximum total traffic (tx+rx) in bytes across all nodes. 0 means unlimited.
 	MaxBytes uint64 `yaml:"maxBytes,omitempty"`
 	// SpeedLimit in bytes per second. 0 means unlimited.
@@ -151,7 +153,17 @@ type Hysteria2OutboundConfig struct {
 
 type APIConfig struct {
 	Listen string `yaml:"listen"`
+	// Secret is only used when importing legacy HMAC subscription tokens.
 	Secret string `yaml:"secret"`
+}
+
+type AdminConfig struct {
+	Listen string `yaml:"listen"`
+}
+
+type SystemdConfig struct {
+	Unit     string `yaml:"unit,omitempty"`
+	Watchdog bool   `yaml:"watchdog,omitempty"`
 }
 
 // SubConfig defines subscription endpoint settings.
@@ -159,6 +171,12 @@ type SubConfig struct {
 	// Secret used to generate per-user tokens (HMAC key).
 	// If empty, falls back to api.secret.
 	Secret string `yaml:"secret,omitempty"`
+	// Listen is the public HTTP listener for subscription URLs. It is separate
+	// from the loopback-only management listener.
+	Listen string `yaml:"listen,omitempty"`
+	// PublicURL is the externally reachable base URL for subscription links,
+	// for example https://sub.example.com/sub/.
+	PublicURL string `yaml:"publicURL,omitempty"`
 	// ServerAddr is the public address of the gateway that clients connect to,
 	// e.g. "your.domain.com:8443". Used in generated proxy configs.
 	ServerAddr string `yaml:"serverAddr"`
@@ -192,12 +210,37 @@ func (c *Config) validate() error {
 		c.Listen = ":443"
 	}
 
-	if c.TLS.Cert == "" && c.ACME == nil {
-		return fmt.Errorf("either tls or acme must be configured")
+	if c.TLS.Cert == "" || c.TLS.Key == "" {
+		return fmt.Errorf("tls.cert and tls.key must be configured")
 	}
 
+	if c.Timezone == "" {
+		c.Timezone = "UTC"
+	}
+	if _, err := time.LoadLocation(c.Timezone); err != nil {
+		return fmt.Errorf("invalid timezone %q: %w", c.Timezone, err)
+	}
+
+	if c.Systemd != nil {
+		if c.Systemd.Unit == "" {
+			c.Systemd.Unit = "hy2-gateway.service"
+		}
+	}
+	if c.TrafficFlushInterval == 0 {
+		c.TrafficFlushInterval = 10 * time.Second
+	}
+	if c.DBPath == "" {
+		c.DBPath = "hy2-gateway.db"
+	}
+
+	return nil
+}
+
+// ValidateLegacy validates the deprecated static user/node data used only by
+// the one-time migration command.
+func (c *Config) ValidateLegacy() error {
 	if len(c.Users) == 0 {
-		return fmt.Errorf("at least one user must be configured")
+		return fmt.Errorf("at least one legacy user must be configured")
 	}
 
 	for name, user := range c.Users {
@@ -207,18 +250,11 @@ func (c *Config) validate() error {
 		if len(user.Routes) == 0 {
 			return fmt.Errorf("user %q has no routes", name)
 		}
-		// Validate route references
 		for _, route := range user.Routes {
 			if route != "direct" {
 				if _, ok := c.Nodes[route]; !ok {
 					return fmt.Errorf("user %q references unknown node %q", name, route)
 				}
-			}
-		}
-		// Validate fallback reference
-		if user.Fallback != "" && user.Fallback != "reject" && user.Fallback != "direct" {
-			if _, ok := c.Nodes[user.Fallback]; !ok {
-				return fmt.Errorf("user %q fallback references unknown node %q", name, user.Fallback)
 			}
 		}
 	}
@@ -242,14 +278,6 @@ func (c *Config) validate() error {
 		default:
 			return fmt.Errorf("node %q has unknown type %q", name, node.Type)
 		}
-	}
-
-	if c.TrafficFlushInterval == 0 {
-		c.TrafficFlushInterval = 10 * time.Second
-	}
-
-	if c.DBPath == "" {
-		c.DBPath = "hy2-gateway.db"
 	}
 
 	return nil

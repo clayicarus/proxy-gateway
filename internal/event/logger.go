@@ -4,6 +4,7 @@ import (
 	"net"
 
 	hyServer "github.com/apernet/hysteria/core/v2/server"
+	"github.com/hy2-gateway/internal/connection"
 	"github.com/hy2-gateway/internal/router"
 	"go.uber.org/zap"
 )
@@ -16,21 +17,27 @@ var _ hyServer.EventLogger = (*EventLogger)(nil)
 // by setting user context before outbound connections are made.
 type EventLogger struct {
 	routingOutbound *router.RoutingOutbound
+	connections     *connection.Tracker
 	logger          *zap.Logger
 }
 
 // NewEventLogger creates a new EventLogger.
-func NewEventLogger(routingOutbound *router.RoutingOutbound, logger *zap.Logger) *EventLogger {
-	return &EventLogger{
+func NewEventLogger(routingOutbound *router.RoutingOutbound, logger *zap.Logger, trackers ...*connection.Tracker) *EventLogger {
+	result := &EventLogger{
 		routingOutbound: routingOutbound,
 		logger:          logger,
 	}
+	if len(trackers) > 0 {
+		result.connections = trackers[0]
+	}
+	return result
 }
 
 // Connect is called when a client connects.
-// This is where we establish the addr -> userId mapping.
 func (e *EventLogger) Connect(addr net.Addr, id string, tx uint64) {
-	e.routingOutbound.SetUserContext(addr, id)
+	if e.connections != nil {
+		e.connections.Connect(addr, id)
+	}
 	e.logger.Info("client connected",
 		zap.String("addr", addr.String()),
 		zap.String("user", id),
@@ -40,7 +47,9 @@ func (e *EventLogger) Connect(addr net.Addr, id string, tx uint64) {
 
 // Disconnect is called when a client disconnects.
 func (e *EventLogger) Disconnect(addr net.Addr, id string, err error) {
-	e.routingOutbound.ClearUserContext(addr)
+	if e.connections != nil {
+		e.connections.Disconnect(addr)
+	}
 	if err != nil {
 		e.logger.Info("client disconnected",
 			zap.String("addr", addr.String()),
@@ -60,7 +69,10 @@ func (e *EventLogger) Disconnect(addr net.Addr, id string, err error) {
 // hysteria2 server.go handleTCPRequest), so we set the request
 // context here for the routing outbound to pick up.
 func (e *EventLogger) TCPRequest(addr net.Addr, id, reqAddr string) {
-	router.SetRequestContext(addr, id, reqAddr)
+	e.routingOutbound.SetRequestContext(addr, id, "tcp", reqAddr)
+	if e.connections != nil {
+		e.connections.StartTCP(addr, reqAddr)
+	}
 	e.logger.Debug("TCP request",
 		zap.String("addr", addr.String()),
 		zap.String("user", id),
@@ -72,7 +84,9 @@ func (e *EventLogger) TCPRequest(addr net.Addr, id, reqAddr string) {
 // Note: Hysteria2 calls this for ALL connection closures, not just errors.
 // A nil error means the connection closed normally.
 func (e *EventLogger) TCPError(addr net.Addr, id, reqAddr string, err error) {
-	router.ClearRequestContext(addr, reqAddr)
+	if e.connections != nil {
+		e.connections.StopTCP(addr, reqAddr)
+	}
 	if err != nil {
 		e.logger.Warn("TCP error",
 			zap.String("addr", addr.String()),
@@ -91,7 +105,10 @@ func (e *EventLogger) TCPError(addr net.Addr, id, reqAddr string, err error) {
 
 // UDPRequest is called when a client makes a UDP proxy request.
 func (e *EventLogger) UDPRequest(addr net.Addr, id string, sessionID uint32, reqAddr string) {
-	router.SetRequestContext(addr, id, reqAddr)
+	e.routingOutbound.SetRequestContext(addr, id, "udp", reqAddr)
+	if e.connections != nil {
+		e.connections.StartUDP(addr, sessionID, reqAddr)
+	}
 	e.logger.Debug("UDP request",
 		zap.String("addr", addr.String()),
 		zap.String("user", id),
@@ -102,6 +119,9 @@ func (e *EventLogger) UDPRequest(addr net.Addr, id string, sessionID uint32, req
 
 // UDPError is called when a UDP proxy request encounters an error.
 func (e *EventLogger) UDPError(addr net.Addr, id string, sessionID uint32, err error) {
+	if e.connections != nil {
+		e.connections.StopUDP(addr, sessionID)
+	}
 	e.logger.Warn("UDP error",
 		zap.String("addr", addr.String()),
 		zap.String("user", id),

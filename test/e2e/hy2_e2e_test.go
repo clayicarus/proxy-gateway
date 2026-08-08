@@ -74,10 +74,19 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 			if err != nil {
 				return
 			}
-			buf := make([]byte, 1024)
-			n, _ := conn.Read(buf)
-			conn.Write([]byte("echo:" + string(buf[:n])))
-			conn.Close()
+			go func(conn net.Conn) {
+				defer conn.Close()
+				buf := make([]byte, 1024)
+				for {
+					n, err := conn.Read(buf)
+					if err != nil {
+						return
+					}
+					if _, err := conn.Write([]byte("echo:" + string(buf[:n]))); err != nil {
+						return
+					}
+				}
+			}(conn)
 		}
 	}()
 
@@ -333,5 +342,108 @@ func TestHy2E2E_UnknownUser(t *testing.T) {
 		t.Error("expected auth to fail for unknown user")
 	} else {
 		t.Logf("unknown user correctly rejected: %v", err)
+	}
+}
+
+func TestHy2E2E_ExpiredUserDisconnectsExistingConnection(t *testing.T) {
+	logger := zap.NewNop()
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetLn.Close()
+	go func() {
+		for {
+			conn, err := targetLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				buffer := make([]byte, 64)
+				for {
+					n, err := conn.Read(buffer)
+					if err != nil {
+						return
+					}
+					if _, err := conn.Write(buffer[:n]); err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	tlsCert, err := generateSelfSignedCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().UTC().Add(time.Hour)
+	users := map[string]config.UserConfig{
+		"alice": {Password: "pass123", Routes: []string{"direct"}, ExpiresAt: &future},
+	}
+	authenticator := auth.NewAuthenticator(users, logger)
+	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
+	routingOutbound := router.NewRoutingOutbound(router.NewRouter(users, logger), router.NewOutboundFactory(nil, logger), logger)
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := hyServer.NewServer(&hyServer.Config{
+		TLSConfig:     hyServer.TLSConfig{Certificates: []tls.Certificate{tlsCert}},
+		Conn:          udpConn,
+		Authenticator: authenticator,
+		Outbound:      routingOutbound,
+		TrafficLogger: trafficLogger,
+		EventLogger:   event.NewEventLogger(routingOutbound, logger),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go server.Serve()
+	defer server.Close()
+
+	serverAddr, err := net.ResolveUDPAddr("udp", udpConn.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, _, err := hyClient.NewClient(&hyClient.Config{
+		ServerAddr: serverAddr,
+		Auth:       "alice:direct:pass123",
+		TLSConfig: hyClient.TLSConfig{
+			ServerName:         "localhost",
+			InsecureSkipVerify: true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	conn, err := client.TCP(targetLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("before-expiry")); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 64)
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := conn.Read(buffer); err != nil || string(buffer[:n]) != "before-expiry" {
+		t.Fatalf("active connection failed before expiry: n=%d err=%v data=%q", n, err, buffer[:n])
+	}
+
+	past := time.Now().UTC().Add(-time.Hour)
+	users["alice"] = config.UserConfig{Password: "pass123", Routes: []string{"direct"}, ExpiresAt: &past}
+	authenticator.UpdateUsers(users)
+	trafficLogger.UpdateUsers(users)
+	_, _ = conn.Write([]byte("after-expiry"))
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := conn.Read(buffer); err == nil {
+		t.Fatalf("expired existing connection remained usable: n=%d data=%q", n, buffer[:n])
 	}
 }

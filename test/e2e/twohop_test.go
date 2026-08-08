@@ -38,10 +38,19 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 			if err != nil {
 				return
 			}
-			buf := make([]byte, 1024)
-			n, _ := conn.Read(buf)
-			conn.Write([]byte("twohop-echo:" + string(buf[:n])))
-			conn.Close()
+			go func(conn net.Conn) {
+				defer conn.Close()
+				buf := make([]byte, 1024)
+				for {
+					n, err := conn.Read(buf)
+					if err != nil {
+						return
+					}
+					if _, err := conn.Write([]byte("twohop-echo:" + string(buf[:n]))); err != nil {
+						return
+					}
+				}
+			}(conn)
 		}
 	}()
 

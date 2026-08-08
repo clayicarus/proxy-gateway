@@ -3,16 +3,10 @@
 # 监听地址
 listen: :8443
 
-# TLS 配置（二选一：tls 或 acme）
+# TLS 证书文件。可由 certbot/acme.sh 等外部工具签发和续期。
 tls:
-  cert: /etc/hy2-gateway/cert.pem
-  key: /etc/hy2-gateway/key.pem
-
-# ACME 自动证书（与 tls 二选一）
-# acme:
-#   domains:
-#     - your.domain.com
-#   email: [email protected]
+  cert: ./cert.pem
+  key: ./key.pem
 
 # 混淆（可选，需要客户端也配置相同密码）
 # obfs:
@@ -33,88 +27,35 @@ tls:
 #     rewriteHost: true
 
 # ============================================================
-# 用户配置
-# 每个用户有独立的密码、可用节点列表、fallback 策略和流量配额
-# 客户端 auth 字段格式: "username:node_name:password"
-# 例如: "alice:node1:alice_secure_pass_123"
+# 管理后台（必须只绑定 loopback）
 # ============================================================
-users:
-  alice:
-    password: "alice_secure_pass_123"
-    routes:                          # 可用节点列表
-      - node1
-      - node2
-      - direct
-    fallback: "direct"               # node 不可用时走直连
-    maxBytes: 107374182400           # 100GB 流量限制（所有节点合计）
-    speedLimit: 52428800             # 50MB/s 速度限制
-
-  bob:
-    password: "bob_secure_pass_456"
-    routes:
-      - node1
-    fallback: "node2"                # node1 不可用时走 node2
-    maxBytes: 0                      # 不限流量
-
-  charlie:
-    password: "charlie_pass_789"
-    routes:
-      - node2
-    # 不配 fallback，默认 "reject"：node 不可用时直接报错给客户端
-    maxBytes: 53687091200            # 50GB 流量限制
-
-# ============================================================
-# 出站节点配置
-# ============================================================
-nodes:
-  node1:
-    type: hysteria2
-    alias: "🇯🇵 东京节点"            # 订阅配置中显示的名称
-    hysteria2:
-      addr: "node1.example.com:443"
-      auth: "node1_secret_key"
-      insecure: true                 # Node 用自签证书时
-
-  node2:
-    type: hysteria2
-    alias: "🇭🇰 香港节点"
-    hysteria2:
-      addr: "node2.example.com:443"
-      auth: "node2_secret_key"
-      insecure: true
-
-  # SOCKS5 代理节点示例
-  # node_socks:
-  #   type: socks5
-  #   socks5:
-  #     addr: "proxy.example.com:1080"
-  #     username: "proxy_user"
-  #     password: "proxy_pass"
-
-  # 直连节点（可以绑定特定网卡/IP）
-  # node_direct_v4:
-  #   type: direct
-  #   direct:
-  #     mode: "4"
-  #     bindIPv4: "1.2.3.4"
-
-# ============================================================
-# 管理 API
-# ============================================================
-api:
-  listen: "127.0.0.1:9090"          # 只监听本地，不暴露到公网
-  secret: "your_api_secret_here"
+admin:
+  listen: "127.0.0.1:9090"
 
 # SQLite 数据库路径
-dbPath: /var/lib/hy2-gateway/traffic.db
+dbPath: ./traffic.db
 
 # 流量统计刷新间隔
 trafficFlushInterval: 10s
 
+# 自然月流量统计时区；SQLite 内部时间始终为 UTC
+timezone: "Asia/Shanghai"
+
+# systemd 直接守护本进程。watchdog 仅在 unit 设置 WatchdogSec 时启用。
+systemd:
+  unit: "hy2-gateway.service"
+  watchdog: true
+
 # ============================================================
-# 订阅配置（用于生成客户端配置）
+# 订阅服务（对用户公网开放，与本地管理后台分离）
 # ============================================================
-# sub:
-#   serverAddr: "your.domain.com:8443"
-#   sni: "your.domain.com"
-#   insecure: false
+sub:
+  listen: "127.0.0.1:9091"        # 可由 Nginx 反向代理到公网
+  publicURL: "https://sub.example.com/sub/"
+  serverAddr: "gateway.example.com:8443"
+  sni: "gateway.example.com"
+  insecure: false
+
+# 用户和节点均由 SQLite 管理。如需导入旧 YAML，请执行：
+# hy2-gateway migrate -c /etc/hy2-gateway/legacy-gateway.yaml
+# 迁移时使用 sub.secret（缺省时 api.secret）计算旧订阅链接。

@@ -9,3 +9,6 @@ build/
 gateway
 hy2-gateway
 *.db
+*.db-shm
+*.db-wal
+*.db-journal

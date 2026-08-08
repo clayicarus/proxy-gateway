@@ -1,7 +1,10 @@
 package router
 
 import (
+	"fmt"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/hy2-gateway/internal/config"
@@ -131,9 +134,6 @@ func TestRoutingOutbound_UserContext(t *testing.T) {
 
 	addr := &net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 12345}
 
-	// ID is now "username:node_name"
-	ro.SetUserContext(addr, "alice:direct")
-
 	// Create a local listener for the test
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -149,7 +149,7 @@ func TestRoutingOutbound_UserContext(t *testing.T) {
 	}()
 
 	// Set request context (simulating EventLogger.TCPRequest)
-	SetRequestContext(addr, "alice:direct", ln.Addr().String())
+	ro.SetRequestContext(addr, "alice:direct", "tcp", ln.Addr().String())
 
 	conn, err := ro.TCP(ln.Addr().String())
 	if err != nil {
@@ -157,5 +157,60 @@ func TestRoutingOutbound_UserContext(t *testing.T) {
 	}
 	conn.Close()
 
-	ro.ClearUserContext(addr)
+}
+
+func TestRoutingOutbound_MissingOrMismatchedContextFailsClosed(t *testing.T) {
+	logger := zap.NewNop()
+	ro := NewRoutingOutbound(NewRouter(nil, logger), NewOutboundFactory(nil, logger), logger)
+
+	if _, err := ro.TCP("example.com:443"); err == nil || !strings.Contains(err.Error(), "context missing") {
+		t.Fatalf("TCP without context should fail closed, got %v", err)
+	}
+	if _, err := ro.UDP("example.com:443"); err == nil || !strings.Contains(err.Error(), "context missing") {
+		t.Fatalf("UDP without context should fail closed, got %v", err)
+	}
+
+	addr := &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 12345}
+	ro.SetRequestContext(addr, "alice:direct", "tcp", "expected.example:443")
+	if _, err := ro.TCP("other.example:443"); err == nil || !strings.Contains(err.Error(), "context mismatch") {
+		t.Fatalf("mismatched context should fail closed, got %v", err)
+	}
+
+	ro.SetRequestContext(addr, "alice", "tcp", "example.com:443")
+	if _, err := ro.TCP("example.com:443"); err == nil || !strings.Contains(err.Error(), "node is required") {
+		t.Fatalf("authenticated ID without an explicit node should fail closed, got %v", err)
+	}
+}
+
+func TestRoutingOutbound_ConcurrentSameTargetKeepsUserRoute(t *testing.T) {
+	logger := zap.NewNop()
+	const requests = 100
+	nodes := make(map[string]config.NodeConfig, requests)
+	for i := 0; i < requests; i++ {
+		route := fmt.Sprintf("route-%03d", i)
+		nodes[route] = config.NodeConfig{Type: "test-invalid"}
+	}
+	ro := NewRoutingOutbound(NewRouter(nil, logger), NewOutboundFactory(nodes, logger), logger)
+
+	var wg sync.WaitGroup
+	errors := make(chan error, requests)
+	for i := 0; i < requests; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			route := fmt.Sprintf("route-%03d", i)
+			addr := &net.UDPAddr{IP: net.ParseIP("192.0.2.20"), Port: 20000 + i}
+			ro.SetRequestContext(addr, "user:"+route, "tcp", "same.example:443")
+			_, err := ro.TCP("same.example:443")
+			if err == nil || !strings.Contains(err.Error(), "node "+route+":") {
+				errors <- fmt.Errorf("request %d used wrong route: %v", i, err)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errors)
+	for err := range errors {
+		t.Error(err)
+	}
 }

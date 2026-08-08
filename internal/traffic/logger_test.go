@@ -2,8 +2,10 @@ package traffic
 
 import (
 	"testing"
+	"time"
 
 	"github.com/hy2-gateway/internal/config"
+	"github.com/hy2-gateway/internal/storage"
 	"go.uber.org/zap"
 )
 
@@ -111,18 +113,76 @@ func TestTrafficLogger_UnknownUser(t *testing.T) {
 	users := map[string]config.UserConfig{}
 	tl := NewTrafficLogger(users, nil, logger)
 
-	// Unknown user should still work (auto-create, no quota)
+	// An authenticated ID that no longer has runtime user state must not retain
+	// access through a stale connection.
 	ok := tl.LogTraffic("unknown:node1", 100, 200)
-	if !ok {
-		t.Error("expected LogTraffic to return true for unknown user (no quota)")
+	if ok {
+		t.Error("expected LogTraffic to return false for unknown user")
 	}
 
 	snap := tl.GetSnapshot("unknown:node1")
-	if snap == nil {
-		t.Fatal("expected snapshot for unknown:node1")
+	if snap != nil {
+		t.Fatalf("inactive traffic must not be accounted, got snapshot %#v", snap)
 	}
-	if snap.TxBytes != 100 || snap.RxBytes != 200 {
-		t.Errorf("expected tx=100 rx=200, got tx=%d rx=%d", snap.TxBytes, snap.RxBytes)
+}
+
+func TestTrafficLogger_DisconnectsInactiveExistingUsers(t *testing.T) {
+	now := time.Now().UTC()
+	future := now.Add(time.Hour)
+	past := now.Add(-time.Hour)
+	users := map[string]config.UserConfig{
+		"alice": {Password: "p", Routes: []string{"node1"}, ExpiresAt: &future},
+	}
+	tl := NewTrafficLogger(users, nil, zap.NewNop())
+
+	if ok := tl.LogTraffic("alice:node1", 100, 200); !ok {
+		t.Fatal("active user traffic was rejected")
+	}
+
+	users["alice"] = config.UserConfig{Password: "p", Routes: []string{"node1"}, ExpiresAt: &past}
+	tl.UpdateUsers(users)
+	if ok := tl.LogTraffic("alice:node1", 10, 20); ok {
+		t.Fatal("expired existing user traffic was accepted")
+	}
+	snapshot := tl.GetSnapshot("alice:node1")
+	if snapshot.TxBytes != 100 || snapshot.RxBytes != 200 {
+		t.Fatalf("expired traffic was accounted: tx=%d rx=%d", snapshot.TxBytes, snapshot.RxBytes)
+	}
+
+	users["alice"] = config.UserConfig{Password: "p", Routes: []string{"node1"}, ExpiresAt: &future}
+	tl.UpdateUsers(users)
+	if ok := tl.LogTraffic("alice:node1", 10, 20); !ok {
+		t.Fatal("renewed user traffic was rejected")
+	}
+
+	users["alice"] = config.UserConfig{Password: "p", Routes: []string{"node1"}, Disabled: true}
+	tl.UpdateUsers(users)
+	if ok := tl.LogTraffic("alice:node1", 10, 20); ok {
+		t.Fatal("disabled existing user traffic was accepted")
+	}
+}
+
+func TestTrafficLogger_StopWaitsForFinalFlush(t *testing.T) {
+	store, err := storage.NewSQLiteStore(t.TempDir()+"/traffic.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	users := map[string]config.UserConfig{
+		"alice": {Password: "p", Routes: []string{"direct"}},
+	}
+	tl := NewTrafficLogger(users, store, zap.NewNop())
+	tl.StartPeriodicFlush(time.Hour)
+	if ok := tl.LogTraffic("alice:direct", 100, 200); !ok {
+		t.Fatal("active traffic was rejected")
+	}
+	tl.Stop()
+	tx, rx, err := store.GetSummary("alice", "direct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tx != 100 || rx != 200 {
+		t.Fatalf("final flush not persisted: tx=%d rx=%d", tx, rx)
 	}
 }
 

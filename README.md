@@ -1,227 +1,215 @@
 # Hy2-Gateway
 
-基于 Hysteria2 协议的多用户网关，支持按用户名路由、鉴权和流量统计。
+基于 Hysteria2 的多用户网关。客户端显式选择获授权的出站节点，Gateway 负责认证、路由、流量计量、配额和下载限速，并通过 SQLite 和本地 Web 后台管理运行配置。
 
-不修改 Hysteria2 源码，通过实现其核心接口注入业务逻辑，与上游保持兼容。
+项目直接实现 Hysteria2 核心接口，不修改上游源码。
 
 ## 功能
 
-- **多用户认证**：`username:node:password` 模式，标准 hy2 客户端直接连接
-- **按用户路由**：不同用户的流量路由到不同的出口节点，支持多节点选择
-- **Fallback 策略**：节点不可用时可配置 fallback 到其他节点、直连或拒绝
-- **流量统计**：按用户实时统计 tx/rx，支持配额限制（超额自动断开）
-- **SQLite 持久化**：流量数据定时写入 SQLite，进程重启不丢失
-- **hy2 Client Pool**：Gateway 到 Node 使用 QUIC 长连接，自动重连
-- **管理 API**：HTTP 接口查询流量、健康检查
+- `username:node:password` 多用户认证，认证 ID 为 `username:node`
+- SQLite 管理用户、节点、用户节点授权、到期、月额度、下载限速和订阅 token
+- 仅绑定 loopback 的管理后台：概览、用户、活跃连接、成本和故障分析
+- 按配置时区的自然月统计所有节点 `tx + rx`，超额时关闭客户端连接
+- 用户级总下载限速，覆盖该用户的全部连接
+- 独立的公开订阅 HTTP 服务，生成 Clash.Meta 配置
+- systemd 重启调度、watchdog、优雅停机和进程退出原因记录
+- Direct、SOCKS5、HTTP CONNECT 和 Hysteria2 出站
 
-## 架构
+服务端没有隐式 fallback。节点缺失、上下文错配或拨号失败都会直接返回错误；`direct` 也必须由客户端明确选择并获用户授权。
 
+## 拓扑
+
+```text
+hy2 客户端 --QUIC/UDP--> Gateway --direct/代理/hy2--> Node 或目标
+                              |--HTTP/TCP--> 本地管理后台
+                              `--HTTP/TCP--> 公开订阅服务
 ```
-用户 ──hy2──→ Gateway(认证 + 路由 + 统计) ──hy2──→ Node(hy2 server + WARP) ──→ 互联网
-```
 
-详细架构设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+详细设计见 [架构文档](docs/ARCHITECTURE.md) 和 [管理后台设计](docs/ADMIN_DESIGN.md)。
 
 ## 构建
 
-需要 Go 1.22+ 和 C 编译器（SQLite 依赖 CGO）。
+需要 Go 1.24+ 和 C 编译器，SQLite 驱动依赖 CGO。
 
 ```bash
-# 构建
 CGO_ENABLED=1 go build -ldflags "-s -w" -o hy2-gateway ./cmd/gateway
-
-# 运行测试
 CGO_ENABLED=1 go test ./...
-
-# Docker 构建
-docker build -t hy2-gateway .
 ```
 
-交叉编译到 Linux amd64（在 macOS/其他平台上）：
-
-```bash
-# 需要安装交叉编译工具链，如 musl-cross 或 zig cc
-CGO_ENABLED=1 CC=x86_64-linux-musl-gcc \
-  GOOS=linux GOARCH=amd64 \
-  go build -ldflags "-s -w -linkmode external -extldflags '-static'" \
-  -o hy2-gateway ./cmd/gateway
-```
-
-或者直接在目标 Linux 服务器上编译，避免交叉编译的麻烦。
+跨平台构建需要相应的 C 交叉编译器；也可以直接在目标 Linux 机器上构建。
 
 ## 快速开始
 
-### 1. 准备配置
+### 1. 配置启动参数
 
 ```yaml
-# /etc/hy2-gateway/gateway.yaml
 listen: :8443
 
 tls:
   cert: /etc/hy2-gateway/cert.pem
   key: /etc/hy2-gateway/key.pem
 
-users:
-  alice:
-    password: "alice_password"
-    routes:
-      - node1
-      - direct
-    fallback: "direct"            # node1 不可用时走直连
-    maxBytes: 107374182400        # 100GB
-  bob:
-    password: "bob_password"
-    routes:
-      - node1
-    fallback: "node2"             # node1 不可用时走 node2
-
-nodes:
-  node1:
-    type: hysteria2
-    hysteria2:
-      addr: "node1.example.com:443"
-      auth: "node1_secret"
-      insecure: true
-  node2:
-    type: hysteria2
-    hysteria2:
-      addr: "node2.example.com:443"
-      auth: "node2_secret"
-      insecure: true
-
-api:
+admin:
   listen: "127.0.0.1:9090"
-  secret: "your_api_secret"
+
+sub:
+  listen: "127.0.0.1:9091"
+  publicURL: "https://sub.example.com/sub/"
+  serverAddr: "gateway.example.com:8443"
+  sni: "gateway.example.com"
 
 dbPath: /var/lib/hy2-gateway/traffic.db
+trafficFlushInterval: 10s
+timezone: "Asia/Shanghai"
+
+systemd:
+  unit: "hy2-gateway.service"
+  watchdog: true
 ```
 
-### 2. 运行
+TLS 证书必须由外部工具准备。内置 ACME 尚未实现。`listen` 是 Hysteria2 的 UDP 端口；`admin.listen` 和 `sub.listen` 是两个独立的 HTTP/TCP 端口。`sub.publicURL` 是用户获取订阅的 URL 前缀，`sub.serverAddr` 则是订阅内容中客户端连接 Gateway 的地址。
+
+用户和节点不写在正常运行 YAML 中。首次启动后通过管理后台创建。
+
+### 2. 启动
 
 ```bash
-mkdir -p /var/lib/hy2-gateway
+install -d -o hy2gateway -g hy2gateway -m 0750 /var/lib/hy2-gateway
 ./hy2-gateway -c /etc/hy2-gateway/gateway.yaml
 ```
 
-### 3. 客户端连接
+SQLite 数据库目录会自动创建，但运行用户必须能够写入其父目录。systemd 的 `WorkingDirectory` 也会影响相对 `dbPath`；生产环境应使用绝对路径。
 
-标准 Hysteria2 客户端，auth 格式为 `username:node:password`：
+### 3. 访问后台
 
-```yaml
-server: your.gateway.com:8443
-auth: alice:node1:alice_password
-bandwidth:
-  up: 50 mbps
-  down: 100 mbps
-socks5:
-  listen: 127.0.0.1:1080
-```
-
-### 4. 查看流量
+后台没有登录鉴权，配置会强制它只绑定 loopback。通过 SSH 转发访问：
 
 ```bash
-# API 查询
-curl -H "Authorization: your_api_secret" http://127.0.0.1:9090/traffic
-
-# 直接查 SQLite
-sqlite3 /var/lib/hy2-gateway/traffic.db "SELECT * FROM traffic_summary;"
+ssh -L 9090:127.0.0.1:9090 root@gateway.example.com
 ```
 
-## 数据库表结构
+浏览器打开 `http://127.0.0.1:9090`。所有写操作有 CSRF 校验，敏感操作还会在前端二次确认。
 
-SQLite 中有两张表：
+节点定义和用户节点授权在重启后生效。用户密码、停用、到期、额度和限速最多约 2 秒刷新；停用、到期或超额的已有会话在下一笔流量时关闭整条 QUIC 连接。
 
-**traffic_summary** — 每个用户+节点的累计流量汇总
+### 4. 客户端连接
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `user_id` | TEXT | 用户名 |
-| `node_id` | TEXT | 节点名 |
-| `tx_total` | INTEGER | 累计上传字节数（服务端→目标） |
-| `rx_total` | INTEGER | 累计下载字节数（目标→服务端） |
-| `updated_at` | DATETIME | 最后更新时间 |
+```yaml
+server: gateway.example.com:8443
+auth: alice:node1:generated_password
+tls:
+  sni: gateway.example.com
+```
 
-**traffic_logs** — 增量流量明细（每次 flush 写入一条）
+推荐直接使用后台生成的订阅 URL。订阅中的多个代理条目对应用户获授权的节点，客户端负责选择和故障切换。
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `id` | INTEGER | 自增主键 |
-| `user_id` | TEXT | 用户名 |
-| `node_id` | TEXT | 节点名 |
-| `tx_bytes` | INTEGER | 本次增量上传字节数 |
-| `rx_bytes` | INTEGER | 本次增量下载字节数 |
-| `created_at` | DATETIME | 记录时间 |
+## 旧 YAML 迁移
 
-### 常用查询
+旧部署先保留原 `users`、`nodes` 和 secret，执行：
+
+```bash
+hy2-gateway migrate -c /etc/hy2-gateway/legacy-gateway.yaml
+```
+
+旧订阅 token 使用 YAML 的 `sub.secret`，缺省时使用 `api.secret`。迁移会将旧 HMAC token 的哈希写入数据库，使已发布链接继续可用。完成后从正常运行 YAML 删除 `users`、`nodes` 和 `fallback`。
+
+需要以旧 YAML 原子替换数据库中的用户和授权时：
+
+```bash
+hy2-gateway migrate --replace-users -c /etc/hy2-gateway/legacy-gateway.yaml
+```
+
+该命令保留节点、流量、重启和进程历史，但会删除 YAML 中不存在的管理用户。详见 [部署指南](docs/DEPLOYMENT.md)。
+
+## 流量口径
+
+- `tx`：客户端经 Gateway 发往 Node 或目标的数据。
+- `rx`：Node 或目标经 Gateway 发往客户端的数据。
+- 用户月额度：该用户所有节点的 `tx + rx`。
+- Gateway 估算出站：`tx + rx`。
+- Node 估算出站：非 `direct` 节点的 `tx + rx`。
+
+这些数值是有效负载估算，不含 QUIC/IP 包头和重传。Node 与 Gateway 的公式是两个服务器视角的成本估算，不能相加后当作某一台机器的流量。
+
+## SQLite
+
+主要表如下：
+
+| 表 | 用途 |
+|---|---|
+| `managed_users` | 用户、生命周期、额度、限速和 token 哈希 |
+| `managed_nodes` | 节点配置与启用状态 |
+| `user_nodes` | 用户节点授权 |
+| `traffic_logs` | 每次 flush 的流量增量 |
+| `traffic_summary` | 用户和节点累计流量 |
+| `config_state` | 保存 revision 与运行 revision |
+| `management_migrations` | 数据迁移标记 |
+| `restart_jobs` | 计划重启任务 |
+| `process_runs` | 进程运行和退出历史 |
+
+所有时间字段使用 UTC Unix 秒。直接查询时需要显式转换：
 
 ```sql
 -- 所有用户累计流量
 SELECT user_id, node_id, tx_total, rx_total FROM traffic_summary;
 
--- 某用户累计流量
-SELECT node_id, tx_total, rx_total FROM traffic_summary WHERE user_id = 'alice';
-
--- 某用户今天的流量
+-- 最近 24 小时某用户流量
 SELECT SUM(tx_bytes) AS tx, SUM(rx_bytes) AS rx
 FROM traffic_logs
-WHERE user_id = 'alice' AND created_at >= date('now');
+WHERE user_id = 'alice' AND created_at >= unixepoch('now', '-1 day');
 
--- 某用户本月每天的流量
-SELECT date(created_at) AS day, SUM(tx_bytes) AS tx, SUM(rx_bytes) AS rx
+-- 按 UTC 日期汇总
+SELECT date(created_at, 'unixepoch') AS day,
+       SUM(tx_bytes) AS tx, SUM(rx_bytes) AS rx
 FROM traffic_logs
-WHERE user_id = 'alice' AND created_at >= date('now', 'start of month')
 GROUP BY day ORDER BY day;
 
--- 某用户按节点分组的今日流量
-SELECT node_id, SUM(tx_bytes) AS tx, SUM(rx_bytes) AS rx
-FROM traffic_logs
-WHERE user_id = 'alice' AND created_at >= date('now')
-GROUP BY node_id;
-
--- 所有用户今日流量排行
-SELECT user_id, SUM(tx_bytes + rx_bytes) AS total
-FROM traffic_logs
-WHERE created_at >= date('now')
-GROUP BY user_id ORDER BY total DESC;
+-- 查看本地可读时间
+SELECT datetime(created_at, 'unixepoch') AS created_utc, user_id, node_id
+FROM traffic_logs ORDER BY created_at DESC LIMIT 20;
 ```
 
-## 配置说明
+自然月额度和后台范围查询会按 YAML 的 `timezone` 计算 UTC 边界，不应直接用 SQLite 的本地日期函数替代。
+
+## 配置字段
 
 | 字段 | 说明 |
-|------|------|
-| `listen` | 监听地址，默认 `:443` |
-| `tls.cert` / `tls.key` | TLS 证书和私钥路径 |
-| `users.<name>.password` | 用户密码 |
-| `users.<name>.routes` | 可用节点列表，`direct` 或 nodes 中的名称 |
-| `users.<name>.fallback` | 节点不可用时的策略：`reject`（默认）/ `direct` / 其他节点名 |
-| `users.<name>.maxBytes` | 流量配额（字节），0 为不限 |
-| `nodes.<name>.type` | 出站类型：`direct` / `socks5` / `http` / `hysteria2` |
-| `api.listen` | 管理 API 监听地址，建议只绑定 127.0.0.1 |
-| `api.secret` | API 鉴权密钥 |
-| `dbPath` | SQLite 数据库路径，默认 `hy2-gateway.db` |
-| `trafficFlushInterval` | 流量写入 SQLite 的间隔，默认 `10s` |
+|---|---|
+| `listen` | Gateway Hysteria2 UDP 监听地址，默认 `:443` |
+| `tls.cert` / `tls.key` | 必填的 TLS 证书和私钥文件 |
+| `admin.listen` | 本地管理后台，必须绑定 loopback |
+| `sub.listen` | 独立订阅 HTTP 服务监听地址 |
+| `sub.publicURL` | 后台展示的公开订阅 URL 前缀 |
+| `sub.serverAddr` | 订阅中客户端连接 Gateway 的公网地址 |
+| `sub.sni` / `sub.insecure` | 生成的客户端 TLS 参数 |
+| `dbPath` | SQLite 路径，默认 `hy2-gateway.db` |
+| `trafficFlushInterval` | 流量写入周期，默认 `10s` |
+| `timezone` | 自然月和后台查询时区，默认 `UTC` |
+| `systemd.unit` | 后台只允许控制的固定 systemd unit |
+| `systemd.watchdog` | 是否发送 systemd watchdog 心跳 |
 
 ## 项目结构
 
-```
-cmd/gateway/          程序入口
-internal/
-  auth/               用户认证
-  router/             路由引擎 + 各类出站实现
-  traffic/            流量统计 + 配额
-  storage/            SQLite 持久化
-  event/              事件日志（用户上下文桥接）
-  api/                管理 HTTP API
-  config/             配置解析
-test/
-  integration/        组件级集成测试
-  e2e/                真实 hy2 客户端端到端测试
-docs/                 文档
+```text
+cmd/gateway/       启动、迁移、退出记录和生命周期
+internal/api/      管理 Web 与数据库订阅服务
+internal/auth/     用户认证和热刷新
+internal/config/   YAML 启动配置及旧配置解析
+internal/connection/ 活跃连接追踪
+internal/event/    Hysteria2 事件与路由上下文交接
+internal/router/   路由和出站实现
+internal/storage/  SQLite schema 与查询
+internal/subtoken/ 订阅 token
+internal/systemd/  D-Bus 重启和 watchdog 通知
+internal/traffic/  流量、配额与下载限速
+test/              集成和端到端测试
+docs/              设计、集成和部署文档
 ```
 
 ## 文档
 
 - [架构设计](docs/ARCHITECTURE.md)
+- [管理后台设计](docs/ADMIN_DESIGN.md)
 - [部署指南](docs/DEPLOYMENT.md)
 - [Hysteria2 集成说明](docs/INTEGRATION.md)
 - [开发路线图](docs/ROADMAP.md)

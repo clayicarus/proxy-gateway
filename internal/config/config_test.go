@@ -100,7 +100,21 @@ users:
 	}
 }
 
-func TestLoad_NoUsers(t *testing.T) {
+func TestLoad_RejectsACMEWithoutCertificateFiles(t *testing.T) {
+	content := `
+acme:
+  domains:
+    - gateway.example.com
+  email: admin@example.com
+`
+	path := writeTempFile(t, content)
+	_, err := Load(path)
+	if err == nil {
+		t.Error("expected error because embedded ACME is not implemented")
+	}
+}
+
+func TestLoad_AllowsEmptyRuntimeDatabase(t *testing.T) {
 	content := `
 tls:
   cert: test.crt
@@ -108,9 +122,8 @@ tls:
 users: {}
 `
 	path := writeTempFile(t, content)
-	_, err := Load(path)
-	if err == nil {
-		t.Error("expected error for empty users")
+	if _, err := Load(path); err != nil {
+		t.Fatalf("runtime config should allow no legacy users: %v", err)
 	}
 }
 
@@ -125,9 +138,13 @@ users:
     routes: []
 `
 	path := writeTempFile(t, content)
-	_, err := Load(path)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	err = cfg.ValidateLegacy()
 	if err == nil {
-		t.Error("expected error for empty routes")
+		t.Error("expected legacy validation error for empty routes")
 	}
 }
 
@@ -143,9 +160,13 @@ users:
       - nonexistent_node
 `
 	path := writeTempFile(t, content)
-	_, err := Load(path)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	err = cfg.ValidateLegacy()
 	if err == nil {
-		t.Error("expected error for invalid route reference")
+		t.Error("expected legacy validation error for invalid route reference")
 	}
 }
 

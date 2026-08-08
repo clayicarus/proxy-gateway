@@ -1,10 +1,13 @@
 package storage
 
 import (
+	"database/sql"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/hy2-gateway/internal/config"
+	"github.com/hy2-gateway/internal/subtoken"
 	"go.uber.org/zap"
 )
 
@@ -103,6 +106,18 @@ func TestSQLiteStore_UnknownUser(t *testing.T) {
 	}
 }
 
+func TestSQLiteStore_CreatesParentDirectory(t *testing.T) {
+	dbPath := t.TempDir() + "/nested/management/traffic.db"
+	store, err := NewSQLiteStore(dbPath, zap.NewNop())
+	if err != nil {
+		t.Fatalf("create store with missing parent: %v", err)
+	}
+	defer store.Close()
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("database file was not created: %v", err)
+	}
+}
+
 func TestSQLiteStore_SkipZeroRecords(t *testing.T) {
 	dbPath := t.TempDir() + "/test.db"
 	defer os.Remove(dbPath)
@@ -128,5 +143,229 @@ func TestSQLiteStore_SkipZeroRecords(t *testing.T) {
 	}
 	if len(all) != 0 {
 		t.Errorf("expected 0 rows (zero records skipped), got %d", len(all))
+	}
+}
+
+func TestSQLiteStore_GetTrafficBuckets(t *testing.T) {
+	store, err := NewSQLiteStore(t.TempDir()+"/traffic.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	base := time.Date(2026, 8, 8, 10, 0, 0, 0, time.UTC)
+	shanghai := time.FixedZone("Asia/Shanghai", 8*60*60)
+	if err := store.FlushTraffic([]TrafficRecord{
+		{UserID: "alice", NodeID: "node1", TxBytes: 10, RxBytes: 20, Timestamp: base.Add(5 * time.Minute).In(shanghai)},
+		{UserID: "alice", NodeID: "node1", TxBytes: 30, RxBytes: 40, Timestamp: base.Add(55 * time.Minute)},
+		{UserID: "alice", NodeID: "direct", TxBytes: 50, RxBytes: 60, Timestamp: base.Add(time.Hour)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	buckets, err := store.GetTrafficBuckets(base, base.Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(buckets) != 2 {
+		t.Fatalf("bucket count = %d, want 2: %#v", len(buckets), buckets)
+	}
+	if buckets[0].Hour != base || buckets[0].TxBytes != 40 || buckets[0].RxBytes != 60 {
+		t.Fatalf("unexpected first bucket: %#v", buckets[0])
+	}
+	if buckets[1].Hour != base.Add(time.Hour) || buckets[1].NodeID != "direct" {
+		t.Fatalf("unexpected second bucket: %#v", buckets[1])
+	}
+}
+
+func TestSQLiteStore_NormalizesLegacyTrafficTimestamps(t *testing.T) {
+	dbPath := t.TempDir() + "/legacy.db"
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE traffic_logs (id INTEGER PRIMARY KEY, user_id TEXT NOT NULL, node_id TEXT NOT NULL, tx_bytes INTEGER NOT NULL, rx_bytes INTEGER NOT NULL, created_at DATETIME NOT NULL);
+		CREATE TABLE traffic_summary (user_id TEXT NOT NULL, node_id TEXT NOT NULL, tx_total INTEGER NOT NULL, rx_total INTEGER NOT NULL, updated_at DATETIME NOT NULL, PRIMARY KEY (user_id, node_id));
+		INSERT INTO traffic_logs (user_id, node_id, tx_bytes, rx_bytes, created_at) VALUES ('alice', 'direct', 1, 2, '2026-08-08 18:30:00+08:00');
+		INSERT INTO traffic_summary (user_id, node_id, tx_total, rx_total, updated_at) VALUES ('alice', 'direct', 1, 2, '2026-08-08 18:30:00+08:00');
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewSQLiteStore(dbPath, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var kind string
+	var timestamp int64
+	if err := store.db.QueryRow(`SELECT typeof(created_at), CAST(created_at AS INTEGER) FROM traffic_logs`).Scan(&kind, &timestamp); err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, 8, 8, 10, 30, 0, 0, time.UTC).Unix()
+	if kind != "integer" || timestamp != want {
+		t.Fatalf("normalized timestamp = %s/%d, want integer/%d", kind, timestamp, want)
+	}
+	buckets, err := store.GetTrafficBuckets(time.Unix(want-60, 0), time.Unix(want+60, 0))
+	if err != nil || len(buckets) != 1 {
+		t.Fatalf("query normalized traffic: buckets=%#v err=%v", buckets, err)
+	}
+}
+
+func TestSQLiteStore_MigrateLegacyPreservesSubscriptionToken(t *testing.T) {
+	store, err := NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := &config.Config{
+		Users: map[string]config.UserConfig{
+			"alice": {Password: "legacy-password", Routes: []string{"node1", "direct"}, MaxBytes: 1234, SpeedLimit: 55},
+		},
+		Nodes: map[string]config.NodeConfig{
+			"node1": {Type: "hysteria2", Hysteria2: &config.Hysteria2OutboundConfig{Addr: "node.example:443", Auth: "node-auth"}},
+		},
+	}
+	secret := "legacy-subscription-secret"
+	if err := store.MigrateLegacy(cfg, func(username string) string { return subtoken.Legacy(username, secret) }); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	users, err := store.LoadRuntimeUsers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := users["alice"]; got.Password != "legacy-password" || got.MaxBytes != 1234 || len(got.Routes) != 2 {
+		t.Fatalf("unexpected migrated user: %#v", got)
+	}
+	nodes, err := store.LoadNodes()
+	if err != nil || nodes["node1"].Hysteria2 == nil {
+		t.Fatalf("migrated nodes: %v, %#v", err, nodes)
+	}
+	user, err := store.FindUserByToken(subtoken.Legacy("alice", secret))
+	if err != nil || user == nil || user.Username != "alice" {
+		t.Fatalf("legacy token lookup: user=%#v err=%v", user, err)
+	}
+	if err := store.MigrateLegacy(cfg, func(username string) string { return subtoken.Legacy(username, secret) }); err == nil {
+		t.Fatal("expected second migration to fail")
+	}
+}
+
+func TestSQLiteStore_ReplaceLegacyUsersPreservesNodesAndTraffic(t *testing.T) {
+	store, err := NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	initial := &config.Config{
+		Users: map[string]config.UserConfig{
+			"alice": {Password: "alice-password", Routes: []string{"node1"}},
+		},
+		Nodes: map[string]config.NodeConfig{
+			"node1": {Type: "socks5", SOCKS5: &config.SOCKS5Config{Addr: "127.0.0.1:1080"}},
+		},
+	}
+	if err := store.MigrateLegacy(initial, func(username string) string { return "old-" + username }); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FlushTraffic([]TrafficRecord{{UserID: "alice", NodeID: "node1", TxBytes: 10, RxBytes: 20, Timestamp: time.Now()}}); err != nil {
+		t.Fatal(err)
+	}
+	replacement := &config.Config{Users: map[string]config.UserConfig{
+		"bob": {Password: "bob-password", Routes: []string{"node1", "direct"}, MaxBytes: 123},
+	}}
+	if err := store.ReplaceLegacyUsers(replacement, func(username string) string { return "new-" + username }); err != nil {
+		t.Fatal(err)
+	}
+	users, err := store.ListUsers()
+	if err != nil || len(users) != 1 || users[0].Username != "bob" || users[0].MonthlyBytes != 123 {
+		t.Fatalf("replacement users: %#v err=%v", users, err)
+	}
+	nodes, err := store.ListNodes()
+	if err != nil || len(nodes) != 1 || nodes[0].Name != "node1" {
+		t.Fatalf("nodes changed during user replacement: %#v err=%v", nodes, err)
+	}
+	tx, rx, err := store.GetSummary("alice", "node1")
+	if err != nil || tx != 10 || rx != 20 {
+		t.Fatalf("traffic changed during user replacement: tx=%d rx=%d err=%v", tx, rx, err)
+	}
+	if user, err := store.FindUserByToken("new-bob"); err != nil || user == nil || user.Username != "bob" {
+		t.Fatalf("replacement token not imported: user=%#v err=%v", user, err)
+	}
+	if user, err := store.FindUserByToken("old-alice"); err != nil || user != nil {
+		t.Fatalf("old token remains active: user=%#v err=%v", user, err)
+	}
+	state, err := store.GetConfigState()
+	if err != nil || state.Revision != 2 || state.ActiveRevision != 0 {
+		t.Fatalf("replacement revision: %#v err=%v", state, err)
+	}
+
+	invalid := &config.Config{Users: map[string]config.UserConfig{
+		"charlie": {Password: "password", Routes: []string{"missing-node"}},
+	}}
+	if err := store.ReplaceLegacyUsers(invalid, func(username string) string { return "invalid-" + username }); err == nil {
+		t.Fatal("expected missing managed node to reject replacement")
+	}
+	users, err = store.ListUsers()
+	if err != nil || len(users) != 1 || users[0].Username != "bob" {
+		t.Fatalf("failed replacement was not rolled back: %#v err=%v", users, err)
+	}
+}
+
+func TestSQLiteStore_UpdateUserOnlyRevisionsRouteChanges(t *testing.T) {
+	store, err := NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.CreateUser(ManagedUserInput{Username: "alice", Password: "password", Routes: []string{"direct"}}, "token"); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.GetConfigState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateUser(ManagedUserInput{Username: "alice", Password: "password", MonthlyBytes: 1024, Routes: []string{"direct"}}); err != nil {
+		t.Fatal(err)
+	}
+	afterLifecycle, err := store.GetConfigState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterLifecycle.Revision != state.Revision {
+		t.Fatalf("lifecycle-only update changed revision: before=%d after=%d", state.Revision, afterLifecycle.Revision)
+	}
+	if err := store.SaveNode("node1", config.NodeConfig{Type: "socks5", SOCKS5: &config.SOCKS5Config{Addr: "127.0.0.1:1080"}}, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateUser(ManagedUserInput{Username: "alice", Password: "password", MonthlyBytes: 1024, Routes: []string{"node1"}}); err != nil {
+		t.Fatal(err)
+	}
+	afterRoutes, err := store.GetConfigState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRoutes.Revision != afterLifecycle.Revision+2 {
+		t.Fatalf("expected node save and route update to increment revision, got %d", afterRoutes.Revision)
+	}
+}
+
+func TestSQLiteStore_ListRunningProcess(t *testing.T) {
+	store, err := NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.StartProcessRun(1234, 7, "scheduled"); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := store.ListProcessRuns(10)
+	if err != nil {
+		t.Fatalf("list running process: %v", err)
+	}
+	if len(runs) != 1 || runs[0].PID != 1234 || runs[0].SystemdResult != "" || runs[0].StoppedAt != nil {
+		t.Fatalf("unexpected running process record: %#v", runs)
 	}
 }
