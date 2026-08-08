@@ -44,6 +44,7 @@ type dashboardData struct {
 	State              storage.ConfigState
 	Monthly            map[string][2]uint64
 	NodeMonthly        map[string][2]uint64
+	DirectRoutes       map[string]bool
 	MonthLabel         string
 	Flash              string
 	Now                time.Time
@@ -80,9 +81,10 @@ type liveStatus struct {
 }
 
 type rangeTraffic struct {
-	Name    string `json:"name"`
-	TxBytes uint64 `json:"txBytes"`
-	RxBytes uint64 `json:"rxBytes"`
+	Name        string `json:"name"`
+	TxBytes     uint64 `json:"txBytes"`
+	RxBytes     uint64 `json:"rxBytes"`
+	EgressBytes uint64 `json:"egressBytes"`
 }
 
 type hourlyTraffic struct {
@@ -282,6 +284,12 @@ func (m *Manager) trafficRange(w http.ResponseWriter, r *http.Request) {
 
 	// Include the latest in-memory deltas in the persisted range query.
 	m.traffic.Flush()
+	managedNodes, err := m.store.ListNodes()
+	if err != nil {
+		m.writeError(w, err)
+		return
+	}
+	directRoutes := directRouteSet(managedNodes)
 	buckets, err := m.store.GetTrafficBuckets(start.UTC(), end.UTC())
 	if err != nil {
 		m.writeError(w, err)
@@ -313,16 +321,20 @@ func (m *Manager) trafficRange(w http.ResponseWriter, r *http.Request) {
 		hours[bucket.Hour] = hour
 		status.Total.TxBytes += bucket.TxBytes
 		status.Total.RxBytes += bucket.RxBytes
-		if bucket.NodeID != "direct" {
+		if !directRoutes[bucket.NodeID] {
 			status.NodeEgress += bucket.TxBytes + bucket.RxBytes
 		}
 	}
 	status.Total.Name = "全部"
 	for name, usage := range users {
-		status.Users = append(status.Users, rangeTraffic{Name: name, TxBytes: usage[0], RxBytes: usage[1]})
+		status.Users = append(status.Users, rangeTraffic{Name: name, TxBytes: usage[0], RxBytes: usage[1], EgressBytes: usage[0] + usage[1]})
 	}
 	for name, usage := range nodes {
-		status.Nodes = append(status.Nodes, rangeTraffic{Name: name, TxBytes: usage[0], RxBytes: usage[1]})
+		egress := usage[0] + usage[1]
+		if directRoutes[name] {
+			egress = 0
+		}
+		status.Nodes = append(status.Nodes, rangeTraffic{Name: name, TxBytes: usage[0], RxBytes: usage[1], EgressBytes: egress})
 	}
 	for hour, usage := range hours {
 		status.Hours = append(status.Hours, hourlyTraffic{Hour: hour, TxBytes: usage[0], RxBytes: usage[1]})
@@ -343,10 +355,6 @@ func (m *Manager) trafficRange(w http.ResponseWriter, r *http.Request) {
 
 func (m *Manager) withCSRF(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet || r.Method == http.MethodHead {
-			next(w, r)
-			return
-		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -374,6 +382,7 @@ func (m *Manager) dashboard(w http.ResponseWriter, r *http.Request) {
 		m.writeError(w, err)
 		return
 	}
+	directRoutes := directRouteSet(nodes)
 	state, err := m.store.GetConfigState()
 	if err != nil {
 		m.writeError(w, err)
@@ -421,7 +430,7 @@ func (m *Manager) dashboard(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for node, usage := range nodeMonthly {
-		if node != "direct" {
+		if !directRoutes[node] {
 			nodeEgressTotal += usage[0] + usage[1]
 		}
 	}
@@ -463,6 +472,7 @@ func (m *Manager) dashboard(w http.ResponseWriter, r *http.Request) {
 		State:              state,
 		Monthly:            monthly,
 		NodeMonthly:        nodeMonthly,
+		DirectRoutes:       directRoutes,
 		MonthLabel:         label,
 		Flash:              r.URL.Query().Get("flash"),
 		Now:                now,
@@ -508,6 +518,7 @@ func (m *Manager) restartAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	runAt := time.Now().Add(2 * time.Second)
+	trigger := "immediate"
 	if value := r.Form.Get("run_at"); value != "" {
 		parsed, err := time.ParseInLocation("2006-01-02T15:04", value, m.loc)
 		if err != nil {
@@ -515,8 +526,9 @@ func (m *Manager) restartAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		runAt = parsed
+		trigger = "scheduled"
 	}
-	if _, err := m.store.ScheduleRestart(runAt, "scheduled"); err != nil {
+	if _, err := m.store.ScheduleRestart(runAt, trigger); err != nil {
 		m.redirectError(w, r, err)
 		return
 	}
@@ -690,8 +702,6 @@ func nodeFromForm(r *http.Request) (string, config.NodeConfig, bool, error) {
 	name := r.Form.Get("name")
 	node := config.NodeConfig{Type: r.Form.Get("type"), Alias: r.Form.Get("alias")}
 	switch node.Type {
-	case "direct":
-		node.Direct = &config.DirectConfig{}
 	case "hysteria2":
 		node.Hysteria2 = &config.Hysteria2OutboundConfig{Addr: r.Form.Get("addr"), Auth: r.Form.Get("auth"), SNI: r.Form.Get("sni"), Insecure: r.Form.Get("insecure") == "on"}
 	case "socks5":
@@ -702,6 +712,16 @@ func nodeFromForm(r *http.Request) (string, config.NodeConfig, bool, error) {
 		return "", node, false, fmt.Errorf("unsupported node type")
 	}
 	return name, node, r.Form.Get("enabled") == "on", nil
+}
+
+func directRouteSet(nodes []storage.ManagedNode) map[string]bool {
+	result := map[string]bool{"direct": true}
+	for _, node := range nodes {
+		if node.Config.Type == "direct" {
+			result[node.Name] = true
+		}
+	}
+	return result
 }
 
 func (m *Manager) subscriptionBase() string {

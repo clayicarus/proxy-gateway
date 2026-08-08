@@ -1,15 +1,18 @@
 package api
 
 import (
+	"bytes"
 	"fmt"
+	"mime"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
-	"text/template"
 
 	"github.com/hy2-gateway/internal/config"
 	"github.com/hy2-gateway/internal/storage"
 	"go.uber.org/zap"
+	"gopkg.in/yaml.v3"
 )
 
 // DatabaseSubscriptionHandler serves bearer-token subscriptions backed by the
@@ -20,7 +23,6 @@ type DatabaseSubscriptionHandler struct {
 	activeRoutes map[string][]string
 	nodes        map[string]config.NodeConfig
 	logger       *zap.Logger
-	tmpl         *template.Template
 }
 
 // NewDatabaseSubscriptionHandler serves the restart-applied node and route
@@ -37,7 +39,6 @@ func NewDatabaseSubscriptionHandler(cfg *config.Config, store *storage.SQLiteSto
 		activeRoutes: activeRoutes,
 		nodes:        nodes,
 		logger:       logger,
-		tmpl:         template.Must(template.New("managed-clash").Parse(managedClashTemplate)),
 	}
 }
 
@@ -76,7 +77,7 @@ func (h *DatabaseSubscriptionHandler) handle(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "subscription pending Gateway restart", http.StatusServiceUnavailable)
 		return
 	}
-	data := managedSubscriptionData{Username: user.Username, MonthlyBytes: user.MonthlyBytes}
+	data := managedSubscriptionData{}
 	host, port := splitHostPort(h.gatewayAddress())
 	for _, route := range routes {
 		if route == "direct" {
@@ -102,17 +103,21 @@ func (h *DatabaseSubscriptionHandler) handle(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "subscription has no active routes", http.StatusServiceUnavailable)
 		return
 	}
+	body, err := renderManagedSubscription(data)
+	if err != nil {
+		h.logger.Error("render managed subscription", zap.Error(err))
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.yaml"`, user.Username))
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": user.Username + ".yaml"}))
 	w.Header().Set("Profile-Update-Interval", "24")
 	// The standard header has no tx+rx notion. It is supplied as an advisory
 	// total while Gateway remains the enforcement authority.
 	if user.MonthlyBytes > 0 {
 		w.Header().Set("Subscription-Userinfo", fmt.Sprintf("upload=0; download=0; total=%d", user.MonthlyBytes))
 	}
-	if err := h.tmpl.Execute(w, data); err != nil {
-		h.logger.Error("render managed subscription", zap.Error(err))
-	}
+	_, _ = w.Write(body)
 }
 
 func (h *DatabaseSubscriptionHandler) gatewayAddress() string {
@@ -133,69 +138,81 @@ func (h *DatabaseSubscriptionHandler) insecure() bool {
 	return h.cfg.Sub != nil && h.cfg.Sub.Insecure
 }
 
-func splitHostPort(addr string) (host, port string) {
-	host, port, err := net.SplitHostPort(addr)
+func splitHostPort(addr string) (host string, port int) {
+	host, rawPort, err := net.SplitHostPort(addr)
 	if err != nil {
-		return addr, "443"
+		return addr, 443
 	}
 	if host == "" {
 		host = "127.0.0.1"
+	}
+	port, err = strconv.Atoi(rawPort)
+	if err != nil || port < 1 || port > 65535 {
+		return host, 443
 	}
 	return host, port
 }
 
 type managedProxy struct {
-	Name       string
-	Server     string
-	Port       string
-	Auth       string
-	SNI        string
-	Insecure   bool
-	Obfs       string
-	ObfsPasswd string
+	Name       string `yaml:"name"`
+	Type       string `yaml:"type"`
+	Server     string `yaml:"server"`
+	Port       int    `yaml:"port"`
+	Auth       string `yaml:"password"`
+	SNI        string `yaml:"sni,omitempty"`
+	Insecure   bool   `yaml:"skip-cert-verify,omitempty"`
+	Obfs       string `yaml:"obfs,omitempty"`
+	ObfsPasswd string `yaml:"obfs-password,omitempty"`
 }
 
 type managedSubscriptionData struct {
-	Username     string
-	MonthlyBytes uint64
-	Proxies      []managedProxy
+	Proxies []managedProxy
 }
 
-const managedClashTemplate = `# managed user: {{.Username}}
-ipv6: false
-log-level: info
-mode: rule
-mixed-port: 7890
+type managedProxyGroup struct {
+	Name    string   `yaml:"name"`
+	Type    string   `yaml:"type"`
+	Proxies []string `yaml:"proxies"`
+}
 
-proxies:
-{{- range .Proxies}}
-  - name: "{{.Name}}"
-    type: hysteria2
-    server: {{.Server}}
-    port: {{.Port}}
-    password: "{{.Auth}}"
-{{- if .SNI}}
-    sni: {{.SNI}}
-{{- end}}
-{{- if .Insecure}}
-    skip-cert-verify: true
-{{- end}}
-{{- if .Obfs}}
-    obfs: {{.Obfs}}
-    obfs-password: "{{.ObfsPasswd}}"
-{{- end}}
-{{- end}}
+type managedClashConfig struct {
+	IPv6        bool                `yaml:"ipv6"`
+	LogLevel    string              `yaml:"log-level"`
+	Mode        string              `yaml:"mode"`
+	MixedPort   int                 `yaml:"mixed-port"`
+	Proxies     []managedProxy      `yaml:"proxies"`
+	ProxyGroups []managedProxyGroup `yaml:"proxy-groups"`
+	Rules       []string            `yaml:"rules"`
+}
 
-proxy-groups:
-  - name: "规则代理"
-    type: select
-    proxies:
-{{- range .Proxies}}
-      - "{{.Name}}"
-{{- end}}
-      - DIRECT
-
-rules:
-  - GEOIP,CN,DIRECT
-  - MATCH,规则代理
-`
+func renderManagedSubscription(data managedSubscriptionData) ([]byte, error) {
+	names := make([]string, 0, len(data.Proxies)+1)
+	for i := range data.Proxies {
+		data.Proxies[i].Type = "hysteria2"
+		names = append(names, data.Proxies[i].Name)
+	}
+	names = append(names, "DIRECT")
+	cfg := managedClashConfig{
+		IPv6:      false,
+		LogLevel:  "info",
+		Mode:      "rule",
+		MixedPort: 7890,
+		Proxies:   data.Proxies,
+		ProxyGroups: []managedProxyGroup{{
+			Name:    "规则代理",
+			Type:    "select",
+			Proxies: names,
+		}},
+		Rules: []string{"GEOIP,CN,DIRECT", "MATCH,规则代理"},
+	}
+	var output bytes.Buffer
+	encoder := yaml.NewEncoder(&output)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(cfg); err != nil {
+		return nil, err
+	}
+	if err := encoder.Close(); err != nil {
+		return nil, err
+	}
+	return output.Bytes(), nil
+}

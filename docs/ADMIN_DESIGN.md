@@ -31,6 +31,8 @@ SQLite 增加以下逻辑实体：
 
 流量明细保留 `user_id`、`node_id`、`tx_bytes`、`rx_bytes` 与 UTC Unix 时间。启动迁移会将旧版带时区的文本时间规范化为 UTC Unix 秒。月度查询按 YAML `timezone` 计算边界。用户套餐用量为当前自然月内所有节点的 `tx + rx` 之和；用户下载限速只限制 `rx`，且所有连接共享额度。
 
+每次 flush 先原子取出内存增量，再使用单个 SQLite 事务写入明细和汇总。事务失败时完整增量会加回内存计数，和故障期间的新流量合并后在下一个周期重试；不会因为临时锁、磁盘或 I/O 错误静默丢失计费数据。
+
 ## 认证、到期和流量
 
 认证在内存用户快照上进行。后台修改用户的删除状态、到期时间、月额度、下载限速和密码后，Gateway 最迟在 2 秒刷新周期后应用该快照。节点和用户节点授权只在完整重启后重新加载。
@@ -38,12 +40,15 @@ SQLite 增加以下逻辑实体：
 - 后台“停用用户”通过软删除标记实现；重新启用会清除该标记，不丢失配置与历史流量。
 - 流量额度超额：产生下一笔流量时立即断开整个客户端连接。
 - 用户停用或到期：拒绝新连接；已有 QUIC 会话在产生下一笔流量时立即断开。
+- 触发关闭的那一笔 TCP/UDP 有效负载会在转发和计量前被拒绝。完全空闲的 QUIC 会话不会被主动扫描或踢下线，仍可能显示在活跃连接中并占用少量会话资源，直到客户端断开、再次发送流量、QUIC idle timeout 或 Gateway 重启。当前 Hysteria2 server API 不提供按用户关闭空闲 QUIC 连接的公开接口。
 - 到期时间当前由管理员直接编辑 `expires_at`；清空表示不过期。数据库统一保存 UTC Unix 秒，表单按 YAML `timezone` 解释。
 - 节点错误直接返回给客户端；不提供服务端隐式 fallback。
 
 ## 订阅
 
 新用户生成随机的 16 位 Base62 bearer token。数据库只存 SHA-256 哈希，订阅请求以哈希索引用户，支持单用户重置链接。
+
+Clash.Meta 订阅通过 `yaml.v3` 从强类型结构编码，节点显示名、用户密码、SNI 和混淆密码不经过字符串模板拼接，特殊字符会按 YAML 规则转义。
 
 旧版本 token 为 `Base62(HMAC-SHA256(subscriptionSecret, username)[:12])`。`migrate` 命令读取旧 YAML 的 `sub.secret`，若为空则读取 `api.secret`，计算旧 token 并存储其哈希，因此已发布订阅 URL 保持可用。
 
@@ -52,6 +57,8 @@ SQLite 增加以下逻辑实体：
 ## 管理 Web 与 CSRF
 
 管理 Web 使用服务端渲染的 HTML 表单，不提供通用 JSON 管理 API。它仅监听 loopback。所有写操作要求启动时生成的 CSRF token；为兼容 SSH 转发和本地代理访问，不校验 `Origin`/`Referer`。这不是登录鉴权。
+
+只有只读页面和查询端点接受 GET。用户、节点和重启路由只接受 POST，并在进入 action handler 前验证 CSRF token。SSH 转发不改变该边界；取消容易被代理误判的 Origin 校验不等于允许 GET 修改状态。
 
 用户策略保存、密码重置、订阅链接重置、用户停用/启用、节点停用和 Gateway 重启均要求二次确认。确认框必须说明凭据失效范围、现有连接是否中断、配置是否保留以及是否需要重启；确认只属于前端防误操作措施，后端仍以 CSRF token 作为写请求保护。
 
@@ -87,9 +94,11 @@ hy2-gateway migrate -c legacy-gateway.yaml
 
 systemd 直接执行 Gateway。推荐的 service 配置包括 `Restart=on-failure`、重启退避、启动失败上限、`TimeoutStopSec`、`KillMode=control-group` 和 `WatchdogSec`。
 
-Gateway 在启动、退出和健康检查状态变化时记录运行事件。systemd 通过 `ExecStopPost` 调用同一二进制的轻量 `record-exit` 子命令，写入 `SERVICE_RESULT`、`EXIT_CODE` 和 `EXIT_STATUS`。后台据此展示人工重启、定时重启、watchdog、OOM、信号、异常退出和启动限流。
+Gateway 在启动、退出和健康检查状态变化时记录运行事件。systemd 通过 `ExecStopPost` 调用同一二进制的轻量 `record-exit` 子命令，写入 `SERVICE_RESULT`、`EXIT_CODE` 和 `EXIT_STATUS`。后台发起的即时/定时任务会关联到下一条进程运行记录；异常重启标记为 `recovery:<systemd-result>`；无法由 systemd 继续细分的外部启动标记为 `external-start`。重启任务同时保存 D-Bus 失败详情。
 
 watchdog 在 Gateway 启动后才进入就绪状态，并在 Gateway 服务循环仍在运行且 SQLite 健康检查成功时发送心跳。出站 Node 不可用只标记节点问题，不触发整个 Gateway 重启。
+
+管理和订阅 HTTP 端口会在启动阶段同步绑定，失败即 fatal。已启动的 HTTP serve loop 若异常退出，会进入主服务错误路径，完成清理后以非零状态退出，交由 systemd 按 `Restart=on-failure` 恢复。
 
 节点/授权改动增加保存 revision 并标记待重启。Gateway 成功启动并加载数据库配置后写入运行 revision。立即或定时重启任务通过受限 systemd D-Bus 权限请求重启 `hy2-gateway.service`；后台不拼接 shell 命令。
 

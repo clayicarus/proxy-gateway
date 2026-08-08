@@ -369,3 +369,129 @@ func TestSQLiteStore_ListRunningProcess(t *testing.T) {
 		t.Fatalf("unexpected running process record: %#v", runs)
 	}
 }
+
+func TestSQLiteStore_RestartJobLinksToNextProcess(t *testing.T) {
+	store, err := NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	jobID, err := store.ScheduleRestart(time.Now().Add(-time.Second), "immediate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.ClaimDueRestart(time.Now())
+	if err != nil || job == nil || job.ID != jobID {
+		t.Fatalf("claim restart job: job=%#v err=%v", job, err)
+	}
+	if err := store.CompleteRestartJob(jobID, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartProcessRun(2345, 8, ""); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := store.ListProcessRuns(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Trigger != "admin:immediate" {
+		t.Fatalf("restart trigger was not linked to process: %#v", runs)
+	}
+}
+
+func TestSQLiteStore_AddsRestartDetailColumnsToExistingDatabase(t *testing.T) {
+	dbPath := t.TempDir() + "/managed.db"
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE restart_jobs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		run_at INTEGER NOT NULL,
+		trigger TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'pending',
+		created_at INTEGER NOT NULL,
+		executed_at INTEGER
+	)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewSQLiteStore(dbPath, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	jobID, err := store.ScheduleRestart(time.Now(), "immediate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteRestartJob(jobID, false, "test detail"); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := store.ListRestartJobs(10)
+	if err != nil || len(jobs) != 1 || jobs[0].Detail != "test detail" {
+		t.Fatalf("restart columns were not migrated: jobs=%#v err=%v", jobs, err)
+	}
+}
+
+func TestSQLiteStore_RestartFailureKeepsDetail(t *testing.T) {
+	store, err := NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	jobID, err := store.ScheduleRestart(time.Now(), "scheduled")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteRestartJob(jobID, false, "D-Bus permission denied"); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := store.ListRestartJobs(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].Status != "failed" || jobs[0].Detail != "D-Bus permission denied" {
+		t.Fatalf("restart failure detail missing: %#v", jobs)
+	}
+}
+
+func TestSQLiteStore_ProcessRecoveryUsesSystemdResult(t *testing.T) {
+	store, err := NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.StartProcessRun(1001, 1, "initial"); err != nil {
+		t.Fatal(err)
+	}
+	// Use a different PID to exercise ExecStopPost's single-process fallback.
+	if err := store.RecordProcessExit(9999, "watchdog", "killed", "6"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartProcessRun(1002, 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := store.ListProcessRuns(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 2 || runs[0].Trigger != "recovery:watchdog" || runs[1].SystemdResult != "watchdog" {
+		t.Fatalf("systemd recovery reason was not retained: %#v", runs)
+	}
+}
+
+func TestSQLiteStore_RejectsManagedDirectNode(t *testing.T) {
+	store, err := NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.SaveNode("direct-v4", config.NodeConfig{Type: "direct", Direct: &config.DirectConfig{}}, true); err == nil {
+		t.Fatal("managed direct node was accepted")
+	}
+}

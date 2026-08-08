@@ -324,8 +324,8 @@ function renderRangeBreakdown(data) {
   if (!body) return;
   body.replaceChildren();
   const entries = [
-    ...data.users.map((item) => ({ ...item, kind: "用户", egress: item.txBytes + item.rxBytes })),
-    ...data.nodes.map((item) => ({ ...item, kind: "节点", egress: item.name === "direct" ? 0 : item.txBytes + item.rxBytes })),
+    ...data.users.map((item) => ({ ...item, kind: "用户", egress: item.egressBytes })),
+    ...data.nodes.map((item) => ({ ...item, kind: "节点", egress: item.egressBytes })),
   ];
   if (!entries.length) {
     const row = document.createElement("tr");

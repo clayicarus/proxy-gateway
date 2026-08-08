@@ -59,6 +59,7 @@ type TrafficLogger struct {
 	stopOnce     sync.Once
 	flushDone    chan struct{}
 	flushStarted atomic.Bool
+	flushMu      sync.Mutex
 
 	location     *time.Location
 	monthKey     string
@@ -198,6 +199,8 @@ func (tl *TrafficLogger) Flush() {
 	if tl.store == nil {
 		return
 	}
+	tl.flushMu.Lock()
+	defer tl.flushMu.Unlock()
 
 	var records []storage.TrafficRecord
 	now := time.Now()
@@ -225,6 +228,14 @@ func (tl *TrafficLogger) Flush() {
 	}
 
 	if err := tl.store.FlushTraffic(records); err != nil {
+		// FlushTraffic is transactional, so none of this batch was persisted.
+		// Restore the deltas alongside traffic accumulated during the failed write;
+		// the next periodic flush will retry the complete amount.
+		for _, record := range records {
+			stats := tl.getOrCreate(record.UserID + ":" + record.NodeID)
+			stats.TxDelta.Add(record.TxBytes)
+			stats.RxDelta.Add(record.RxBytes)
+		}
 		tl.logger.Error("failed to flush traffic to sqlite", zap.Error(err))
 	} else {
 		tl.logger.Debug("flushed traffic to sqlite", zap.Int("records", len(records)))

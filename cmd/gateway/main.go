@@ -40,10 +40,12 @@ func main() {
 		runMigrate(os.Args[2:])
 		return
 	}
-	runGateway(os.Args[1:])
+	if err := runGateway(os.Args[1:]); err != nil {
+		os.Exit(1)
+	}
 }
 
-func runGateway(args []string) {
+func runGateway(args []string) error {
 	flags := flag.NewFlagSet("hy2-gateway", flag.ExitOnError)
 	configPath := flags.String("c", "configs/gateway.yaml", "path to config file")
 	_ = flags.Parse(args)
@@ -108,6 +110,7 @@ func runGateway(args []string) {
 	// subscription listener. The old api.listen value is accepted as a legacy
 	// alias for admin.listen but no longer grants a JSON management API.
 	var httpServers []*http.Server
+	serviceErrCh := make(chan error, 3)
 	adminListen := cfg.Admin.Listen
 	if adminListen == "" {
 		adminListen = cfg.API.Listen
@@ -121,13 +124,21 @@ func runGateway(args []string) {
 			logger.Fatal("failed to create management web", zap.Error(err))
 		}
 		httpServer := &http.Server{Addr: adminListen, Handler: manager.Handler(), ReadHeaderTimeout: 10 * time.Second}
+		listener, err := net.Listen("tcp", adminListen)
+		if err != nil {
+			logger.Fatal("management web failed to listen", zap.String("listen", adminListen), zap.Error(err))
+		}
 		httpServers = append(httpServers, httpServer)
-		go serveHTTP(logger, "management web", httpServer)
+		go serveHTTP(logger, "management web", httpServer, listener, serviceErrCh)
 	}
 	if cfg.Sub != nil && cfg.Sub.Listen != "" {
 		httpServer := &http.Server{Addr: cfg.Sub.Listen, Handler: api.NewDatabaseSubscriptionHandler(cfg, store, users, nodes, logger).Handler(), ReadHeaderTimeout: 10 * time.Second}
+		listener, err := net.Listen("tcp", cfg.Sub.Listen)
+		if err != nil {
+			logger.Fatal("subscription service failed to listen", zap.String("listen", cfg.Sub.Listen), zap.Error(err))
+		}
 		httpServers = append(httpServers, httpServer)
-		go serveHTTP(logger, "subscription service", httpServer)
+		go serveHTTP(logger, "subscription service", httpServer, listener, serviceErrCh)
 	}
 
 	// Only user lifecycle fields are hot-reloaded. Node definitions and route
@@ -177,12 +188,15 @@ func runGateway(args []string) {
 	logger.Info("hy2-gateway starting", zap.String("listen", cfg.Listen))
 
 	// Start serving in background
-	errCh := make(chan error, 1)
 	var gatewayServing atomic.Bool
 	go func() {
 		gatewayServing.Store(true)
 		defer gatewayServing.Store(false)
-		errCh <- hyServerInstance.Serve()
+		err := hyServerInstance.Serve()
+		if err == nil {
+			err = fmt.Errorf("serve loop stopped without an error")
+		}
+		serviceErrCh <- fmt.Errorf("Gateway server stopped: %w", err)
 	}()
 
 	state, err := store.GetConfigState()
@@ -218,11 +232,12 @@ func runGateway(args []string) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	var serviceErr error
 	select {
 	case sig := <-sigCh:
 		logger.Info("received signal, shutting down", zap.String("signal", sig.String()))
-	case err := <-errCh:
-		logger.Error("server error", zap.Error(err))
+	case serviceErr = <-serviceErrCh:
+		logger.Error("service error", zap.Error(serviceErr))
 	case <-ctx.Done():
 	}
 
@@ -242,6 +257,7 @@ func runGateway(args []string) {
 	background.Wait()
 	trafficLogger.Stop()
 	logger.Info("hy2-gateway stopped")
+	return serviceErr
 }
 
 func isLoopbackListen(addr string) bool {
@@ -335,10 +351,10 @@ func runWatchdog(stop <-chan struct{}, store *storage.SQLiteStore, gatewayServin
 	}
 }
 
-func serveHTTP(logger *zap.Logger, name string, server *http.Server) {
+func serveHTTP(logger *zap.Logger, name string, server *http.Server, listener net.Listener, errCh chan<- error) {
 	logger.Info(name+" starting", zap.String("listen", server.Addr))
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logger.Error(name+" failed", zap.Error(err))
+	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+		errCh <- fmt.Errorf("%s stopped: %w", name, err)
 	}
 }
 

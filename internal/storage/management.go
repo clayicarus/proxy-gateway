@@ -65,6 +65,7 @@ type RestartJob struct {
 	RunAt      time.Time
 	Trigger    string
 	Status     string
+	Detail     string
 	CreatedAt  time.Time
 	ExecutedAt *time.Time
 }
@@ -156,7 +157,9 @@ func (s *SQLiteStore) migrateManagement() error {
 		trigger TEXT NOT NULL,
 		status TEXT NOT NULL DEFAULT 'pending',
 		created_at INTEGER NOT NULL,
-		executed_at INTEGER
+		executed_at INTEGER,
+		error_detail TEXT,
+		started_process_run_id INTEGER
 	);
 	CREATE INDEX IF NOT EXISTS idx_restart_jobs_pending ON restart_jobs(status, run_at);
 
@@ -174,7 +177,40 @@ func (s *SQLiteStore) migrateManagement() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_process_runs_started ON process_runs(started_at DESC);
 	`
-	_, err := s.db.Exec(schema)
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("restart_jobs", "error_detail", "TEXT"); err != nil {
+		return err
+	}
+	return s.ensureColumn("restart_jobs", "started_process_run_id", "INTEGER")
+}
+
+func (s *SQLiteStore) ensureColumn(table, column, definition string) error {
+	rows, err := s.db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, definition))
 	return err
 }
 
@@ -220,6 +256,9 @@ func (s *SQLiteStore) MigrateLegacy(cfg *config.Config, legacyToken func(string)
 		node := cfg.Nodes[name]
 		if name == "direct" && node.Type == "direct" {
 			continue
+		}
+		if node.Type == "direct" {
+			return fmt.Errorf("legacy node %q uses direct type; authorize the built-in direct route instead", name)
 		}
 		if !isValidName(name) {
 			return fmt.Errorf("invalid legacy node name %q", name)
@@ -803,6 +842,9 @@ func (s *SQLiteStore) SaveNode(name string, node config.NodeConfig, enabled bool
 	if !isValidName(name) || name == "direct" {
 		return fmt.Errorf("invalid node name")
 	}
+	if node.Type == "direct" {
+		return fmt.Errorf("direct is a built-in route and cannot be saved as a managed node")
+	}
 	if err := validateNode(name, node); err != nil {
 		return err
 	}
@@ -901,12 +943,13 @@ func (s *SQLiteStore) ClaimDueRestart(now time.Time) (*RestartJob, error) {
 	return &job, nil
 }
 
-func (s *SQLiteStore) CompleteRestartJob(id int64, success bool, _ string) error {
+func (s *SQLiteStore) CompleteRestartJob(id int64, success bool, detail string) error {
 	status := "failed"
 	if success {
 		status = "completed"
+		detail = ""
 	}
-	_, err := s.db.Exec(`UPDATE restart_jobs SET status = ?, executed_at = COALESCE(executed_at, ?) WHERE id = ?`, status, time.Now().UTC().Unix(), id)
+	_, err := s.db.Exec(`UPDATE restart_jobs SET status = ?, error_detail = NULLIF(?, ''), executed_at = COALESCE(executed_at, ?) WHERE id = ?`, status, detail, time.Now().UTC().Unix(), id)
 	return err
 }
 
@@ -914,7 +957,7 @@ func (s *SQLiteStore) ListRestartJobs(limit int) ([]RestartJob, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
-	rows, err := s.db.Query(`SELECT id, run_at, trigger, status, created_at, executed_at FROM restart_jobs ORDER BY id DESC LIMIT ?`, limit)
+	rows, err := s.db.Query(`SELECT id, run_at, trigger, status, COALESCE(error_detail, ''), created_at, executed_at FROM restart_jobs ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -924,7 +967,7 @@ func (s *SQLiteStore) ListRestartJobs(limit int) ([]RestartJob, error) {
 		var job RestartJob
 		var runAt, createdAt int64
 		var executedAt sql.NullInt64
-		if err := rows.Scan(&job.ID, &runAt, &job.Trigger, &job.Status, &createdAt, &executedAt); err != nil {
+		if err := rows.Scan(&job.ID, &runAt, &job.Trigger, &job.Status, &job.Detail, &createdAt, &executedAt); err != nil {
 			return nil, err
 		}
 		job.RunAt = time.Unix(runAt, 0).UTC()
@@ -937,14 +980,61 @@ func (s *SQLiteStore) ListRestartJobs(limit int) ([]RestartJob, error) {
 
 // StartProcessRun records a newly started Gateway process.
 func (s *SQLiteStore) StartProcessRun(pid int, revision int64, trigger string) (int64, error) {
-	if trigger == "" {
-		trigger = "auto"
-	}
-	result, err := s.db.Exec(`INSERT INTO process_runs (pid, started_at, config_revision, trigger) VALUES (?, ?, ?, ?)`, pid, time.Now().UTC().Unix(), revision, trigger)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
 	}
-	return result.LastInsertId()
+	defer tx.Rollback()
+	now := time.Now().UTC().Unix()
+	var restartJobID int64
+	if trigger == "" {
+		var jobTrigger string
+		var jobStatus string
+		err := tx.QueryRow(`SELECT id, trigger, status FROM restart_jobs WHERE status IN ('completed', 'running') AND started_process_run_id IS NULL AND executed_at >= ? ORDER BY executed_at DESC, id DESC LIMIT 1`, now-600).Scan(&restartJobID, &jobTrigger, &jobStatus)
+		switch {
+		case err == nil:
+			trigger = "admin:" + jobTrigger
+			if jobStatus == "running" {
+				if _, err := tx.Exec(`UPDATE restart_jobs SET status = 'completed', error_detail = COALESCE(error_detail, 'new process observed before the scheduler recorded D-Bus completion') WHERE id = ?`, restartJobID); err != nil {
+					return 0, err
+				}
+			}
+		case err != sql.ErrNoRows:
+			return 0, err
+		default:
+			var previousResult string
+			err = tx.QueryRow(`SELECT COALESCE(systemd_result, '') FROM process_runs WHERE stopped_at IS NOT NULL ORDER BY id DESC LIMIT 1`).Scan(&previousResult)
+			switch {
+			case err == sql.ErrNoRows:
+				trigger = "initial"
+			case err != nil:
+				return 0, err
+			case previousResult != "" && previousResult != "success":
+				trigger = "recovery:" + previousResult
+			default:
+				trigger = "external-start"
+			}
+		}
+	}
+	result, err := tx.Exec(`INSERT INTO process_runs (pid, started_at, config_revision, trigger) VALUES (?, ?, ?, ?)`, pid, now, revision, trigger)
+	if err != nil {
+		return 0, err
+	}
+	runID, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if restartJobID != 0 {
+		if _, err := tx.Exec(`UPDATE restart_jobs SET started_process_run_id = ? WHERE id = ? AND started_process_run_id IS NULL`, runID, restartJobID); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return runID, nil
 }
 
 // RecordProcessExit is called by the record-exit subcommand from ExecStopPost.
@@ -956,7 +1046,17 @@ func (s *SQLiteStore) RecordProcessExit(pid int, result, exitCode, exitStatus st
 		args = append(args, pid)
 	}
 	query += ` ORDER BY id DESC LIMIT 1)`
-	_, err := s.db.Exec(query, args...)
+	updateResult, err := s.db.Exec(query, args...)
+	if err != nil || pid <= 0 {
+		return err
+	}
+	affected, err := updateResult.RowsAffected()
+	if err != nil || affected != 0 {
+		return err
+	}
+	// MAINPID is not consistently exported to ExecStopPost by every systemd
+	// version. This service is single-process, so fall back to its latest open run.
+	_, err = s.db.Exec(`UPDATE process_runs SET stopped_at = ?, systemd_result = ?, exit_code = ?, exit_status = ? WHERE id = (SELECT id FROM process_runs WHERE stopped_at IS NULL ORDER BY id DESC LIMIT 1)`, time.Now().UTC().Unix(), result, exitCode, exitStatus)
 	return err
 }
 
@@ -987,7 +1087,7 @@ func (s *SQLiteStore) ListProcessRuns(limit int) ([]ProcessRun, error) {
 func validateNode(name string, node config.NodeConfig) error {
 	switch node.Type {
 	case "direct":
-		return nil
+		return fmt.Errorf("node %q cannot use the built-in direct type", name)
 	case "socks5":
 		if node.SOCKS5 == nil || node.SOCKS5.Addr == "" {
 			return fmt.Errorf("node %q requires socks5 addr", name)

@@ -38,6 +38,34 @@ func TestManagerRejectsWriteWithoutCSRF(t *testing.T) {
 	}
 }
 
+func TestManagerRejectsGETForUserActions(t *testing.T) {
+	store, err := storage.NewSQLiteStore(t.TempDir()+"/admin.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.CreateUser(storage.ManagedUserInput{Username: "alice", Password: "password", Routes: []string{"direct"}}, "token"); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(&config.Config{Timezone: "UTC"}, store, traffic.NewTrafficLogger(nil, store, zap.NewNop()), zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	manager.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9090/users/alice/delete", nil))
+	if response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET user action status = %d, want %d", response.Code, http.StatusMethodNotAllowed)
+	}
+	user, err := store.GetUser("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user == nil || user.DeletedAt != nil {
+		t.Fatal("GET user action changed managed user state")
+	}
+}
+
 func TestManagerCreatesUserWithCSRFRegardlessOfOrigin(t *testing.T) {
 	store, err := storage.NewSQLiteStore(t.TempDir()+"/admin.db", zap.NewNop())
 	if err != nil {
@@ -292,5 +320,15 @@ func TestManagerLiveTrafficAggregatesByUserAndNode(t *testing.T) {
 	}
 	if got := status.Nodes["node1"]; got.TxBytes != 140 || got.RxBytes != 250 || got.Online != 2 {
 		t.Fatalf("unexpected node1 live traffic: %#v", got)
+	}
+}
+
+func TestDirectRouteSetIncludesLegacyNamedDirectNodes(t *testing.T) {
+	routes := directRouteSet([]storage.ManagedNode{
+		{Name: "direct-v4", Config: config.NodeConfig{Type: "direct", Direct: &config.DirectConfig{}}},
+		{Name: "node1", Config: config.NodeConfig{Type: "socks5", SOCKS5: &config.SOCKS5Config{Addr: "127.0.0.1:1080"}}},
+	})
+	if !routes["direct"] || !routes["direct-v4"] || routes["node1"] {
+		t.Fatalf("unexpected direct route set: %#v", routes)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/hy2-gateway/internal/config"
 	"github.com/hy2-gateway/internal/storage"
 	"go.uber.org/zap"
+	"gopkg.in/yaml.v3"
 )
 
 func TestDatabaseSubscriptionUsesRestartAppliedRoutes(t *testing.T) {
@@ -101,5 +102,40 @@ func TestDatabaseSubscriptionRejectsTokenOutsideSubPath(t *testing.T) {
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://sub.example/subscription-token", nil))
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("token outside /sub/ status = %d, want 404", response.Code)
+	}
+}
+
+func TestDatabaseSubscriptionEscapesYAMLSpecialCharacters(t *testing.T) {
+	store, err := storage.NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	node := config.NodeConfig{
+		Type:      "hysteria2",
+		Alias:     "Node \"One\"\nPrimary",
+		Hysteria2: &config.Hysteria2OutboundConfig{Addr: "node1.example:443", Auth: "node-password"},
+	}
+	password := "p\"ass\\word\nsecond-line"
+	if err := store.SaveNode("node1", node, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateUser(storage.ManagedUserInput{Username: "alice", Password: password, Routes: []string{"node1"}}, "subscription-token"); err != nil {
+		t.Fatal(err)
+	}
+	users := map[string]config.UserConfig{"alice": {Password: password, Routes: []string{"node1"}}}
+	handler := NewDatabaseSubscriptionHandler(&config.Config{Sub: &config.SubConfig{ServerAddr: "gateway.example:8443", SNI: "gateway.example"}}, store, users, map[string]config.NodeConfig{"node1": node}, zap.NewNop()).Handler()
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://sub.example/sub/subscription-token", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("subscription status = %d: %s", response.Code, response.Body.String())
+	}
+	var decoded managedClashConfig
+	if err := yaml.Unmarshal(response.Body.Bytes(), &decoded); err != nil {
+		t.Fatalf("generated subscription is invalid YAML: %v\n%s", err, response.Body.String())
+	}
+	if len(decoded.Proxies) != 1 || decoded.Proxies[0].Name != node.Alias || decoded.Proxies[0].Auth != "alice:node1:"+password {
+		t.Fatalf("special characters did not round trip: %#v", decoded.Proxies)
 	}
 }

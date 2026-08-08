@@ -186,6 +186,33 @@ func TestTrafficLogger_StopWaitsForFinalFlush(t *testing.T) {
 	}
 }
 
+func TestTrafficLogger_FailedFlushRestoresDeltas(t *testing.T) {
+	store, err := storage.NewSQLiteStore(t.TempDir()+"/traffic.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	users := map[string]config.UserConfig{
+		"alice": {Password: "p", Routes: []string{"direct"}},
+	}
+	tl := NewTrafficLogger(users, store, zap.NewNop())
+	if ok := tl.LogTraffic("alice:direct", 100, 200); !ok {
+		t.Fatal("active traffic was rejected")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	tl.Flush()
+	value, ok := tl.stats.Load("alice:direct")
+	if !ok {
+		t.Fatal("traffic stats missing after failed flush")
+	}
+	stats := value.(*UserNodeStats)
+	if tx, rx := stats.TxDelta.Load(), stats.RxDelta.Load(); tx != 100 || rx != 200 {
+		t.Fatalf("failed flush deltas = %d/%d, want 100/200", tx, rx)
+	}
+}
+
 func TestTrafficLogger_Reset(t *testing.T) {
 	logger := zap.NewNop()
 	users := map[string]config.UserConfig{
