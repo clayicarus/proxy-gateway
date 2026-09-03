@@ -1,4 +1,4 @@
-BINARY_NAME=hy2-gateway
+BINARY_NAME=proxy-gateway
 VERSION?=0.1.0
 BUILD_DIR=build
 GO=go

@@ -24,9 +24,10 @@ users:
       - direct
 nodes:
   node1:
-    type: socks5
-    socks5:
-      addr: "proxy.example.com:1080"
+    type: hysteria2
+    hysteria2:
+      addr: "proxy.example.com:443"
+      auth: "node-secret"
 api:
   listen: ":9090"
   secret: "test_secret"
@@ -80,7 +81,7 @@ api:
 	if cfg.Listen != ":443" {
 		t.Errorf("expected default listen :443, got %s", cfg.Listen)
 	}
-	if cfg.DBPath != "hy2-gateway.db" {
+	if cfg.DBPath != "proxy-gateway.db" {
 		t.Errorf("expected default dbPath, got %s", cfg.DBPath)
 	}
 }
@@ -205,13 +206,15 @@ users:
       - direct
 nodes:
   node_tokyo:
-    type: socks5
-    socks5:
-      addr: "tokyo.example.com:1080"
+    type: hysteria2
+    hysteria2:
+      addr: "tokyo.example.com:443"
+      auth: "tokyo-secret"
   node_sg:
-    type: socks5
-    socks5:
-      addr: "sg.example.com:1080"
+    type: hysteria2
+    hysteria2:
+      addr: "sg.example.com:443"
+      auth: "sg-secret"
 api:
   listen: ":9090"
 `
@@ -224,6 +227,20 @@ api:
 	alice := cfg.Users["alice"]
 	if len(alice.Routes) != 3 {
 		t.Errorf("expected 3 routes, got %d", len(alice.Routes))
+	}
+}
+
+func TestValidateLegacy_RejectsRemovedNodeTypes(t *testing.T) {
+	for _, nodeType := range []string{"socks5", "http", "direct"} {
+		t.Run(nodeType, func(t *testing.T) {
+			cfg := &Config{
+				Users: map[string]UserConfig{"alice": {Password: "secret", Routes: []string{"node1"}}},
+				Nodes: map[string]NodeConfig{"node1": {Type: nodeType}},
+			}
+			if err := cfg.ValidateLegacy(); err == nil {
+				t.Fatalf("legacy validation accepted removed node type %q", nodeType)
+			}
+		})
 	}
 }
 

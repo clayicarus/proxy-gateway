@@ -1,4 +1,4 @@
-# Hy2-Gateway 示例配置
+# Proxy Gateway 示例配置
 
 # 监听地址
 listen: :8443
@@ -43,7 +43,7 @@ timezone: "Asia/Shanghai"
 
 # systemd 直接守护本进程。watchdog 仅在 unit 设置 WatchdogSec 时启用。
 systemd:
-  unit: "hy2-gateway.service"
+  unit: "proxy-gateway.service"
   watchdog: true
 
 # ============================================================
@@ -57,5 +57,5 @@ sub:
   insecure: false
 
 # 用户和节点均由 SQLite 管理。如需导入旧 YAML，请执行：
-# hy2-gateway migrate -c /etc/hy2-gateway/legacy-gateway.yaml
+# proxy-gateway migrate -c /etc/proxy-gateway/legacy-gateway.yaml
 # 迁移时使用 sub.secret（缺省时 api.secret）计算旧订阅链接。

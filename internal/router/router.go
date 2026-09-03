@@ -3,8 +3,8 @@ package router
 import (
 	"fmt"
 
-	"github.com/hy2-gateway/internal/auth"
-	"github.com/hy2-gateway/internal/config"
+	"github.com/clayicarus/proxy-gateway/internal/auth"
+	"github.com/clayicarus/proxy-gateway/internal/config"
 	"go.uber.org/zap"
 )
 

@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hy2-gateway/internal/config"
-	"github.com/hy2-gateway/internal/storage"
+	"github.com/clayicarus/proxy-gateway/internal/config"
+	"github.com/clayicarus/proxy-gateway/internal/storage"
 	"go.uber.org/zap"
 )
 

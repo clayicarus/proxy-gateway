@@ -1,8 +1,8 @@
-# Hy2-Gateway 架构设计
+# Proxy Gateway 架构设计
 
 ## 系统边界
 
-Hy2-Gateway 在 Hysteria2 核心库之上实现多用户入口、显式节点路由、流量策略和 SQLite 控制面。Gateway、本地管理 Web、公开订阅 HTTP 服务、重启调度器和 watchdog 都运行在同一进程中；systemd 负责进程守护和异常重启。
+Proxy Gateway 在 Hysteria2 核心库之上实现多用户入口、显式节点路由、流量策略和 SQLite 控制面。Gateway、本地管理 Web、公开订阅 HTTP 服务、重启调度器和 watchdog 都运行在同一进程中；systemd 负责进程守护和异常重启。
 
 ```mermaid
 flowchart LR
@@ -21,7 +21,6 @@ flowchart LR
 
     subgraph 出站
         D[direct]
-        P[SOCKS5 / HTTP 代理]
         H[远端 Hysteria2 Node]
         I[互联网]
     end
@@ -35,7 +34,6 @@ flowchart LR
     W -->|受限 D-Bus 重启| SD
     SD -->|守护 / watchdog| G
     G --> D --> I
-    G --> P --> I
     G -->|QUIC / UDP| H --> I
 ```
 
@@ -100,13 +98,11 @@ sequenceDiagram
 
 ## 出站生命周期
 
-`OutboundFactory` 持有启动时加载的节点定义，并按需创建、缓存每个节点的一个 outbound：
+`OutboundFactory` 持有启动时加载的 Hysteria2 节点定义；`direct` 是唯一内建出站。Gateway 启动时最多并发预连接 8 个节点，并等待首轮连接结果最多 10 秒。一个节点阻塞或失败不会占用全局锁，也不会阻止其他节点完成连接；预热超时后 Gateway 继续启动，未完成节点留在后台处理。
 
-- `direct`、SOCKS5 和 HTTP CONNECT 在第一次使用时创建。
-- Hysteria2 outbound 也在第一次使用该节点时创建；创建时其 `ReconnectableClient` 立即建立一条 QUIC 连接，之后自动重连并复用 stream。
-- Gateway 停机时关闭所有已缓存且支持关闭的 outbound。
+每个节点在 Ready 状态持有一个上游 `client.Client` 并复用 QUIC stream。连接关闭后立即将该节点标记为不可用，请求直接失败，不在请求路径等待重连；后台使用带 jitter 的指数退避重建连接，最长等待 60 秒。每次后台连接尝试均以 3 秒超时重新解析域名，依次尝试返回的 A/AAAA 地址，同时保留原域名作为默认 SNI；IPv4/IPv6 字面量跳过 DNS。Direct TCP 拨号超时为 10 秒，Hy2 握手使用上游默认 5 秒。
 
-这不是多连接池，也不会在 Gateway 启动时预连接全部节点。当前一个 Hysteria2 节点对应一个缓存 client。
+节点状态为 Connecting、Ready、Unavailable 或 Backoff，管理后台同时展示解析地址、最近成功、最近错误和下次重试时间。Gateway 停机时停止所有节点 worker 并关闭活动 client。这不是多连接池，当前一个 Hysteria2 节点对应一条活动 client 连接。
 
 ## 流量、配额和连接
 

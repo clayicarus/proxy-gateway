@@ -5,14 +5,14 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags "-s -w" -o /hy2-gateway ./cmd/gateway
+RUN CGO_ENABLED=0 go build -ldflags "-s -w" -o /proxy-gateway ./cmd/gateway
 
 FROM alpine:3.19
 RUN apk add --no-cache ca-certificates
-COPY --from=builder /hy2-gateway /usr/local/bin/hy2-gateway
+COPY --from=builder /proxy-gateway /usr/local/bin/proxy-gateway
 
 EXPOSE 443/udp
 EXPOSE 9090/tcp
 
-ENTRYPOINT ["hy2-gateway"]
-CMD ["-c", "/etc/hy2-gateway/gateway.yaml"]
+ENTRYPOINT ["proxy-gateway"]
+CMD ["-c", "/etc/proxy-gateway/gateway.yaml"]

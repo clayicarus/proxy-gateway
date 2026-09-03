@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"context"
 	"crypto/tls"
 	"net"
 	"testing"
@@ -8,11 +9,11 @@ import (
 
 	hyClient "github.com/apernet/hysteria/core/v2/client"
 	hyServer "github.com/apernet/hysteria/core/v2/server"
-	"github.com/hy2-gateway/internal/auth"
-	"github.com/hy2-gateway/internal/config"
-	"github.com/hy2-gateway/internal/event"
-	"github.com/hy2-gateway/internal/router"
-	"github.com/hy2-gateway/internal/traffic"
+	"github.com/clayicarus/proxy-gateway/internal/auth"
+	"github.com/clayicarus/proxy-gateway/internal/config"
+	"github.com/clayicarus/proxy-gateway/internal/event"
+	"github.com/clayicarus/proxy-gateway/internal/router"
+	"github.com/clayicarus/proxy-gateway/internal/traffic"
 	"go.uber.org/zap"
 )
 
@@ -110,6 +111,13 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
 	routerEngine := router.NewRouter(users, logger)
 	outboundFactory := router.NewOutboundFactory(nodes, logger)
+	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := outboundFactory.Warmup(warmupCtx); err != nil {
+		warmupCancel()
+		outboundFactory.Close()
+		t.Fatalf("failed to warm up node outbound: %v", err)
+	}
+	warmupCancel()
 	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
 	eventLogger := event.NewEventLogger(routingOutbound, logger)
 

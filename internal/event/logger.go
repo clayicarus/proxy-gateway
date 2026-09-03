@@ -4,8 +4,8 @@ import (
 	"net"
 
 	hyServer "github.com/apernet/hysteria/core/v2/server"
-	"github.com/hy2-gateway/internal/connection"
-	"github.com/hy2-gateway/internal/router"
+	"github.com/clayicarus/proxy-gateway/internal/connection"
+	"github.com/clayicarus/proxy-gateway/internal/router"
 	"go.uber.org/zap"
 )
 

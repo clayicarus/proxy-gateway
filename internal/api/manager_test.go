@@ -11,10 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hy2-gateway/internal/config"
-	"github.com/hy2-gateway/internal/connection"
-	"github.com/hy2-gateway/internal/storage"
-	"github.com/hy2-gateway/internal/traffic"
+	"github.com/clayicarus/proxy-gateway/internal/config"
+	"github.com/clayicarus/proxy-gateway/internal/connection"
+	"github.com/clayicarus/proxy-gateway/internal/router"
+	"github.com/clayicarus/proxy-gateway/internal/storage"
+	"github.com/clayicarus/proxy-gateway/internal/traffic"
 	"go.uber.org/zap"
 )
 
@@ -124,7 +125,7 @@ func TestManagerRendersDashboard(t *testing.T) {
 	if response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("dashboard cache control = %q, want no-store", response.Header().Get("Cache-Control"))
 	}
-	if !strings.Contains(response.Body.String(), "Hy2 Gateway") {
+	if !strings.Contains(response.Body.String(), "Proxy Gateway") {
 		t.Fatal("dashboard title missing")
 	}
 	for _, section := range []string{"基本信息", "用户管理", "活跃连接", "成本分析", "故障分析"} {
@@ -144,6 +145,67 @@ func TestManagerRendersDashboard(t *testing.T) {
 		if !strings.Contains(response.Body.String(), content) {
 			t.Fatalf("sensitive operation warning %q missing", content)
 		}
+	}
+}
+
+func TestManagerEditsAndPermanentlyDeletesNode(t *testing.T) {
+	store, err := storage.NewSQLiteStore(t.TempDir()+"/admin.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.SaveNode("node1", config.NodeConfig{Type: "hysteria2", Alias: "old", Hysteria2: &config.Hysteria2OutboundConfig{Addr: "node.example:443", Auth: "old-auth"}}, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateUser(storage.ManagedUserInput{Username: "alice", Password: "password", Routes: []string{"node1"}}, "token"); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(&config.Config{Timezone: "UTC"}, store, traffic.NewTrafficLogger(nil, store, zap.NewNop()), zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dashboard := httptest.NewRecorder()
+	manager.Handler().ServeHTTP(dashboard, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9090/", nil))
+	for _, marker := range []string{`action="/nodes/node1/save"`, `action="/nodes/node1/delete"`, `value="node.example:443"`, "永久删除节点 node1？"} {
+		if !strings.Contains(dashboard.Body.String(), marker) {
+			t.Fatalf("node management control %q missing", marker)
+		}
+	}
+	if strings.Contains(dashboard.Body.String(), "old-auth") {
+		t.Fatal("stored node auth was exposed in dashboard HTML")
+	}
+
+	edit := url.Values{
+		"csrf":  {manager.csrf},
+		"name":  {"node1"},
+		"alias": {"updated"},
+		"addr":  {"new-node.example:8443"},
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:9090/nodes/node1/save", strings.NewReader(edit.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	manager.Handler().ServeHTTP(response, request)
+	nodes, err := store.ListNodes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].Config.Alias != "updated" || nodes[0].Config.Hysteria2 == nil || nodes[0].Config.Hysteria2.Addr != "new-node.example:8443" || nodes[0].Config.Hysteria2.Auth != "old-auth" || nodes[0].Enabled {
+		t.Fatalf("node edit was not persisted: %#v", nodes)
+	}
+
+	deleteForm := url.Values{"csrf": {manager.csrf}}
+	request = httptest.NewRequest(http.MethodPost, "http://127.0.0.1:9090/nodes/node1/delete", strings.NewReader(deleteForm.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response = httptest.NewRecorder()
+	manager.Handler().ServeHTTP(response, request)
+	nodes, err = store.ListNodes()
+	if err != nil || len(nodes) != 0 {
+		t.Fatalf("node was not physically deleted: nodes=%#v err=%v", nodes, err)
+	}
+	user, err := store.GetUser("alice")
+	if err != nil || user == nil || len(user.Routes) != 0 {
+		t.Fatalf("node authorizations remain: user=%#v err=%v", user, err)
 	}
 }
 
@@ -323,12 +385,52 @@ func TestManagerLiveTrafficAggregatesByUserAndNode(t *testing.T) {
 	}
 }
 
-func TestDirectRouteSetIncludesLegacyNamedDirectNodes(t *testing.T) {
-	routes := directRouteSet([]storage.ManagedNode{
-		{Name: "direct-v4", Config: config.NodeConfig{Type: "direct", Direct: &config.DirectConfig{}}},
-		{Name: "node1", Config: config.NodeConfig{Type: "socks5", SOCKS5: &config.SOCKS5Config{Addr: "127.0.0.1:1080"}}},
-	})
-	if !routes["direct"] || !routes["direct-v4"] || routes["node1"] {
+func TestDirectRouteSetOnlyIncludesBuiltInRoute(t *testing.T) {
+	routes := directRouteSet()
+	if len(routes) != 1 || !routes["direct"] {
 		t.Fatalf("unexpected direct route set: %#v", routes)
+	}
+}
+
+type staticNodeStatuses map[string]router.NodeStatus
+
+func (s staticNodeStatuses) NodeStatuses() map[string]router.NodeStatus { return s }
+
+func TestManagerRendersRuntimeNodeStatus(t *testing.T) {
+	store, err := storage.NewSQLiteStore(t.TempDir()+"/admin.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	node := config.NodeConfig{Type: "hysteria2", Hysteria2: &config.Hysteria2OutboundConfig{Addr: "node.example:443", Auth: "secret"}}
+	if err := store.SaveNode("ready-node", node, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveNode("disabled-node", node, false); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(&config.Config{Timezone: "UTC"}, store, traffic.NewTrafficLogger(nil, store, zap.NewNop()), zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 9, 10, 11, 12, 0, time.UTC)
+	manager.SetNodeStatusProvider(staticNodeStatuses{"ready-node": {
+		Name:         "ready-node",
+		State:        router.NodeReady,
+		ResolvedAddr: "[2001:db8::1]:443",
+		LastSuccess:  now,
+	}})
+	response := httptest.NewRecorder()
+	manager.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9090/", nil))
+	body := response.Body.String()
+	for _, marker := range []string{"Ready", "Disabled", "[2001:db8::1]:443", "2026-08-09 10:11:12"} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("runtime node marker %q missing", marker)
+		}
+	}
+	for _, removed := range []string{`name="type"`, "proxy_username", "clear_proxy_password", "data-node-field"} {
+		if strings.Contains(body, removed) {
+			t.Fatalf("removed node control %q is still rendered", removed)
+		}
 	}
 }

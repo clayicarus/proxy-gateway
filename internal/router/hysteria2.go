@@ -7,21 +7,16 @@ import (
 
 	hyClient "github.com/apernet/hysteria/core/v2/client"
 	hyServer "github.com/apernet/hysteria/core/v2/server"
-	"github.com/hy2-gateway/internal/config"
+	"github.com/clayicarus/proxy-gateway/internal/config"
 	"go.uber.org/zap"
 )
 
 // Compile-time check.
 var _ hyServer.Outbound = (*Hysteria2Outbound)(nil)
 
-// Hysteria2Outbound routes traffic through a remote Hysteria2 server
-// using the official hysteria2 client library.
-//
-// It uses ReconnectableClient to maintain a persistent QUIC connection
-// to the remote node. The connection is established eagerly on creation
-// and automatically reconnects on failure.
+// Hysteria2Outbound is one established connection to a remote Hysteria2 node.
+// Reconnection and DNS refresh are owned by the node entry in factory.go.
 type Hysteria2Outbound struct {
-	name   string
 	cfg    *config.Hysteria2OutboundConfig
 	client hyClient.Client
 	logger *zap.Logger
@@ -30,62 +25,26 @@ type Hysteria2Outbound struct {
 	closed bool
 }
 
-// NewHysteria2Outbound creates a new Hysteria2 client outbound.
-// It eagerly establishes a QUIC connection to the remote node.
-func NewHysteria2Outbound(cfg *config.Hysteria2OutboundConfig, logger *zap.Logger) (*Hysteria2Outbound, error) {
-	sni := cfg.SNI
-	if sni == "" {
-		host, _, err := net.SplitHostPort(cfg.Addr)
-		if err == nil {
-			sni = host
-		}
-	}
-
-	ob := &Hysteria2Outbound{
-		cfg:    cfg,
-		logger: logger,
-	}
-
-	serverAddr, err := net.ResolveUDPAddr("udp", cfg.Addr)
-	if err != nil {
-		return nil, fmt.Errorf("hy2 outbound: failed to resolve %s: %w", cfg.Addr, err)
-	}
-
-	finalSNI := sni
-	finalInsecure := cfg.Insecure
-
-	client, err := hyClient.NewReconnectableClient(
-		func() (*hyClient.Config, error) {
-			return &hyClient.Config{
-				ServerAddr: serverAddr,
-				Auth:       cfg.Auth,
-				TLSConfig: hyClient.TLSConfig{
-					ServerName:         finalSNI,
-					InsecureSkipVerify: finalInsecure,
-				},
-			}, nil
+func newHysteria2Outbound(cfg *config.Hysteria2OutboundConfig, serverAddr *net.UDPAddr, sni string, logger *zap.Logger) (*Hysteria2Outbound, error) {
+	client, info, err := hyClient.NewClient(&hyClient.Config{
+		ServerAddr: serverAddr,
+		Auth:       cfg.Auth,
+		TLSConfig: hyClient.TLSConfig{
+			ServerName:         sni,
+			InsecureSkipVerify: cfg.Insecure,
 		},
-		func(c hyClient.Client, info *hyClient.HandshakeInfo, count int) {
-			logger.Info("hy2 outbound connected to node",
-				zap.String("addr", cfg.Addr),
-				zap.Bool("udpEnabled", info.UDPEnabled),
-				zap.Uint64("tx", info.Tx),
-				zap.Int("connectCount", count),
-			)
-		},
-		false, // eager connect (not lazy)
-	)
+	})
 	if err != nil {
-		return nil, fmt.Errorf("hy2 outbound: failed to connect to %s: %w", cfg.Addr, err)
+		return nil, fmt.Errorf("hy2 outbound: %w", err)
 	}
-
-	ob.client = client
-	logger.Info("hy2 outbound initialized",
-		zap.String("addr", cfg.Addr),
-		zap.String("sni", finalSNI),
+	logger.Info("hy2 outbound connected",
+		zap.String("configuredAddr", cfg.Addr),
+		zap.String("resolvedAddr", serverAddr.String()),
+		zap.String("sni", sni),
+		zap.Bool("udpEnabled", info.UDPEnabled),
+		zap.Uint64("tx", info.Tx),
 	)
-
-	return ob, nil
+	return &Hysteria2Outbound{cfg: cfg, client: client, logger: logger}, nil
 }
 
 // TCP implements server.Outbound.

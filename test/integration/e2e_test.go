@@ -5,12 +5,12 @@ import (
 	"os"
 	"testing"
 
-	"github.com/hy2-gateway/internal/auth"
-	"github.com/hy2-gateway/internal/config"
-	"github.com/hy2-gateway/internal/event"
-	"github.com/hy2-gateway/internal/router"
-	"github.com/hy2-gateway/internal/storage"
-	"github.com/hy2-gateway/internal/traffic"
+	"github.com/clayicarus/proxy-gateway/internal/auth"
+	"github.com/clayicarus/proxy-gateway/internal/config"
+	"github.com/clayicarus/proxy-gateway/internal/event"
+	"github.com/clayicarus/proxy-gateway/internal/router"
+	"github.com/clayicarus/proxy-gateway/internal/storage"
+	"github.com/clayicarus/proxy-gateway/internal/traffic"
 	"go.uber.org/zap"
 )
 

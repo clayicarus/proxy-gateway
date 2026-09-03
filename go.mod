@@ -1,4 +1,4 @@
-module github.com/hy2-gateway
+module github.com/clayicarus/proxy-gateway
 
 go 1.24.0
 

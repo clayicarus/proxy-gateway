@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hy2-gateway/internal/config"
+	"github.com/clayicarus/proxy-gateway/internal/config"
 )
 
 // ManagedUser is the database-backed user record used by the management UI.
@@ -254,14 +254,11 @@ func (s *SQLiteStore) MigrateLegacy(cfg *config.Config, legacyToken func(string)
 	sort.Strings(nodeNames)
 	for _, name := range nodeNames {
 		node := cfg.Nodes[name]
-		if name == "direct" && node.Type == "direct" {
-			continue
-		}
-		if node.Type == "direct" {
-			return fmt.Errorf("legacy node %q uses direct type; authorize the built-in direct route instead", name)
-		}
 		if !isValidName(name) {
 			return fmt.Errorf("invalid legacy node name %q", name)
+		}
+		if err := validateNode(name, node); err != nil {
+			return err
 		}
 		encoded, err := json.Marshal(node)
 		if err != nil {
@@ -436,6 +433,9 @@ func (s *SQLiteStore) LoadNodes() (map[string]config.NodeConfig, error) {
 		var node config.NodeConfig
 		if err := json.Unmarshal([]byte(raw), &node); err != nil {
 			return nil, fmt.Errorf("decode node %q: %w", name, err)
+		}
+		if err := validateNode(name, node); err != nil {
+			return nil, fmt.Errorf("load node: %w", err)
 		}
 		nodes[name] = node
 	}
@@ -829,6 +829,9 @@ func (s *SQLiteStore) ListNodes() ([]ManagedNode, error) {
 		if err := json.Unmarshal([]byte(raw), &node.Config); err != nil {
 			return nil, fmt.Errorf("decode node %q: %w", node.Name, err)
 		}
+		if err := validateNode(node.Name, node.Config); err != nil {
+			return nil, fmt.Errorf("list node: %w", err)
+		}
 		node.Enabled = enabled != 0
 		node.CreatedAt = time.Unix(createdAt, 0).UTC()
 		node.UpdatedAt = time.Unix(updatedAt, 0).UTC()
@@ -837,13 +840,35 @@ func (s *SQLiteStore) ListNodes() ([]ManagedNode, error) {
 	return result, rows.Err()
 }
 
+// GetNode returns one managed node, or nil when it does not exist.
+func (s *SQLiteStore) GetNode(name string) (*ManagedNode, error) {
+	var node ManagedNode
+	var raw string
+	var enabled int
+	var createdAt, updatedAt int64
+	err := s.db.QueryRow(`SELECT name, config_json, enabled, created_at, updated_at FROM managed_nodes WHERE name = ?`, name).Scan(&node.Name, &raw, &enabled, &createdAt, &updatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(raw), &node.Config); err != nil {
+		return nil, fmt.Errorf("decode node %q: %w", node.Name, err)
+	}
+	if err := validateNode(node.Name, node.Config); err != nil {
+		return nil, fmt.Errorf("get node: %w", err)
+	}
+	node.Enabled = enabled != 0
+	node.CreatedAt = time.Unix(createdAt, 0).UTC()
+	node.UpdatedAt = time.Unix(updatedAt, 0).UTC()
+	return &node, nil
+}
+
 // SaveNode creates or updates a node. All node changes require Gateway restart.
 func (s *SQLiteStore) SaveNode(name string, node config.NodeConfig, enabled bool) error {
 	if !isValidName(name) || name == "direct" {
 		return fmt.Errorf("invalid node name")
-	}
-	if node.Type == "direct" {
-		return fmt.Errorf("direct is a built-in route and cannot be saved as a managed node")
 	}
 	if err := validateNode(name, node); err != nil {
 		return err
@@ -869,10 +894,19 @@ func (s *SQLiteStore) SaveNode(name string, node config.NodeConfig, enabled bool
 	return tx.Commit()
 }
 
-// SetNodeEnabled changes a node's availability for future configuration
-// snapshots. Existing running Gateways keep their startup snapshot until
-// restart.
-func (s *SQLiteStore) SetNodeEnabled(name string, enabled bool) error {
+// UpdateNode replaces an existing node definition. The node name remains the
+// stable identifier used by authorizations and traffic history.
+func (s *SQLiteStore) UpdateNode(name string, node config.NodeConfig, enabled bool) error {
+	if !isValidName(name) || name == "direct" {
+		return fmt.Errorf("invalid node name")
+	}
+	if err := validateNode(name, node); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(node)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
@@ -880,7 +914,37 @@ func (s *SQLiteStore) SetNodeEnabled(name string, enabled bool) error {
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.Exec(`UPDATE managed_nodes SET enabled = ?, updated_at = ? WHERE name = ?`, boolToInt(enabled), time.Now().UTC().Unix(), name)
+	result, err := tx.Exec(`UPDATE managed_nodes SET config_json = ?, enabled = ?, updated_at = ? WHERE name = ?`, string(raw), boolToInt(enabled), time.Now().UTC().Unix(), name)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return fmt.Errorf("node %q not found", name)
+	}
+	if _, err := tx.Exec(`UPDATE config_state SET revision = revision + 1 WHERE id = 1`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// DeleteNode permanently removes a managed node and all user authorizations
+// that reference it. Traffic history is intentionally retained for auditing.
+// Existing running Gateways keep their startup snapshot until restart.
+func (s *SQLiteStore) DeleteNode(name string) error {
+	if !isValidName(name) || name == "direct" {
+		return fmt.Errorf("invalid node name")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM user_nodes WHERE node_name = ?`, name); err != nil {
+		return err
+	}
+	result, err := tx.Exec(`DELETE FROM managed_nodes WHERE name = ?`, name)
 	if err != nil {
 		return err
 	}
@@ -1086,16 +1150,6 @@ func (s *SQLiteStore) ListProcessRuns(limit int) ([]ProcessRun, error) {
 
 func validateNode(name string, node config.NodeConfig) error {
 	switch node.Type {
-	case "direct":
-		return fmt.Errorf("node %q cannot use the built-in direct type", name)
-	case "socks5":
-		if node.SOCKS5 == nil || node.SOCKS5.Addr == "" {
-			return fmt.Errorf("node %q requires socks5 addr", name)
-		}
-	case "http":
-		if node.HTTP == nil || node.HTTP.URL == "" {
-			return fmt.Errorf("node %q requires http url", name)
-		}
 	case "hysteria2":
 		if node.Hysteria2 == nil || node.Hysteria2.Addr == "" || node.Hysteria2.Auth == "" {
 			return fmt.Errorf("node %q requires hysteria2 addr and auth", name)

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hy2-gateway/internal/config"
-	"github.com/hy2-gateway/internal/storage"
+	"github.com/clayicarus/proxy-gateway/internal/config"
+	"github.com/clayicarus/proxy-gateway/internal/storage"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
@@ -38,7 +38,7 @@ func TestDatabaseSubscriptionUsesRestartAppliedRoutes(t *testing.T) {
 		t.Fatalf("subscription omitted applied node or live password: %s", response.Body.String())
 	}
 
-	if err := store.SaveNode("node2", config.NodeConfig{Type: "socks5", Alias: "Node Two", SOCKS5: &config.SOCKS5Config{Addr: "127.0.0.1:1080"}}, true); err != nil {
+	if err := store.SaveNode("node2", config.NodeConfig{Type: "hysteria2", Alias: "Node Two", Hysteria2: &config.Hysteria2OutboundConfig{Addr: "node2.example:443", Auth: "node-password"}}, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.UpdateUser(storage.ManagedUserInput{Username: "alice", Password: "new-password", Routes: []string{"node2"}}); err != nil {

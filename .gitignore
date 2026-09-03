@@ -7,7 +7,7 @@ build/
 *.crt
 *.key
 gateway
-hy2-gateway
+proxy-gateway
 *.db
 *.db-shm
 *.db-wal

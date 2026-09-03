@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hy2-gateway/internal/config"
-	"github.com/hy2-gateway/internal/subtoken"
+	"github.com/clayicarus/proxy-gateway/internal/config"
+	"github.com/clayicarus/proxy-gateway/internal/subtoken"
 	"go.uber.org/zap"
 )
 
@@ -264,7 +264,7 @@ func TestSQLiteStore_ReplaceLegacyUsersPreservesNodesAndTraffic(t *testing.T) {
 			"alice": {Password: "alice-password", Routes: []string{"node1"}},
 		},
 		Nodes: map[string]config.NodeConfig{
-			"node1": {Type: "socks5", SOCKS5: &config.SOCKS5Config{Addr: "127.0.0.1:1080"}},
+			"node1": {Type: "hysteria2", Hysteria2: &config.Hysteria2OutboundConfig{Addr: "node.example:443", Auth: "secret"}},
 		},
 	}
 	if err := store.MigrateLegacy(initial, func(username string) string { return "old-" + username }); err != nil {
@@ -337,7 +337,7 @@ func TestSQLiteStore_UpdateUserOnlyRevisionsRouteChanges(t *testing.T) {
 	if afterLifecycle.Revision != state.Revision {
 		t.Fatalf("lifecycle-only update changed revision: before=%d after=%d", state.Revision, afterLifecycle.Revision)
 	}
-	if err := store.SaveNode("node1", config.NodeConfig{Type: "socks5", SOCKS5: &config.SOCKS5Config{Addr: "127.0.0.1:1080"}}, true); err != nil {
+	if err := store.SaveNode("node1", config.NodeConfig{Type: "hysteria2", Hysteria2: &config.Hysteria2OutboundConfig{Addr: "node.example:443", Auth: "secret"}}, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.UpdateUser(ManagedUserInput{Username: "alice", Password: "password", MonthlyBytes: 1024, Routes: []string{"node1"}}); err != nil {
@@ -485,13 +485,70 @@ func TestSQLiteStore_ProcessRecoveryUsesSystemdResult(t *testing.T) {
 	}
 }
 
-func TestSQLiteStore_RejectsManagedDirectNode(t *testing.T) {
+func TestSQLiteStore_RejectsUnsupportedNodeType(t *testing.T) {
 	store, err := NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if err := store.SaveNode("direct-v4", config.NodeConfig{Type: "direct", Direct: &config.DirectConfig{}}, true); err == nil {
-		t.Fatal("managed direct node was accepted")
+	for _, nodeType := range []string{"direct", "socks5", "http"} {
+		if err := store.SaveNode("unsupported", config.NodeConfig{Type: nodeType}, true); err == nil {
+			t.Fatalf("managed %s node was accepted", nodeType)
+		}
+	}
+}
+
+func TestSQLiteStore_DeleteNodeRemovesConfigAndAuthorizations(t *testing.T) {
+	store, err := NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	node := config.NodeConfig{Type: "hysteria2", Hysteria2: &config.Hysteria2OutboundConfig{Addr: "node.example:443", Auth: "secret"}}
+	if err := store.SaveNode("node1", node, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateUser(ManagedUserInput{Username: "alice", Password: "password", Routes: []string{"node1", "direct"}}, "token"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FlushTraffic([]TrafficRecord{{UserID: "alice", NodeID: "node1", TxBytes: 10, RxBytes: 20, Timestamp: time.Now()}}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.GetConfigState()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.DeleteNode("node1"); err != nil {
+		t.Fatal(err)
+	}
+	nodes, err := store.ListNodes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 0 {
+		t.Fatalf("deleted node still listed: %#v", nodes)
+	}
+	user, err := store.GetUser("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user == nil || len(user.Routes) != 1 || user.Routes[0] != "direct" {
+		t.Fatalf("node authorization was not removed: %#v", user)
+	}
+	tx, rx, err := store.GetSummary("alice", "node1")
+	if err != nil || tx != 10 || rx != 20 {
+		t.Fatalf("traffic history changed: tx=%d rx=%d err=%v", tx, rx, err)
+	}
+	after, err := store.GetConfigState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Revision != before.Revision+1 {
+		t.Fatalf("delete revision = %d, want %d", after.Revision, before.Revision+1)
+	}
+	if err := store.DeleteNode("node1"); err == nil {
+		t.Fatal("deleting a missing node succeeded")
 	}
 }

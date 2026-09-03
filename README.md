@@ -1,4 +1,4 @@
-# Hy2-Gateway
+# Proxy Gateway
 
 基于 Hysteria2 的多用户网关。客户端显式选择获授权的出站节点，Gateway 负责认证、路由、流量计量、配额和下载限速，并通过 SQLite 和本地 Web 后台管理运行配置。
 
@@ -13,14 +13,16 @@
 - 用户级总下载限速，覆盖该用户的全部连接
 - 独立的公开订阅 HTTP 服务，生成 Clash.Meta 配置
 - systemd 重启调度、watchdog、优雅停机和进程退出原因记录
-- Direct、SOCKS5、HTTP CONNECT 和 Hysteria2 出站
+- 内建 Direct 和远端 Hysteria2 出站
 
 服务端没有隐式 fallback。节点缺失、上下文错配或拨号失败都会直接返回错误；`direct` 也必须由客户端明确选择并获用户授权。
+
+Gateway 启动时并发预连接所有启用的 Hysteria2 节点，最多同时连接 8 个并等待首轮结果 10 秒。单节点失败不会阻止其他节点或 Gateway 启动；请求遇到不可用节点会立即失败，节点在后台以带 jitter 的指数退避重连（最长 60 秒）。每次连接尝试都重新查询 DNS，应用本身不缓存结果；系统解析器仍可能使用操作系统或上游 DNS 缓存。管理后台显示节点状态、实际解析地址、最近成功、错误和下次重试时间。
 
 ## 拓扑
 
 ```text
-hy2 客户端 --QUIC/UDP--> Gateway --direct/代理/hy2--> Node 或目标
+hy2 客户端 --QUIC/UDP--> Gateway --direct/hy2--> Node 或目标
                               |--HTTP/TCP--> 本地管理后台
                               `--HTTP/TCP--> 公开订阅服务
 ```
@@ -32,7 +34,7 @@ hy2 客户端 --QUIC/UDP--> Gateway --direct/代理/hy2--> Node 或目标
 需要 Go 1.24+ 和 C 编译器，SQLite 驱动依赖 CGO。
 
 ```bash
-CGO_ENABLED=1 go build -ldflags "-s -w" -o hy2-gateway ./cmd/gateway
+CGO_ENABLED=1 go build -ldflags "-s -w" -o proxy-gateway ./cmd/gateway
 CGO_ENABLED=1 go test ./...
 ```
 
@@ -46,8 +48,8 @@ CGO_ENABLED=1 go test ./...
 listen: :8443
 
 tls:
-  cert: /etc/hy2-gateway/cert.pem
-  key: /etc/hy2-gateway/key.pem
+  cert: /etc/proxy-gateway/cert.pem
+  key: /etc/proxy-gateway/key.pem
 
 admin:
   listen: "127.0.0.1:9090"
@@ -58,12 +60,12 @@ sub:
   serverAddr: "gateway.example.com:8443"
   sni: "gateway.example.com"
 
-dbPath: /var/lib/hy2-gateway/traffic.db
+dbPath: /var/lib/proxy-gateway/traffic.db
 trafficFlushInterval: 10s
 timezone: "Asia/Shanghai"
 
 systemd:
-  unit: "hy2-gateway.service"
+  unit: "proxy-gateway.service"
   watchdog: true
 ```
 
@@ -74,8 +76,8 @@ systemd:
 ### 2. 启动
 
 ```bash
-install -d -o hy2gateway -g hy2gateway -m 0750 /var/lib/hy2-gateway
-./hy2-gateway -c /etc/hy2-gateway/gateway.yaml
+install -d -o proxygateway -g proxygateway -m 0750 /var/lib/proxy-gateway
+./proxy-gateway -c /etc/proxy-gateway/gateway.yaml
 ```
 
 SQLite 数据库目录会自动创建，但运行用户必须能够写入其父目录。systemd 的 `WorkingDirectory` 也会影响相对 `dbPath`；生产环境应使用绝对路径。
@@ -108,7 +110,7 @@ tls:
 旧部署先保留原 `users`、`nodes` 和 secret，执行：
 
 ```bash
-hy2-gateway migrate -c /etc/hy2-gateway/legacy-gateway.yaml
+proxy-gateway migrate -c /etc/proxy-gateway/legacy-gateway.yaml
 ```
 
 旧订阅 token 使用 YAML 的 `sub.secret`，缺省时使用 `api.secret`。迁移会将旧 HMAC token 的哈希写入数据库，使已发布链接继续可用。完成后从正常运行 YAML 删除 `users`、`nodes` 和 `fallback`。
@@ -116,7 +118,7 @@ hy2-gateway migrate -c /etc/hy2-gateway/legacy-gateway.yaml
 需要以旧 YAML 原子替换数据库中的用户和授权时：
 
 ```bash
-hy2-gateway migrate --replace-users -c /etc/hy2-gateway/legacy-gateway.yaml
+proxy-gateway migrate --replace-users -c /etc/proxy-gateway/legacy-gateway.yaml
 ```
 
 该命令保留节点、流量、重启和进程历史，但会删除 YAML 中不存在的管理用户。详见 [部署指南](docs/DEPLOYMENT.md)。
@@ -182,7 +184,7 @@ FROM traffic_logs ORDER BY created_at DESC LIMIT 20;
 | `sub.publicURL` | 后台展示的公开订阅 URL 前缀 |
 | `sub.serverAddr` | 订阅中客户端连接 Gateway 的公网地址 |
 | `sub.sni` / `sub.insecure` | 生成的客户端 TLS 参数 |
-| `dbPath` | SQLite 路径，默认 `hy2-gateway.db` |
+| `dbPath` | SQLite 路径，默认 `proxy-gateway.db` |
 | `trafficFlushInterval` | 流量写入周期，默认 `10s` |
 | `timezone` | 自然月和后台查询时区，默认 `UTC` |
 | `systemd.unit` | 后台只允许控制的固定 systemd unit |

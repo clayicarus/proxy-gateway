@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hy2-gateway/internal/auth"
+	"github.com/clayicarus/proxy-gateway/internal/auth"
 )
 
 // Tracker keeps process-local connection state for the management UI. Client

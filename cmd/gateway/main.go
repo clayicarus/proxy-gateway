@@ -17,16 +17,16 @@ import (
 	"time"
 
 	hyServer "github.com/apernet/hysteria/core/v2/server"
-	"github.com/hy2-gateway/internal/api"
-	"github.com/hy2-gateway/internal/auth"
-	"github.com/hy2-gateway/internal/config"
-	"github.com/hy2-gateway/internal/connection"
-	"github.com/hy2-gateway/internal/event"
-	"github.com/hy2-gateway/internal/router"
-	"github.com/hy2-gateway/internal/storage"
-	"github.com/hy2-gateway/internal/subtoken"
-	"github.com/hy2-gateway/internal/systemd"
-	"github.com/hy2-gateway/internal/traffic"
+	"github.com/clayicarus/proxy-gateway/internal/api"
+	"github.com/clayicarus/proxy-gateway/internal/auth"
+	"github.com/clayicarus/proxy-gateway/internal/config"
+	"github.com/clayicarus/proxy-gateway/internal/connection"
+	"github.com/clayicarus/proxy-gateway/internal/event"
+	"github.com/clayicarus/proxy-gateway/internal/router"
+	"github.com/clayicarus/proxy-gateway/internal/storage"
+	"github.com/clayicarus/proxy-gateway/internal/subtoken"
+	"github.com/clayicarus/proxy-gateway/internal/systemd"
+	"github.com/clayicarus/proxy-gateway/internal/traffic"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -46,7 +46,7 @@ func main() {
 }
 
 func runGateway(args []string) error {
-	flags := flag.NewFlagSet("hy2-gateway", flag.ExitOnError)
+	flags := flag.NewFlagSet("proxy-gateway", flag.ExitOnError)
 	configPath := flags.String("c", "configs/gateway.yaml", "path to config file")
 	_ = flags.Parse(args)
 
@@ -97,6 +97,11 @@ func runGateway(args []string) error {
 	trafficLogger := traffic.NewTrafficLoggerWithLocation(users, store, logger, location)
 	routerEngine := router.NewRouter(users, logger)
 	outboundFactory := router.NewOutboundFactory(nodes, logger)
+	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := outboundFactory.Warmup(warmupCtx); err != nil {
+		logger.Warn("node warmup incomplete; startup will continue", zap.Error(err))
+	}
+	warmupCancel()
 	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
 	connectionTracker := connection.NewTracker()
 	eventLogger := event.NewEventLogger(routingOutbound, logger, connectionTracker)
@@ -123,6 +128,7 @@ func runGateway(args []string) error {
 		if err != nil {
 			logger.Fatal("failed to create management web", zap.Error(err))
 		}
+		manager.SetNodeStatusProvider(outboundFactory)
 		httpServer := &http.Server{Addr: adminListen, Handler: manager.Handler(), ReadHeaderTimeout: 10 * time.Second}
 		listener, err := net.Listen("tcp", adminListen)
 		if err != nil {
@@ -185,7 +191,7 @@ func runGateway(args []string) error {
 		logger.Fatal("failed to create hysteria2 server", zap.Error(err))
 	}
 
-	logger.Info("hy2-gateway starting", zap.String("listen", cfg.Listen))
+	logger.Info("proxy-gateway starting", zap.String("listen", cfg.Listen))
 
 	// Start serving in background
 	var gatewayServing atomic.Bool
@@ -256,7 +262,7 @@ func runGateway(args []string) error {
 	outboundFactory.Close()
 	background.Wait()
 	trafficLogger.Stop()
-	logger.Info("hy2-gateway stopped")
+	logger.Info("proxy-gateway stopped")
 	return serviceErr
 }
 
@@ -273,7 +279,7 @@ func isLoopbackListen(addr string) bool {
 }
 
 func runRecordExit(args []string) {
-	flags := flag.NewFlagSet("hy2-gateway record-exit", flag.ExitOnError)
+	flags := flag.NewFlagSet("proxy-gateway record-exit", flag.ExitOnError)
 	configPath := flags.String("c", "configs/gateway.yaml", "path to config file")
 	_ = flags.Parse(args)
 	cfg, err := config.Load(*configPath)
@@ -391,7 +397,7 @@ func refreshUserState(stop <-chan struct{}, store *storage.SQLiteStore, active m
 }
 
 func runMigrate(args []string) {
-	flags := flag.NewFlagSet("hy2-gateway migrate", flag.ExitOnError)
+	flags := flag.NewFlagSet("proxy-gateway migrate", flag.ExitOnError)
 	configPath := flags.String("c", "configs/gateway.yaml", "path to legacy config file")
 	replaceUsers := flags.Bool("replace-users", false, "replace managed users and routes while retaining nodes and traffic")
 	_ = flags.Parse(args)

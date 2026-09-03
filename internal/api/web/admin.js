@@ -94,16 +94,6 @@ confirmDialog?.addEventListener("close", () => {
   pendingConfirmForm = undefined;
 });
 
-const nodeTypeSelect = document.querySelector("[data-node-type-select]");
-function updateNodeFields() {
-  const selected = nodeTypeSelect?.value;
-  document.querySelectorAll("[data-node-field]").forEach((field) => {
-    field.hidden = !field.dataset.nodeField.split(" ").includes(selected);
-  });
-}
-nodeTypeSelect?.addEventListener("change", updateNodeFields);
-updateNodeFields();
-
 function formatRate(bytes) {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B/s";
   const units = ["B/s", "KiB/s", "MiB/s", "GiB/s"];

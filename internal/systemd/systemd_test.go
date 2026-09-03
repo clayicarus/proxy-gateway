@@ -6,12 +6,12 @@ import (
 )
 
 func TestValidUnit(t *testing.T) {
-	for _, unit := range []string{"hy2-gateway.service", "hy2-gateway@blue.service", "a_b-1.service"} {
+	for _, unit := range []string{"proxy-gateway.service", "proxy-gateway@blue.service", "a_b-1.service"} {
 		if !validUnit(unit) {
 			t.Fatalf("expected valid unit %q", unit)
 		}
 	}
-	for _, unit := range []string{"", "hy2-gateway", "../other.service", "a.service;reboot", "unit.socket"} {
+	for _, unit := range []string{"", "proxy-gateway", "../other.service", "a.service;reboot", "unit.socket"} {
 		if validUnit(unit) {
 			t.Fatalf("expected invalid unit %q", unit)
 		}

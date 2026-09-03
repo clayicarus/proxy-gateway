@@ -23,7 +23,7 @@ YAML 仅保存无法安全或合理地存入运行时数据库的启动配置：
 SQLite 增加以下逻辑实体：
 
 - `managed_users`：用户名、密码、软删除时间、到期时间、每月总流量额度（tx + rx）、下载总限速（rx）、订阅 token 哈希、创建/更新时间。
-- `managed_nodes`：节点名、显示名、类型、序列化配置、启用状态、创建/更新时间。`direct` 是内置路由，不进入该表。
+- `managed_nodes`：Hysteria2 节点名、显示名、序列化配置、启用状态、创建/更新时间。`direct` 是内置路由，不进入该表。
 - `user_nodes`：用户到节点（或 `direct`）的多对多授权。
 - `config_state`：当前保存 revision、当前 Gateway 进程成功加载的 revision、待重启状态。
 - `restart_jobs`：一次性、持久化的计划重启任务。
@@ -60,9 +60,9 @@ Clash.Meta 订阅通过 `yaml.v3` 从强类型结构编码，节点显示名、�
 
 只有只读页面和查询端点接受 GET。用户、节点和重启路由只接受 POST，并在进入 action handler 前验证 CSRF token。SSH 转发不改变该边界；取消容易被代理误判的 Origin 校验不等于允许 GET 修改状态。
 
-用户策略保存、密码重置、订阅链接重置、用户停用/启用、节点停用和 Gateway 重启均要求二次确认。确认框必须说明凭据失效范围、现有连接是否中断、配置是否保留以及是否需要重启；确认只属于前端防误操作措施，后端仍以 CSRF token 作为写请求保护。
+用户策略保存、密码重置、订阅链接重置、用户停用/启用、节点编辑/删除和 Gateway 重启均要求二次确认。确认框必须说明凭据失效范围、现有连接是否中断、配置是否保留以及是否需要重启；确认只属于前端防误操作措施，后端仍以 CSRF token 作为写请求保护。节点名是授权和流量归属使用的稳定标识，编辑时不可重命名。删除节点会在单一事务中物理删除节点配置及所有用户对它的授权，但保留历史流量用于成本审计；运行进程仍使用启动快照，重启后才卸载被删除节点。
 
-后台采用左侧板块导航，划分为基本信息、用户管理、活跃连接、成本分析和故障分析。页面显示用户、流量、按节点的 Gateway/Node 成本估算、节点与授权、待重启 revision、计划重启和进程运行历史。
+后台采用左侧板块导航，划分为基本信息、用户管理、活跃连接、成本分析和故障分析。页面显示用户、流量、按节点的 Gateway/Node 成本估算、节点与授权、待重启 revision、计划重启和进程运行历史。节点列表合并当前进程的 Connecting、Ready、Unavailable、Backoff 状态，并显示解析地址、最近成功、最近错误和下次重试时间；停用或尚未进入运行快照的节点分别显示 Disabled 和 Pending restart。
 
 管理页面通过同一 loopback 监听器上的只读 `/live` 端点每两秒获取内存累计计数，并在浏览器中按相邻采样差计算当前 `tx`/`rx` 速度。该端点同时返回当前客户端 IP、源端口、用户、所选节点以及活跃 TCP/UDP 请求目标。连接明细只保存在进程内存，不写入 SQLite，断开或进程重启后清除。
 
@@ -83,7 +83,7 @@ Clash.Meta 订阅通过 `yaml.v3` 从强类型结构编码，节点显示名、�
 迁移是一次性显式命令：
 
 ```text
-hy2-gateway migrate -c legacy-gateway.yaml
+proxy-gateway migrate -c legacy-gateway.yaml
 ```
 
 命令在单一事务中校验并导入旧 YAML 用户、节点和授权，丢弃服务端 fallback，计算旧订阅 token，并设置迁移标记。目标数据库已有管理数据时命令失败，不覆盖运行配置。迁移后正常 YAML 删除 `users` 与 `nodes`。
@@ -100,6 +100,6 @@ watchdog 在 Gateway 启动后才进入就绪状态，并在 Gateway 服务循�
 
 管理和订阅 HTTP 端口会在启动阶段同步绑定，失败即 fatal。已启动的 HTTP serve loop 若异常退出，会进入主服务错误路径，完成清理后以非零状态退出，交由 systemd 按 `Restart=on-failure` 恢复。
 
-节点/授权改动增加保存 revision 并标记待重启。Gateway 成功启动并加载数据库配置后写入运行 revision。立即或定时重启任务通过受限 systemd D-Bus 权限请求重启 `hy2-gateway.service`；后台不拼接 shell 命令。
+节点/授权改动增加保存 revision 并标记待重启。Gateway 成功启动并加载数据库配置后写入运行 revision。立即或定时重启任务通过受限 systemd D-Bus 权限请求重启 `proxy-gateway.service`；后台不拼接 shell 命令。
 
 收到 SIGTERM 时，Gateway 停止接受新连接、关闭 HTTP 服务、停止 QUIC 服务、flush 流量、关闭出站连接与 SQLite，再退出。systemd 在宽限时间后才强制终止。

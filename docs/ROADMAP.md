@@ -1,10 +1,10 @@
-# Hy2-Gateway Roadmap
+# Proxy Gateway Roadmap
 
 本文只记录当前实现状态和仍可能开展的工作。设计约束以 `ARCHITECTURE.md` 和 `ADMIN_DESIGN.md` 为准。
 
 ## 已完成
 
-- [x] Hysteria2 Gateway 入口与 Direct、SOCKS5、HTTP CONNECT、Hysteria2 出站
+- [x] Hysteria2 Gateway 入口与 Direct、Hysteria2 出站
 - [x] `username:node:password` 认证和显式多节点授权
 - [x] fail-closed 路由，不提供服务端隐式 fallback
 - [x] SQLite 用户、节点、授权、token、流量、revision、重启和进程历史
@@ -18,6 +18,7 @@
 - [x] 独立公开订阅服务和 Clash.Meta 配置生成
 - [x] 配置 revision、立即/定时 systemd 重启与退出原因记录
 - [x] systemd watchdog 和优雅停机
+- [x] 节点并发预热、故障隔离、运行状态、DNS 刷新和后台退避重连
 - [x] 单元、集成、真实 Hysteria2 链路和路由并发测试
 
 ## 近期候选
@@ -26,7 +27,6 @@
 - [ ] 数据库备份、恢复和完整性检查操作手册
 - [ ] 审计日志：记录管理员写操作，不记录用户明文密码或订阅 token
 - [ ] 用户并发连接数或设备数限制
-- [ ] 节点健康状态与拨号错误摘要，仅用于诊断，不触发服务端 fallback
 - [ ] 管理后台大数据量分页和查询基准，重点覆盖低内存服务器
 - [ ] Prometheus 指标与可选 Grafana 模板
 - [ ] 日志轮转和敏感字段脱敏检查

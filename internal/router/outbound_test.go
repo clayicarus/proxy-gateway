@@ -1,17 +1,26 @@
 package router
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
-	"github.com/hy2-gateway/internal/config"
+	coreErrors "github.com/apernet/hysteria/core/v2/errors"
+	hyServer "github.com/apernet/hysteria/core/v2/server"
+	"github.com/clayicarus/proxy-gateway/internal/config"
 	"go.uber.org/zap"
 )
 
 func TestDirectOutbound_TCP(t *testing.T) {
+	if directDialer.Timeout != 10*time.Second {
+		t.Fatalf("unexpected direct TCP timeout: %v", directDialer.Timeout)
+	}
 	logger := zap.NewNop()
 	d := &DirectOutbound{logger: logger}
 
@@ -43,6 +52,231 @@ func TestDirectOutbound_TCP(t *testing.T) {
 	if string(buf[:n]) != "hello" {
 		t.Errorf("expected 'hello', got %q", string(buf[:n]))
 	}
+}
+
+type fakeConnectedOutbound struct {
+	tcpErr error
+	closed atomic.Bool
+}
+
+func (f *fakeConnectedOutbound) TCP(string) (net.Conn, error) { return nil, f.tcpErr }
+func (f *fakeConnectedOutbound) UDP(string) (hyServer.UDPConn, error) {
+	return nil, f.tcpErr
+}
+func (f *fakeConnectedOutbound) Close() error {
+	f.closed.Store(true)
+	return nil
+}
+
+type fakeNodeConnector struct {
+	connect func(context.Context, string, *config.Hysteria2OutboundConfig) (connectedOutbound, string, error)
+}
+
+func (f fakeNodeConnector) Connect(ctx context.Context, name string, cfg *config.Hysteria2OutboundConfig) (connectedOutbound, string, error) {
+	return f.connect(ctx, name, cfg)
+}
+
+func validTestNode(addr string) config.NodeConfig {
+	return config.NodeConfig{Type: "hysteria2", Hysteria2: &config.Hysteria2OutboundConfig{Addr: addr, Auth: "secret"}}
+}
+
+func waitFor(t *testing.T, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("condition was not satisfied before timeout")
+}
+
+func TestOutboundFactory_NodeFailureIsIsolatedAndFailsFast(t *testing.T) {
+	connector := fakeNodeConnector{connect: func(_ context.Context, name string, _ *config.Hysteria2OutboundConfig) (connectedOutbound, string, error) {
+		if name == "bad" {
+			return nil, "", fmt.Errorf("handshake failed")
+		}
+		return &fakeConnectedOutbound{}, "192.0.2.10:443", nil
+	}}
+	factory := newOutboundFactory(map[string]config.NodeConfig{
+		"bad":  validTestNode("bad.example:443"),
+		"good": validTestNode("good.example:443"),
+	}, zap.NewNop(), connector, func(int) time.Duration { return time.Hour })
+	defer factory.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := factory.Warmup(ctx); err != nil {
+		t.Fatalf("warmup should finish after every first attempt: %v", err)
+	}
+	if factory.NodeStatuses()["good"].State != NodeReady {
+		t.Fatalf("good node was blocked by failed node: %#v", factory.NodeStatuses())
+	}
+	waitFor(t, func() bool {
+		status := factory.NodeStatuses()["bad"]
+		return status.State == NodeBackoff && !status.NextRetry.IsZero() && strings.Contains(status.LastError, "handshake failed")
+	})
+	bad, err := factory.Get("bad")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if _, err := bad.TCP("example.com:443"); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("bad node did not fail fast: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("unavailable request blocked for %v", elapsed)
+	}
+	if _, err := factory.Get("direct"); err != nil {
+		t.Fatalf("direct route was affected by failed node: %v", err)
+	}
+}
+
+func TestOutboundFactory_ClosedConnectionReconnectsInBackground(t *testing.T) {
+	var calls atomic.Int32
+	connector := fakeNodeConnector{connect: func(context.Context, string, *config.Hysteria2OutboundConfig) (connectedOutbound, string, error) {
+		call := calls.Add(1)
+		if call == 1 {
+			return &fakeConnectedOutbound{tcpErr: coreErrors.ClosedError{}}, "192.0.2.1:443", nil
+		}
+		return &fakeConnectedOutbound{}, "192.0.2.2:443", nil
+	}}
+	factory := newOutboundFactory(map[string]config.NodeConfig{"node": validTestNode("node.example:443")}, zap.NewNop(), connector, func(int) time.Duration { return time.Millisecond })
+	defer factory.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := factory.Warmup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	node, _ := factory.Get("node")
+	if _, err := node.TCP("example.com:443"); !isClosedConnection(err) {
+		t.Fatalf("expected closed connection error, got %v", err)
+	}
+	waitFor(t, func() bool {
+		status := factory.NodeStatuses()["node"]
+		return calls.Load() >= 2 && status.State == NodeReady && status.ResolvedAddr == "192.0.2.2:443"
+	})
+}
+
+func TestOutboundFactory_BoundsConcurrentPreconnects(t *testing.T) {
+	release := make(chan struct{})
+	var active atomic.Int32
+	var maximum atomic.Int32
+	connector := fakeNodeConnector{connect: func(ctx context.Context, _ string, _ *config.Hysteria2OutboundConfig) (connectedOutbound, string, error) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			previous := maximum.Load()
+			if current <= previous || maximum.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		select {
+		case <-release:
+			return &fakeConnectedOutbound{}, "192.0.2.1:443", nil
+		case <-ctx.Done():
+			return nil, "", ctx.Err()
+		}
+	}}
+	nodes := make(map[string]config.NodeConfig, 12)
+	for i := 0; i < 12; i++ {
+		nodes[fmt.Sprintf("node-%02d", i)] = validTestNode("node.example:443")
+	}
+	factory := newOutboundFactory(nodes, zap.NewNop(), connector, func(int) time.Duration { return time.Hour })
+	factory.Start()
+	waitFor(t, func() bool { return maximum.Load() == maxConnectAttempts })
+	close(release)
+	defer factory.Close()
+	if maximum.Load() > maxConnectAttempts {
+		t.Fatalf("preconnect concurrency exceeded limit: %d", maximum.Load())
+	}
+}
+
+func TestDefaultRetryDelayNeverExceedsCap(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		if delay := defaultRetryDelay(100); delay > time.Minute {
+			t.Fatalf("retry delay exceeded cap: %v", delay)
+		}
+	}
+}
+
+type fakeIPResolver struct {
+	mu      sync.Mutex
+	calls   int
+	answers []netip.Addr
+}
+
+func (r *fakeIPResolver) LookupNetIP(context.Context, string, string) ([]netip.Addr, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	return append([]netip.Addr(nil), r.answers...), nil
+}
+
+func TestHysteria2Connector_RefreshesDNSAndTriesAllAddresses(t *testing.T) {
+	resolver := &fakeIPResolver{answers: []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1")}}
+	var mu sync.Mutex
+	var addresses, serverNames []string
+	connector := &hysteria2Connector{
+		resolver: resolver,
+		logger:   zap.NewNop(),
+		dial: func(_ *config.Hysteria2OutboundConfig, addr *net.UDPAddr, sni string, _ *zap.Logger) (connectedOutbound, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			addresses = append(addresses, addr.String())
+			serverNames = append(serverNames, sni)
+			if addr.IP.String() == "192.0.2.1" {
+				return nil, fmt.Errorf("unreachable")
+			}
+			return &fakeConnectedOutbound{}, nil
+		},
+	}
+	cfg := &config.Hysteria2OutboundConfig{Addr: "node.example:443", Auth: "secret"}
+	for i := 0; i < 2; i++ {
+		outbound, _, err := connector.Connect(context.Background(), "node", cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = outbound.Close()
+	}
+	if resolver.calls != 2 {
+		t.Fatalf("DNS was not refreshed for each attempt: calls=%d", resolver.calls)
+	}
+	if got := strings.Join(addresses, ","); got != "192.0.2.1:443,[2001:db8::1]:443,192.0.2.1:443,[2001:db8::1]:443" {
+		t.Fatalf("addresses were not tried sequentially: %s", got)
+	}
+	for _, sni := range serverNames {
+		if sni != "node.example" {
+			t.Fatalf("resolved IP replaced hostname SNI: %q", sni)
+		}
+	}
+
+	connector.dial = func(_ *config.Hysteria2OutboundConfig, addr *net.UDPAddr, _ string, _ *zap.Logger) (connectedOutbound, error) {
+		if addr.IP.String() != "2001:db8::2" {
+			t.Fatalf("unexpected IPv6 literal address: %s", addr)
+		}
+		return &fakeConnectedOutbound{}, nil
+	}
+	outbound, _, err := connector.Connect(context.Background(), "literal", &config.Hysteria2OutboundConfig{Addr: "[2001:db8::2]:443", Auth: "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = outbound.Close()
+	if resolver.calls != 2 {
+		t.Fatalf("IPv6 literal unexpectedly used DNS: calls=%d", resolver.calls)
+	}
+
+	connector.dial = func(_ *config.Hysteria2OutboundConfig, addr *net.UDPAddr, sni string, _ *zap.Logger) (connectedOutbound, error) {
+		if addr.Zone != "eth0" || sni != "fe80::1" {
+			t.Fatalf("IPv6 zone leaked into SNI: addr=%s sni=%q", addr, sni)
+		}
+		return &fakeConnectedOutbound{}, nil
+	}
+	outbound, _, err = connector.Connect(context.Background(), "zoned", &config.Hysteria2OutboundConfig{Addr: "[fe80::1%eth0]:443", Auth: "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = outbound.Close()
 }
 
 func TestDirectOutbound_UDP(t *testing.T) {
@@ -89,10 +323,8 @@ func TestDirectOutbound_UDP(t *testing.T) {
 
 func TestOutboundFactory_Direct(t *testing.T) {
 	logger := zap.NewNop()
-	nodes := map[string]config.NodeConfig{
-		"my_direct": {Type: "direct"},
-	}
-	f := NewOutboundFactory(nodes, logger)
+	f := NewOutboundFactory(nil, logger)
+	defer f.Close()
 
 	ob, err := f.Get("direct")
 	if err != nil {
@@ -100,14 +332,6 @@ func TestOutboundFactory_Direct(t *testing.T) {
 	}
 	if ob == nil {
 		t.Fatal("expected non-nil outbound")
-	}
-
-	ob2, err := f.Get("my_direct")
-	if err != nil {
-		t.Fatalf("get my_direct failed: %v", err)
-	}
-	if ob2 == nil {
-		t.Fatal("expected non-nil outbound for my_direct")
 	}
 }
 
@@ -203,7 +427,7 @@ func TestRoutingOutbound_ConcurrentSameTargetKeepsUserRoute(t *testing.T) {
 			addr := &net.UDPAddr{IP: net.ParseIP("192.0.2.20"), Port: 20000 + i}
 			ro.SetRequestContext(addr, "user:"+route, "tcp", "same.example:443")
 			_, err := ro.TCP("same.example:443")
-			if err == nil || !strings.Contains(err.Error(), "node "+route+":") {
+			if err == nil || !strings.Contains(err.Error(), "node "+route+" unavailable:") {
 				errors <- fmt.Errorf("request %d used wrong route: %v", i, err)
 			}
 		}()

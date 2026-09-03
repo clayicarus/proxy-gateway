@@ -1,6 +1,6 @@
 # Hysteria2 核心库集成说明
 
-本文记录 hy2-gateway 与 `github.com/apernet/hysteria/core/v2` 的当前集成契约，重点是认证 ID、请求路由上下文和流量回调。实际装配入口位于 `cmd/gateway/main.go`。
+本文记录 proxy-gateway 与 `github.com/apernet/hysteria/core/v2` 的当前集成契约，重点是认证 ID、请求路由上下文和流量回调。实际装配入口位于 `cmd/gateway/main.go`。
 
 ## 接口映射
 
@@ -25,6 +25,9 @@ authenticator := auth.NewAuthenticator(users, logger)
 trafficLogger := traffic.NewTrafficLoggerWithLocation(users, store, logger, location)
 routerEngine := router.NewRouter(users, logger)
 outboundFactory := router.NewOutboundFactory(nodes, logger)
+warmupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+_ = outboundFactory.Warmup(warmupCtx)
+cancel()
 routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
 connectionTracker := connection.NewTracker()
 eventLogger := event.NewEventLogger(routingOutbound, logger, connectionTracker)
@@ -86,14 +89,9 @@ EventLogger 调用 `RoutingOutbound.SetRequestContext`，把协议、认证 ID�
 
 ## 出站适配
 
-`OutboundFactory` 在第一次使用节点时创建并缓存一个实现：
+`OutboundFactory` 只提供内建 Direct 与数据库中的 Hysteria2 节点。Direct TCP 使用带 10 秒超时的标准 `net.Dialer`。Hysteria2 outbound 使用上游 `client.NewClient`，Gateway 自己管理每个节点的 eager 连接状态和重试生命周期。
 
-- Direct 使用标准 `net.Dialer`。
-- SOCKS5 实现 TCP 与 UDP ASSOCIATE。
-- HTTP CONNECT 仅支持 TCP。
-- Hysteria2 outbound 使用上游 `client.NewReconnectableClient`。
-
-Hysteria2 outbound 创建时 eager 建立到远端节点的一条 QUIC 连接，后续请求复用 stream，并由 `ReconnectableClient` 自动重连。它是在节点第一次被使用时才创建，不是在 Gateway 启动时为所有节点预连接，也不是每节点多条连接的 pool。
+启动时最多同时预连接 8 个节点，首轮预热最多等待 10 秒；节点失败互相隔离。请求路径只使用 Ready client，不可用时立即报错；后台以最长 60 秒的指数退避重连。每次尝试都以 3 秒超时重新查询 DNS，并依次尝试 A/AAAA 地址；连接到解析 IP 时仍将配置域名作为默认 SNI。Hy2 握手保留上游默认 5 秒超时。当前每节点一条活动 client 连接，不是连接池。
 
 UDP client 的 `HyUDPConn` 通过轻量 wrapper 适配为 `server.UDPConn` 的 `ReadFrom`、`WriteTo` 和 `Close` 签名。
 
@@ -126,7 +124,7 @@ UntraceStream(stream HyStream)
 ## 并发与测试要求
 
 - Authenticator 和 TrafficLogger 的用户快照更新必须受锁保护。
-- OutboundFactory 的 cache 必须避免同一节点被并发创建多次。
+- OutboundFactory 的节点状态和 client 切换必须受每节点锁保护，且后台连接并发数不得超过上限。
 - 请求上下文交接必须 fail-closed，不能根据 target 猜测用户。
 - `go test -race` 应覆盖 auth、router、traffic 和集成请求链路。
 - 至少保留“多用户并发访问相同 target 不串路由”的压力测试。

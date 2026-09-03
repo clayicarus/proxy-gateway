@@ -15,32 +15,34 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hy2-gateway/internal/config"
-	"github.com/hy2-gateway/internal/connection"
-	"github.com/hy2-gateway/internal/storage"
-	"github.com/hy2-gateway/internal/subtoken"
-	"github.com/hy2-gateway/internal/systemd"
-	"github.com/hy2-gateway/internal/traffic"
+	"github.com/clayicarus/proxy-gateway/internal/config"
+	"github.com/clayicarus/proxy-gateway/internal/connection"
+	"github.com/clayicarus/proxy-gateway/internal/router"
+	"github.com/clayicarus/proxy-gateway/internal/storage"
+	"github.com/clayicarus/proxy-gateway/internal/subtoken"
+	"github.com/clayicarus/proxy-gateway/internal/systemd"
+	"github.com/clayicarus/proxy-gateway/internal/traffic"
 	"go.uber.org/zap"
 )
 
 // Manager serves the loopback-only management web UI. It deliberately uses
 // server-rendered forms and does not expose a general management JSON API.
 type Manager struct {
-	cfg         *config.Config
-	store       *storage.SQLiteStore
-	traffic     *traffic.TrafficLogger
-	connections *connection.Tracker
-	logger      *zap.Logger
-	csrf        string
-	loc         *time.Location
-	tmpl        *template.Template
+	cfg          *config.Config
+	store        *storage.SQLiteStore
+	traffic      *traffic.TrafficLogger
+	connections  *connection.Tracker
+	nodeStatuses NodeStatusProvider
+	logger       *zap.Logger
+	csrf         string
+	loc          *time.Location
+	tmpl         *template.Template
 }
 
 type dashboardData struct {
 	CSRF               string
 	Users              []storage.ManagedUser
-	Nodes              []storage.ManagedNode
+	Nodes              []managedNodeView
 	State              storage.ConfigState
 	Monthly            map[string][2]uint64
 	NodeMonthly        map[string][2]uint64
@@ -64,6 +66,20 @@ type dashboardData struct {
 	DBPath             string
 	FlushInterval      time.Duration
 	Timezone           string
+}
+
+// NodeStatusProvider supplies the runtime state of the restart-applied node snapshot.
+type NodeStatusProvider interface {
+	NodeStatuses() map[string]router.NodeStatus
+}
+
+type managedNodeView struct {
+	storage.ManagedNode
+	RuntimeState string
+	ResolvedAddr string
+	LastError    string
+	LastSuccess  string
+	NextRetry    string
 }
 
 type liveTraffic struct {
@@ -168,6 +184,11 @@ func NewManager(cfg *config.Config, store *storage.SQLiteStore, trafficLogger *t
 		},
 	}).Parse(managerTemplate))
 	return m, nil
+}
+
+// SetNodeStatusProvider attaches the running outbound snapshot to the dashboard.
+func (m *Manager) SetNodeStatusProvider(provider NodeStatusProvider) {
+	m.nodeStatuses = provider
 }
 
 func randomCSRF() (string, error) {
@@ -284,12 +305,7 @@ func (m *Manager) trafficRange(w http.ResponseWriter, r *http.Request) {
 
 	// Include the latest in-memory deltas in the persisted range query.
 	m.traffic.Flush()
-	managedNodes, err := m.store.ListNodes()
-	if err != nil {
-		m.writeError(w, err)
-		return
-	}
-	directRoutes := directRouteSet(managedNodes)
+	directRoutes := directRouteSet()
 	buckets, err := m.store.GetTrafficBuckets(start.UTC(), end.UTC())
 	if err != nil {
 		m.writeError(w, err)
@@ -382,7 +398,8 @@ func (m *Manager) dashboard(w http.ResponseWriter, r *http.Request) {
 		m.writeError(w, err)
 		return
 	}
-	directRoutes := directRouteSet(nodes)
+	directRoutes := directRouteSet()
+	nodeViews := m.nodeViews(nodes)
 	state, err := m.store.GetConfigState()
 	if err != nil {
 		m.writeError(w, err)
@@ -468,7 +485,7 @@ func (m *Manager) dashboard(w http.ResponseWriter, r *http.Request) {
 	data := dashboardData{
 		CSRF:               m.csrf,
 		Users:              users,
-		Nodes:              nodes,
+		Nodes:              nodeViews,
 		State:              state,
 		Monthly:            monthly,
 		NodeMonthly:        nodeMonthly,
@@ -501,6 +518,34 @@ func (m *Manager) dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write(rendered.Bytes())
+}
+
+func (m *Manager) nodeViews(nodes []storage.ManagedNode) []managedNodeView {
+	statuses := map[string]router.NodeStatus{}
+	if m.nodeStatuses != nil {
+		statuses = m.nodeStatuses.NodeStatuses()
+	}
+	result := make([]managedNodeView, 0, len(nodes))
+	for _, node := range nodes {
+		view := managedNodeView{ManagedNode: node}
+		if !node.Enabled {
+			view.RuntimeState = "Disabled"
+		} else if status, ok := statuses[node.Name]; ok {
+			view.RuntimeState = string(status.State)
+			view.ResolvedAddr = status.ResolvedAddr
+			view.LastError = status.LastError
+			if !status.LastSuccess.IsZero() {
+				view.LastSuccess = status.LastSuccess.In(m.loc).Format("2006-01-02 15:04:05")
+			}
+			if !status.NextRetry.IsZero() {
+				view.NextRetry = status.NextRetry.In(m.loc).Format("2006-01-02 15:04:05")
+			}
+		} else {
+			view.RuntimeState = "Pending restart"
+		}
+		result = append(result, view)
+	}
+	return result
 }
 
 func containsRoute(routes []string, target string) bool {
@@ -676,6 +721,13 @@ func (m *Manager) saveNode(w http.ResponseWriter, r *http.Request) {
 	}
 	name, node, enabled, err := nodeFromForm(r)
 	if err == nil {
+		var existing *storage.ManagedNode
+		existing, err = m.store.GetNode(name)
+		if err == nil && existing != nil {
+			err = fmt.Errorf("node %q already exists; use edit instead", name)
+		}
+	}
+	if err == nil {
 		err = m.store.SaveNode(name, node, enabled)
 	}
 	if err != nil {
@@ -687,41 +739,69 @@ func (m *Manager) saveNode(w http.ResponseWriter, r *http.Request) {
 
 func (m *Manager) nodeAction(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/nodes/"), "/"), "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] != "disable" {
+	if len(parts) != 2 || parts[0] == "" {
 		http.NotFound(w, r)
 		return
 	}
-	if err := m.store.SetNodeEnabled(parts[0], false); err != nil {
-		m.redirectError(w, r, err)
+	switch parts[1] {
+	case "save":
+		existing, err := m.store.GetNode(parts[0])
+		if err == nil && existing == nil {
+			err = fmt.Errorf("node %q not found", parts[0])
+		}
+		name, node, enabled, parseErr := nodeFromForm(r)
+		if err == nil {
+			err = parseErr
+		}
+		if err == nil && name != parts[0] {
+			err = fmt.Errorf("node name cannot be changed")
+		}
+		if err == nil {
+			preserveNodeCredentials(&node, existing.Config)
+			err = m.store.UpdateNode(name, node, enabled)
+		}
+		if err != nil {
+			m.redirectError(w, r, err)
+			return
+		}
+		m.redirect(w, r, "node updated; restart required before changes are active", "overview")
+	case "delete":
+		if err := m.store.DeleteNode(parts[0]); err != nil {
+			m.redirectError(w, r, err)
+			return
+		}
+		m.redirect(w, r, "node permanently deleted; restart required to unload the running snapshot", "overview")
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func preserveNodeCredentials(node *config.NodeConfig, existing config.NodeConfig) {
+	if node.Type != existing.Type {
 		return
 	}
-	m.redirect(w, r, "node disabled; restart required before it is inactive", "overview")
+	if node.Hysteria2 != nil && existing.Hysteria2 != nil && node.Hysteria2.Auth == "" {
+		node.Hysteria2.Auth = existing.Hysteria2.Auth
+	}
 }
 
 func nodeFromForm(r *http.Request) (string, config.NodeConfig, bool, error) {
 	name := r.Form.Get("name")
-	node := config.NodeConfig{Type: r.Form.Get("type"), Alias: r.Form.Get("alias")}
-	switch node.Type {
-	case "hysteria2":
-		node.Hysteria2 = &config.Hysteria2OutboundConfig{Addr: r.Form.Get("addr"), Auth: r.Form.Get("auth"), SNI: r.Form.Get("sni"), Insecure: r.Form.Get("insecure") == "on"}
-	case "socks5":
-		node.SOCKS5 = &config.SOCKS5Config{Addr: r.Form.Get("addr"), Username: r.Form.Get("proxy_username"), Password: r.Form.Get("proxy_password")}
-	case "http":
-		node.HTTP = &config.HTTPConfig{URL: r.Form.Get("url"), Insecure: r.Form.Get("insecure") == "on"}
-	default:
-		return "", node, false, fmt.Errorf("unsupported node type")
+	node := config.NodeConfig{
+		Type:  "hysteria2",
+		Alias: r.Form.Get("alias"),
+		Hysteria2: &config.Hysteria2OutboundConfig{
+			Addr:     r.Form.Get("addr"),
+			Auth:     r.Form.Get("auth"),
+			SNI:      r.Form.Get("sni"),
+			Insecure: r.Form.Get("insecure") == "on",
+		},
 	}
 	return name, node, r.Form.Get("enabled") == "on", nil
 }
 
-func directRouteSet(nodes []storage.ManagedNode) map[string]bool {
-	result := map[string]bool{"direct": true}
-	for _, node := range nodes {
-		if node.Config.Type == "direct" {
-			result[node.Name] = true
-		}
-	}
-	return result
+func directRouteSet() map[string]bool {
+	return map[string]bool{"direct": true}
 }
 
 func (m *Manager) subscriptionBase() string {

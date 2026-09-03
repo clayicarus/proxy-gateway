@@ -4,7 +4,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/hy2-gateway/internal/config"
+	"github.com/clayicarus/proxy-gateway/internal/config"
 	"go.uber.org/zap"
 )
 

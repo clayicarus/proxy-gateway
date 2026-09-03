@@ -105,43 +105,15 @@ type UserConfig struct {
 
 // NodeConfig defines an outbound node.
 type NodeConfig struct {
-	// Type: "direct", "socks5", "http", "hysteria2"
+	// Type is currently always "hysteria2" for managed nodes.
 	Type string `yaml:"type"`
 
 	// Alias is an optional display name used in generated subscription configs.
 	// If empty, the node key name is used.
 	Alias string `yaml:"alias,omitempty"`
 
-	// Direct outbound options
-	Direct *DirectConfig `yaml:"direct,omitempty"`
-
-	// SOCKS5 outbound options
-	SOCKS5 *SOCKS5Config `yaml:"socks5,omitempty"`
-
-	// HTTP outbound options
-	HTTP *HTTPConfig `yaml:"http,omitempty"`
-
 	// Hysteria2 outbound (forward to another hy2 node)
 	Hysteria2 *Hysteria2OutboundConfig `yaml:"hysteria2,omitempty"`
-}
-
-type DirectConfig struct {
-	// Mode: auto, 64, 46, 6, 4
-	Mode       string `yaml:"mode,omitempty"`
-	BindIPv4   string `yaml:"bindIPv4,omitempty"`
-	BindIPv6   string `yaml:"bindIPv6,omitempty"`
-	BindDevice string `yaml:"bindDevice,omitempty"`
-}
-
-type SOCKS5Config struct {
-	Addr     string `yaml:"addr"`
-	Username string `yaml:"username,omitempty"`
-	Password string `yaml:"password,omitempty"`
-}
-
-type HTTPConfig struct {
-	URL      string `yaml:"url"`
-	Insecure bool   `yaml:"insecure,omitempty"`
 }
 
 type Hysteria2OutboundConfig struct {
@@ -223,14 +195,14 @@ func (c *Config) validate() error {
 
 	if c.Systemd != nil {
 		if c.Systemd.Unit == "" {
-			c.Systemd.Unit = "hy2-gateway.service"
+			c.Systemd.Unit = "proxy-gateway.service"
 		}
 	}
 	if c.TrafficFlushInterval == 0 {
 		c.TrafficFlushInterval = 10 * time.Second
 	}
 	if c.DBPath == "" {
-		c.DBPath = "hy2-gateway.db"
+		c.DBPath = "proxy-gateway.db"
 	}
 
 	return nil
@@ -260,23 +232,11 @@ func (c *Config) ValidateLegacy() error {
 	}
 
 	for name, node := range c.Nodes {
-		switch node.Type {
-		case "direct":
-			// ok
-		case "socks5":
-			if node.SOCKS5 == nil || node.SOCKS5.Addr == "" {
-				return fmt.Errorf("node %q (socks5) requires addr", name)
-			}
-		case "http":
-			if node.HTTP == nil || node.HTTP.URL == "" {
-				return fmt.Errorf("node %q (http) requires url", name)
-			}
-		case "hysteria2":
-			if node.Hysteria2 == nil || node.Hysteria2.Addr == "" {
-				return fmt.Errorf("node %q (hysteria2) requires addr and auth", name)
-			}
-		default:
+		if node.Type != "hysteria2" {
 			return fmt.Errorf("node %q has unknown type %q", name, node.Type)
+		}
+		if node.Hysteria2 == nil || node.Hysteria2.Addr == "" || node.Hysteria2.Auth == "" {
+			return fmt.Errorf("node %q (hysteria2) requires addr and auth", name)
 		}
 	}
 

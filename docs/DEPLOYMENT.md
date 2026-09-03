@@ -1,9 +1,9 @@
-# Hy2-Gateway 部署指南
+# Proxy Gateway 部署指南
 
 ## 前置条件
 
 - Gateway 主机和可用的 UDP 公网端口
-- 可选的远端 Hysteria2、SOCKS5 或 HTTP CONNECT Node
+- 可选的远端 Hysteria2 Node
 - TLS 证书与私钥文件
 - 构建环境使用 Go 1.24+ 和 C 编译器；运行环境不需要 Go
 - 推荐 systemd 和 SQLite CLI
@@ -15,7 +15,7 @@
 SQLite 驱动依赖 CGO：
 
 ```bash
-CGO_ENABLED=1 go build -ldflags "-s -w" -o hy2-gateway ./cmd/gateway
+CGO_ENABLED=1 go build -ldflags "-s -w" -o proxy-gateway ./cmd/gateway
 CGO_ENABLED=1 go test ./...
 ```
 
@@ -35,14 +35,14 @@ openssl req -new -x509 -key key.pem -out cert.pem -days 365 \
 
 ## 3. 启动配置
 
-创建 `/etc/hy2-gateway/gateway.yaml`：
+创建 `/etc/proxy-gateway/gateway.yaml`：
 
 ```yaml
 listen: :8443
 
 tls:
-  cert: /etc/hy2-gateway/cert.pem
-  key: /etc/hy2-gateway/key.pem
+  cert: /etc/proxy-gateway/cert.pem
+  key: /etc/proxy-gateway/key.pem
 
 # 可选，客户端需配置同一密码
 # obfs:
@@ -65,12 +65,12 @@ sub:
   sni: "gateway.example.com"
   insecure: false
 
-dbPath: /var/lib/hy2-gateway/traffic.db
+dbPath: /var/lib/proxy-gateway/traffic.db
 trafficFlushInterval: 10s
 timezone: "Asia/Shanghai"
 
 systemd:
-  unit: "hy2-gateway.service"
+  unit: "proxy-gateway.service"
   watchdog: true
 ```
 
@@ -91,28 +91,28 @@ systemd:
 创建专用用户和目录：
 
 ```bash
-useradd --system --home /var/lib/hy2-gateway --shell /usr/sbin/nologin hy2gateway
-install -d -o hy2gateway -g hy2gateway -m 0750 /var/lib/hy2-gateway
-install -d -o root -g hy2gateway -m 0750 /etc/hy2-gateway
-install -o root -g root -m 0755 hy2-gateway /usr/local/bin/hy2-gateway
+useradd --system --home /var/lib/proxy-gateway --shell /usr/sbin/nologin proxygateway
+install -d -o proxygateway -g proxygateway -m 0750 /var/lib/proxy-gateway
+install -d -o root -g proxygateway -m 0750 /etc/proxy-gateway
+install -o root -g root -m 0755 proxy-gateway /usr/local/bin/proxy-gateway
 ```
 
-确保证书和 YAML 对 `hy2gateway` 可读，私钥不要授予其他用户权限。创建 `/etc/systemd/system/hy2-gateway.service`：
+确保证书和 YAML 对 `proxygateway` 可读，私钥不要授予其他用户权限。创建 `/etc/systemd/system/proxy-gateway.service`：
 
 ```ini
 [Unit]
-Description=Hy2-Gateway
+Description=Proxy Gateway
 After=network.target
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
 Type=simple
-User=hy2gateway
-Group=hy2gateway
-WorkingDirectory=/var/lib/hy2-gateway
-ExecStart=/usr/local/bin/hy2-gateway -c /etc/hy2-gateway/gateway.yaml
-ExecStopPost=/usr/local/bin/hy2-gateway record-exit -c /etc/hy2-gateway/gateway.yaml
+User=proxygateway
+Group=proxygateway
+WorkingDirectory=/var/lib/proxy-gateway
+ExecStart=/usr/local/bin/proxy-gateway -c /etc/proxy-gateway/gateway.yaml
+ExecStopPost=/usr/local/bin/proxy-gateway record-exit -c /etc/proxy-gateway/gateway.yaml
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=60
@@ -123,8 +123,8 @@ LimitNOFILE=65535
 
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/hy2-gateway
-ReadOnlyPaths=/etc/hy2-gateway
+ReadWritePaths=/var/lib/proxy-gateway
+ReadOnlyPaths=/etc/proxy-gateway
 
 # 监听 443 等特权端口时需要
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -138,17 +138,17 @@ WantedBy=multi-user.target
 加载并检查：
 
 ```bash
-systemd-analyze verify /etc/systemd/system/hy2-gateway.service
+systemd-analyze verify /etc/systemd/system/proxy-gateway.service
 systemctl daemon-reload
-systemctl enable --now hy2-gateway.service
-systemctl status hy2-gateway.service
-systemctl show hy2-gateway.service \
+systemctl enable --now proxy-gateway.service
+systemctl status proxy-gateway.service
+systemctl show proxy-gateway.service \
   -p User -p Group -p WorkingDirectory -p MainPID -p ActiveState \
   -p SubState -p Result -p NRestarts -p WatchdogUSec
-journalctl -u hy2-gateway.service -f
+journalctl -u proxy-gateway.service -f
 ```
 
-`status=217/USER` 表示 `User=` 或 `Group=` 不存在或 systemd 无法解析，应先用 `id hy2gateway` 检查。不要仅为绕过错误而长期以 root 运行。
+`status=217/USER` 表示 `User=` 或 `Group=` 不存在或 systemd 无法解析，应先用 `id proxygateway` 检查。不要仅为绕过错误而长期以 root 运行。
 
 watchdog 能处理“进程存在但应用不再发送健康心跳”的假死，超时后 systemd 会终止并按 `Restart=on-failure` 重启。僵尸进程本身已经退出，systemd 会根据主进程状态处理；watchdog不是僵尸回收机制。当前心跳要求 Hysteria2 serve loop 正常且 SQLite 可 `Ping`，远端 Node 故障不会重启整个 Gateway。
 
@@ -161,11 +161,11 @@ watchdog 能处理“进程存在但应用不再发送健康心跳”的假死�
 非 root service 用户默认没有 `RestartUnit` 权限。可以配置严格限定 unit 的 polkit 规则，并在目标发行版验证 `action.lookup("unit")` 可用：
 
 ```javascript
-// /etc/polkit-1/rules.d/50-hy2-gateway-restart.rules
+// /etc/polkit-1/rules.d/50-proxy-gateway-restart.rules
 polkit.addRule(function(action, subject) {
   if (action.id == "org.freedesktop.systemd1.manage-units" &&
-      subject.user == "hy2gateway" &&
-      action.lookup("unit") == "hy2-gateway.service") {
+      subject.user == "proxygateway" &&
+      action.lookup("unit") == "proxy-gateway.service") {
     return polkit.Result.YES;
   }
 });
@@ -174,7 +174,7 @@ polkit.addRule(function(action, subject) {
 不要授予该用户控制任意 unit 的权限。若发行版不提供可安全限定 unit 的 polkit 上下文，应禁用后台重启能力，继续由管理员执行：
 
 ```bash
-systemctl restart hy2-gateway.service
+systemctl restart proxy-gateway.service
 ```
 
 ## 6. SSH 访问管理后台
@@ -218,10 +218,10 @@ server {
 迁移前备份 YAML 和数据库，并停止 Gateway，确保命令使用与 service 完全相同的 `dbPath`：
 
 ```bash
-systemctl stop hy2-gateway.service
-sudo -u hy2gateway /usr/local/bin/hy2-gateway migrate \
-  -c /etc/hy2-gateway/legacy-gateway.yaml
-systemctl start hy2-gateway.service
+systemctl stop proxy-gateway.service
+sudo -u proxygateway /usr/local/bin/proxy-gateway migrate \
+  -c /etc/proxy-gateway/legacy-gateway.yaml
+systemctl start proxy-gateway.service
 ```
 
 旧 YAML 必须包含用户、节点，以及 `sub.secret` 或回退使用的 `api.secret`。迁移在一个事务中导入用户、节点、授权，并保存旧 HMAC token 的哈希。数据库已有管理用户或已迁移时会拒绝覆盖。
@@ -229,11 +229,11 @@ systemctl start hy2-gateway.service
 如果数据库用户表已错误，需要以旧 YAML 完整重建用户和授权：
 
 ```bash
-systemctl stop hy2-gateway.service
-cp /var/lib/hy2-gateway/traffic.db /var/lib/hy2-gateway/traffic.db.backup
-sudo -u hy2gateway /usr/local/bin/hy2-gateway migrate --replace-users \
-  -c /etc/hy2-gateway/legacy-gateway.yaml
-systemctl start hy2-gateway.service
+systemctl stop proxy-gateway.service
+cp /var/lib/proxy-gateway/traffic.db /var/lib/proxy-gateway/traffic.db.backup
+sudo -u proxygateway /usr/local/bin/proxy-gateway migrate --replace-users \
+  -c /etc/proxy-gateway/legacy-gateway.yaml
+systemctl start proxy-gateway.service
 ```
 
 `--replace-users` 会删除 YAML 中不存在的管理用户，并替换密码、额度、限速和授权；节点、流量、进程和重启历史保留。YAML 引用的非 `direct` 节点必须已存在于数据库，任何失败都会回滚整个事务。
@@ -247,15 +247,15 @@ systemctl start hy2-gateway.service
 curl -I http://127.0.0.1:9090/
 
 # 监听端口；8443 应为 UDP，9090/9091 应为 TCP
-ss -lntup | grep hy2-gateway
+ss -lntup | grep proxy-gateway
 
 # 数据库完整性与用户数量
-sqlite3 /var/lib/hy2-gateway/traffic.db "PRAGMA integrity_check;"
-sqlite3 /var/lib/hy2-gateway/traffic.db "SELECT COUNT(*) FROM managed_users;"
+sqlite3 /var/lib/proxy-gateway/traffic.db "PRAGMA integrity_check;"
+sqlite3 /var/lib/proxy-gateway/traffic.db "SELECT COUNT(*) FROM managed_users;"
 
 # systemd 状态和最近退出原因
-systemctl status hy2-gateway.service
-journalctl -u hy2-gateway.service -n 100 --no-pager
+systemctl status proxy-gateway.service
+journalctl -u proxy-gateway.service -n 100 --no-pager
 ```
 
 在后台创建测试用户并重启应用配置后，用后台显示的订阅 URL 验证：
@@ -288,7 +288,7 @@ ufw allow 443/tcp
 # 不开放 9090；9091 绑定 loopback 时也无需开放
 ```
 
-远端 Hysteria2 Node 对 Gateway 开放相应 UDP 端口。SOCKS5/HTTP Node 按其协议开放 TCP。
+远端 Hysteria2 Node 对 Gateway 开放相应 UDP 端口。
 
 ## 11. Docker 限制
 
@@ -296,14 +296,14 @@ ufw allow 443/tcp
 
 ```bash
 docker run -d \
-  --name hy2-gateway \
+  --name proxy-gateway \
   --restart unless-stopped \
-  -v /etc/hy2-gateway:/etc/hy2-gateway:ro \
-  -v /var/lib/hy2-gateway:/var/lib/hy2-gateway \
+  -v /etc/proxy-gateway:/etc/proxy-gateway:ro \
+  -v /var/lib/proxy-gateway:/var/lib/proxy-gateway \
   -p 8443:8443/udp \
   -p 127.0.0.1:9090:9090/tcp \
   -p 127.0.0.1:9091:9091/tcp \
-  hy2-gateway -c /etc/hy2-gateway/gateway.yaml
+  proxy-gateway -c /etc/proxy-gateway/gateway.yaml
 ```
 
 普通容器内无法访问宿主 systemd D-Bus，也不会获得 systemd watchdog 环境。因此后台重启、进程级 systemd 状态、watchdog 和 `ExecStopPost` 退出记录不可用；容器重启应交给 Docker 或外部编排器。不要为了这些功能把宿主 D-Bus 和高权限直接暴露进容器。
@@ -315,14 +315,14 @@ docker run -d \
 最常见原因是 service 读取了另一份数据库。检查 `ExecStart`、`WorkingDirectory`、YAML 的绝对 `dbPath` 和文件权限：
 
 ```bash
-systemctl show hy2-gateway.service -p ExecStart -p WorkingDirectory -p User -p Group
-sudo -u hy2gateway sqlite3 /var/lib/hy2-gateway/traffic.db \
+systemctl show proxy-gateway.service -p ExecStart -p WorkingDirectory -p User -p Group
+sudo -u proxygateway sqlite3 /var/lib/proxy-gateway/traffic.db \
   "SELECT username FROM managed_users ORDER BY username;"
 ```
 
 ### Node 连接失败
 
-Gateway 不会在启动时连接全部 Node。某节点第一次收到请求时才创建并缓存 outbound；Hysteria2 outbound 随即 eager 建立 QUIC 并自动重连。查看当次请求日志，核对 Node 地址、UDP 防火墙、auth、SNI 和证书，不会隐式回退到其他节点。
+Gateway 启动时最多并发预连接 8 个 Node，等待首轮结果最多 10 秒后继续启动。失败节点在后台以最长 60 秒的指数退避重连；请求不会等待重连，而是立即失败，也不会隐式回退到其他节点。每次连接尝试都会重新查询 DNS，应用自身不缓存结果，但 systemd-resolved、nscd、操作系统解析链或上游 DNS 仍可能命中缓存。后台节点状态会显示实际解析地址、最近错误和下次重试时间；同时核对 UDP 防火墙、auth、SNI 和证书。
 
 ### 修改后尚未生效
 

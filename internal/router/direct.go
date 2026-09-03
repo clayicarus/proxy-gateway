@@ -2,6 +2,7 @@ package router
 
 import (
 	"net"
+	"time"
 
 	hyServer "github.com/apernet/hysteria/core/v2/server"
 	"go.uber.org/zap"
@@ -15,8 +16,10 @@ type DirectOutbound struct {
 	logger *zap.Logger
 }
 
+var directDialer = net.Dialer{Timeout: 10 * time.Second}
+
 func (d *DirectOutbound) TCP(reqAddr string) (net.Conn, error) {
-	conn, err := net.Dial("tcp", reqAddr)
+	conn, err := directDialer.Dial("tcp", reqAddr)
 	if err != nil {
 		return nil, err
 	}

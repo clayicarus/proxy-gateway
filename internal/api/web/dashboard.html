@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Hy2 Gateway 管理</title>
+  <title>Proxy Gateway 管理</title>
   <link rel="stylesheet" href="/assets/admin.css?v=4">
   <script src="/assets/admin.js?v=4" defer></script>
 </head>
@@ -37,7 +37,7 @@
     <aside class="sidebar" id="sidebar">
       <div class="brand">
         <div class="brand-mark">H2</div>
-        <div><strong>Hy2 Gateway</strong><span>Control plane</span></div>
+        <div><strong>Proxy Gateway</strong><span>Control plane</span></div>
       </div>
       <nav class="primary-nav" aria-label="管理板块">
         <a href="#overview" data-nav="overview" class="active"><svg class="icon"><use href="#i-dashboard"/></svg><span>基本信息</span></a>
@@ -95,9 +95,32 @@
           </div>
 
           <div class="panel">
-            <div class="panel-heading"><div><h3>节点配置</h3><p>启停和内容修改均需重启</p></div><button class="button secondary" type="button" data-open-dialog="node-dialog"><svg class="icon"><use href="#i-plus"/></svg>新增或更新</button></div>
+            <div class="panel-heading"><div><h3>节点配置</h3><p>编辑和删除均需重启生效</p></div><button class="button secondary" type="button" data-open-dialog="node-dialog"><svg class="icon"><use href="#i-plus"/></svg>新增节点</button></div>
             <div class="compact-list">
-              {{range .Nodes}}<div class="compact-row"><div class="node-avatar"><svg class="icon"><use href="#i-server"/></svg></div><div class="grow"><strong>{{.Name}}</strong><span>{{.Config.Type}}{{if .Config.Alias}} · {{.Config.Alias}}{{end}}</span></div><span class="badge {{if .Enabled}}success{{else}}neutral{{end}}">{{if .Enabled}}启用{{else}}停用{{end}}</span>{{if .Enabled}}<form method="post" action="/nodes/{{.Name}}/disable" data-confirm-title="停用节点 {{.Name}}？" data-confirm-summary="节点将在下次 Gateway 重启后停止提供出站服务。" data-confirm-risk="重启会中断全部活跃连接；仍选择该节点的旧客户端配置可能认证失败。" data-confirm-label="确认停用" data-confirm-tone="danger"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button class="icon-button danger" aria-label="停用 {{.Name}}" title="停用节点"><svg class="icon"><use href="#i-x"/></svg></button></form>{{end}}</div>{{else}}<div class="empty-state">尚未配置远端节点</div>{{end}}
+              {{range $index, $node := .Nodes}}
+              <div class="compact-row">
+                <div class="node-avatar"><svg class="icon"><use href="#i-server"/></svg></div>
+                <div class="grow"><strong>{{$node.Name}}</strong><span>Hysteria2{{if $node.Config.Alias}} · {{$node.Config.Alias}}{{end}}{{if $node.ResolvedAddr}} · {{$node.ResolvedAddr}}{{end}}</span><small class="node-runtime" title="{{$node.LastError}}">{{if $node.LastSuccess}}最近成功 {{$node.LastSuccess}}{{end}}{{if $node.NextRetry}}{{if $node.LastSuccess}} · {{end}}下次重试 {{$node.NextRetry}}{{end}}{{if $node.LastError}}{{if or $node.LastSuccess $node.NextRetry}} · {{end}}{{$node.LastError}}{{end}}</small></div>
+                <span class="badge {{if eq $node.RuntimeState "Ready"}}success{{else if eq $node.RuntimeState "Unavailable"}}danger{{else if or (eq $node.RuntimeState "Connecting") (eq $node.RuntimeState "Backoff")}}warning{{else}}neutral{{end}}">{{$node.RuntimeState}}</span>
+                <button class="icon-button" type="button" data-open-dialog="node-edit-{{$index}}" aria-label="编辑 {{$node.Name}}" title="编辑节点"><svg class="icon"><use href="#i-settings"/></svg></button>
+                <form method="post" action="/nodes/{{$node.Name}}/delete" data-confirm-title="永久删除节点 {{$node.Name}}？" data-confirm-summary="节点配置及所有用户对它的授权将从数据库中永久删除。" data-confirm-risk="此操作不可恢复；历史流量会保留。当前运行进程在重启前仍持有旧节点快照，重启会中断全部活跃连接。" data-confirm-label="确认永久删除" data-confirm-tone="danger"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button class="icon-button danger" aria-label="删除 {{$node.Name}}" title="永久删除节点"><svg class="icon"><use href="#i-trash"/></svg></button></form>
+              </div>
+              <dialog id="node-edit-{{$index}}" class="modal">
+                <div class="modal-heading"><div><p class="eyebrow">出站配置</p><h2>编辑节点 {{$node.Name}}</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="关闭" title="关闭"><svg class="icon"><use href="#i-x"/></svg></button></div>
+                <form method="post" action="/nodes/{{$node.Name}}/save" data-confirm-title="保存节点 {{$node.Name}}？" data-confirm-summary="新的出站配置和启用状态将在下次 Gateway 重启后生效。" data-confirm-risk="错误的地址、凭据或 TLS 设置会导致该节点无法连接；重启会中断全部活跃连接。" data-confirm-label="确认保存">
+                  <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                  <div class="form-grid">
+                    <label class="field">节点名<input name="name" value="{{$node.Name}}" readonly></label>
+                    <label class="field">显示名<input name="alias" value="{{$node.Config.Alias}}"></label>
+                    <label class="field">地址<input name="addr" value="{{$node.Config.Hysteria2.Addr}}" placeholder="host:port" required></label>
+                    <label class="field">Hy2 Auth<input name="auth" type="password" placeholder="留空则保留当前凭据" autocomplete="new-password"></label>
+                    <label class="field">SNI<input name="sni" value="{{$node.Config.Hysteria2.SNI}}"></label>
+                  </div>
+                  <fieldset><legend>节点选项</legend><div class="choice-grid"><label><input type="checkbox" name="enabled" {{if $node.Enabled}}checked{{end}}> 启用</label><label><input type="checkbox" name="insecure" {{if $node.Config.Hysteria2.Insecure}}checked{{end}}> 跳过 TLS 验证</label></div></fieldset>
+                  <div class="modal-actions"><button class="button secondary" type="button" data-close-dialog>取消</button><button class="button primary" type="submit"><svg class="icon"><use href="#i-server"/></svg>保存修改</button></div>
+                </form>
+              </dialog>
+              {{else}}<div class="empty-state">尚未配置远端节点</div>{{end}}
             </div>
           </div>
         </div>
@@ -203,8 +226,8 @@
   </dialog>
 
   <dialog id="node-dialog" class="modal">
-    <div class="modal-heading"><div><p class="eyebrow">出站配置</p><h2>新增或更新节点</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="关闭" title="关闭"><svg class="icon"><use href="#i-x"/></svg></button></div>
-    <form method="post" action="/nodes"><input type="hidden" name="csrf" value="{{.CSRF}}"><div class="form-grid"><label class="field">节点名<input name="name" required autocomplete="off"></label><label class="field">显示名<input name="alias"></label><label class="field">类型<select name="type" data-node-type-select><option value="hysteria2">Hysteria2</option><option value="socks5">SOCKS5</option><option value="http">HTTP</option></select></label><label class="field" data-node-field="hysteria2 socks5">地址<input name="addr" placeholder="host:port"></label><label class="field" data-node-field="hysteria2">Hy2 Auth<input name="auth"></label><label class="field" data-node-field="hysteria2">SNI<input name="sni"></label><label class="field" data-node-field="http">HTTP URL<input name="url" placeholder="https://proxy.example"></label><label class="field" data-node-field="socks5">SOCKS 用户名<input name="proxy_username"></label><label class="field" data-node-field="socks5">SOCKS 密码<input name="proxy_password" type="password"></label></div><fieldset><legend>节点选项</legend><div class="choice-grid"><label><input type="checkbox" name="enabled" checked> 启用</label><label data-node-field="hysteria2 http"><input type="checkbox" name="insecure"> 跳过 TLS 验证</label></div></fieldset><div class="modal-actions"><button class="button secondary" type="button" data-close-dialog>取消</button><button class="button primary" type="submit"><svg class="icon"><use href="#i-server"/></svg>保存节点</button></div></form>
+    <div class="modal-heading"><div><p class="eyebrow">出站配置</p><h2>新增节点</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="关闭" title="关闭"><svg class="icon"><use href="#i-x"/></svg></button></div>
+    <form method="post" action="/nodes"><input type="hidden" name="csrf" value="{{.CSRF}}"><div class="form-grid"><label class="field">节点名<input name="name" required autocomplete="off"></label><label class="field">显示名<input name="alias"></label><label class="field">地址<input name="addr" placeholder="host:port" required></label><label class="field">Hy2 Auth<input name="auth" type="password" autocomplete="new-password" required></label><label class="field">SNI<input name="sni"></label></div><fieldset><legend>节点选项</legend><div class="choice-grid"><label><input type="checkbox" name="enabled" checked> 启用</label><label><input type="checkbox" name="insecure"> 跳过 TLS 验证</label></div></fieldset><div class="modal-actions"><button class="button secondary" type="button" data-close-dialog>取消</button><button class="button primary" type="submit"><svg class="icon"><use href="#i-server"/></svg>创建节点</button></div></form>
   </dialog>
 </body>
 </html>
