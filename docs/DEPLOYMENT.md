@@ -264,6 +264,18 @@ journalctl -u hy2-gateway.service -n 100 --no-pager
 curl -fS "https://sub.example.com/sub/<token>"
 ```
 
+也可以用项目自带的 Python 脚本验证完整的 Hysteria2 链路。脚本需要已安装官方 `hysteria` v2 客户端；它通过临时本地 SOCKS5 代理连接目标 TCP 地址，因而会同时验证 QUIC、TLS、认证、节点路由和实际出站：
+
+```bash
+python3 scripts/hy2_connectivity.py \
+  --server gateway.example.com:8443 \
+  --auth 'alice:node1:generated_password' \
+  --sni gateway.example.com \
+  --target example.com:443
+```
+
+IPv6 字面量必须使用方括号，例如 `--server '[2001:db8::10]:8443'` 或 `--target '[2606:4700::1111]:443'`。自签证书的测试可额外使用 `--insecure`，生产环境不应使用该选项。
+
 ## 10. 防火墙
 
 ```bash
