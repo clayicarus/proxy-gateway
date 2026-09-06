@@ -1,23 +1,33 @@
 BINARY_NAME=proxy-gateway
 VERSION?=0.1.0
 BUILD_DIR=build
-GO=go
+GO?=go
+export CGO_ENABLED?=1
 
-.PHONY: all build clean test lint
+.PHONY: all build clean test lint race fuzz check run docker
 
 all: build
 
 build:
-	$(GO) build -ldflags "-s -w -X main.version=$(VERSION)" -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/gateway
+	mkdir -p "$(BUILD_DIR)"
+	$(GO) build -ldflags "-s -w -X main.version=$(VERSION)" -o "$(BUILD_DIR)/$(BINARY_NAME)" ./cmd/gateway
 
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf "$(BUILD_DIR)"
 
 test:
-	$(GO) test -v ./...
+	$(GO) test -count=1 ./...
 
 lint:
-	golangci-lint run ./...
+	$(GO) vet ./...
+
+race:
+	$(GO) test -race -count=1 ./...
+
+fuzz:
+	$(GO) test ./internal/trojan -run='^$$' -fuzz=FuzzParseRequest -fuzztime=30s -parallel=2
+
+check: test lint race fuzz build
 
 run: build
 	$(BUILD_DIR)/$(BINARY_NAME) -c configs/gateway.yaml

@@ -1,17 +1,18 @@
 # Proxy Gateway
 
-基于 Hysteria2 的多用户网关。客户端显式选择获授权的出站节点，Gateway 负责认证、路由、流量计量、配额和下载限速，并通过 SQLite 和本地 Web 后台管理运行配置。
+支持 Hysteria2 QUIC/UDP 和可选 Trojan TCP/TLS 入站的多用户网关。客户端显式选择获授权的出站节点，Gateway 负责认证、路由、流量计量、配额和下载限速，并通过 SQLite 和本地 Web 后台管理运行配置。
 
 项目直接实现 Hysteria2 核心接口，不修改上游源码。
 
 ## 功能
 
 - `username:node:password` 多用户认证，认证 ID 为 `username:node`
+- Trojan TCP CONNECT，复用用户节点授权、证书、出站与流量策略
 - SQLite 管理用户、节点、用户节点授权、到期、月额度、下载限速和订阅 token
 - 仅绑定 loopback 的管理后台：概览、用户、活跃连接、成本和故障分析
 - 按配置时区的自然月统计所有节点 `tx + rx`，超额时关闭客户端连接
 - 用户级总下载限速，覆盖该用户的全部连接
-- 独立的公开订阅 HTTP 服务，生成 Clash.Meta 配置
+- 独立的公开订阅 HTTP 服务，生成 Clash.Meta Hysteria2 配置；Trojan 使用手工配置
 - systemd 重启调度、watchdog、优雅停机和进程退出原因记录
 - 内建 Direct 和远端 Hysteria2 出站
 
@@ -23,6 +24,7 @@ Gateway 启动时并发预连接所有启用的 Hysteria2 节点，最多同时�
 
 ```text
 hy2 客户端 --QUIC/UDP--> Gateway --direct/hy2--> Node 或目标
+Trojan 客户端 --TLS/TCP----^
                               |--HTTP/TCP--> 本地管理后台
                               `--HTTP/TCP--> 公开订阅服务
 ```
@@ -38,6 +40,14 @@ CGO_ENABLED=1 go build -ldflags "-s -w" -o proxy-gateway ./cmd/gateway
 CGO_ENABLED=1 go test ./...
 ```
 
+Linux/macOS 可运行 `make check` 完成测试、race、vet、30 秒 parser fuzz 和构建。Windows 可复用已有 Go 与 Conda/MinGW 的 GCC，无需 Docker：
+
+```powershell
+.\scripts\check.ps1 -GoBin 'C:\Go\bin' -CCompiler 'C:\path\to\gcc.exe'
+```
+
+将路径替换为本机安装位置；工具已在 PATH 中时可省略参数。脚本默认执行全部验收，产物为 `build/proxy-gateway.exe`；`-Check test` 可单独运行测试。GitHub Actions 在 Linux 上运行相同的 Go 验收。
+
 跨平台构建需要相应的 C 交叉编译器；也可以直接在目标 Linux 机器上构建。
 
 ## 快速开始
@@ -46,6 +56,12 @@ CGO_ENABLED=1 go test ./...
 
 ```yaml
 listen: :8443
+
+# 省略该段即可只运行 Hysteria2。
+trojan:
+  listen: :8443
+  handshakeTimeout: 10s
+  maxPendingConnections: 256
 
 tls:
   cert: /etc/proxy-gateway/cert.pem
@@ -69,7 +85,9 @@ systemd:
   watchdog: true
 ```
 
-必须提供 `tls.cert` 与 `tls.key` 证书文件。`listen` 是 Hysteria2 的 UDP 端口；`admin.listen` 和 `sub.listen` 是两个独立的 HTTP/TCP 端口。`sub.publicURL` 是用户获取订阅的 URL 前缀，`sub.serverAddr` 则是订阅内容中客户端连接 Gateway 的地址。
+必须提供 `tls.cert` 与 `tls.key` 证书文件，两个入站共用这对证书。`listen` 是 Hysteria2 的 UDP 端口，`trojan.listen` 是 TCP 端口；两者可使用相同数字。`admin.listen` 和 `sub.listen` 是独立的 HTTP/TCP 端口，不能与 Trojan 的 TCP 地址冲突。启用订阅时必须显式配置客户端可访问的 `sub.serverAddr`，不能使用 `:8443` 或通配监听地址。
+
+配置采用严格 YAML 解析，未知字段和多个 YAML 文档会报错。当前未实现 `obfs`、`masquerade` 或协议 fallback，相关字段不会被静默忽略。
 
 用户和节点不写在正常运行 YAML 中。首次启动后通过管理后台创建。
 
@@ -92,7 +110,7 @@ ssh -L 9090:127.0.0.1:9090 root@gateway.example.com
 
 浏览器打开 `http://127.0.0.1:9090`。所有写操作只接受 POST 并校验 CSRF token，敏感操作还会在前端二次确认；Origin/Referer 不作为 SSH 转发环境下的安全边界。
 
-节点定义和用户节点授权在重启后生效。用户密码、停用、到期、额度和限速最多约 2 秒刷新；停用、到期或超额的已有会话会在下一笔有效负载转发前关闭整条 QUIC 连接。完全空闲的会话不会被主动清理，直到客户端断开、再次发送流量、QUIC idle timeout 或 Gateway 重启。
+新用户、节点定义和用户节点授权在重启后生效。用户密码、停用、到期、额度和限速最多约 2 秒刷新；停用、到期或超额的已有会话会在下一笔有效负载转发前关闭对应的 QUIC 连接或 Trojan TCP 会话。密码重置影响后续认证，已认证会话继续按当前生命周期策略执行。完全空闲的会话不会被主动扫描清理。
 
 ### 4. 客户端连接
 
@@ -105,9 +123,25 @@ tls:
 
 推荐直接使用后台生成的订阅 URL。订阅中的多个代理条目对应用户获授权的节点，客户端负责选择和故障切换。
 
+Trojan 第一期需手工添加 Clash.Meta 条目，每个授权节点使用独立的原始 password：
+
+```yaml
+proxies:
+  - name: node1-trojan
+    type: trojan
+    server: gateway.example.com
+    port: 8443
+    password: 'alice:node1:generated_password'
+    sni: gateway.example.com
+    skip-cert-verify: false
+    udp: false
+```
+
+客户端负责计算协议中的 SHA-224；不要把哈希填入客户端 `password` 字段。只有显式授权了 `direct` 的用户，才可使用 `alice:direct:generated_password`。本期不提供 Trojan UDP、BIND、mux、HTTPS fallback 或 Trojan 订阅。详见 [Trojan 设计与验收清单](docs/TROJAN_INBOUND_DESIGN.md)。
+
 ## 旧 YAML 迁移
 
-旧部署先保留原 `users`、`nodes` 和 secret，执行：
+旧部署先保留原 `users`、`nodes` 和 secret，删除已废弃的 `fallback` 及未支持的 `obfs`、`masquerade` 段，再执行：
 
 ```bash
 proxy-gateway migrate -c /etc/proxy-gateway/legacy-gateway.yaml
@@ -132,6 +166,8 @@ proxy-gateway migrate --replace-users -c /etc/proxy-gateway/legacy-gateway.yaml
 - Node 估算出站：非 `direct` 节点的 `tx + rx`。
 
 这些数值是有效负载估算，不含 QUIC/IP 包头和重传。Node 与 Gateway 的公式是两个服务器视角的成本估算，不能相加后当作某一台机器的流量。
+
+Trojan 的 TLS、认证和请求头不计入有效负载。两个协议都先计量读取到的 chunk，再尝试写出；超额 chunk 会被计量但不会转发，后续写入失败也不会回退已计量字节。待刷盘增量保留所属自然月，跨月和数据库写入重试不会把旧月份流量计入新月。
 
 ## SQLite
 
@@ -178,6 +214,9 @@ FROM traffic_logs ORDER BY created_at DESC LIMIT 20;
 | 字段 | 说明 |
 |---|---|
 | `listen` | Gateway Hysteria2 UDP 监听地址，默认 `:443` |
+| `trojan.listen` | 可选 Trojan TCP/TLS 地址；省略或为空即禁用 |
+| `trojan.handshakeTimeout` | TLS 握手和请求首包的总期限，默认 `10s`，范围 `1s`–`2m` |
+| `trojan.maxPendingConnections` | 握手/未完成首包连接上限，默认 `256`，范围 `1`–`65535` |
 | `tls.cert` / `tls.key` | 必填的 TLS 证书和私钥文件 |
 | `admin.listen` | 本地管理后台，必须绑定 loopback |
 | `sub.listen` | 独立订阅 HTTP 服务监听地址 |
@@ -204,6 +243,7 @@ internal/storage/  SQLite schema 与查询
 internal/subtoken/ 订阅 token
 internal/systemd/  D-Bus 重启和 watchdog 通知
 internal/traffic/  流量、配额与下载限速
+internal/trojan/   Trojan 凭据索引、有界 parser 和 TCP/TLS relay
 test/              集成和端到端测试
 docs/              设计、集成和部署文档
 ```
@@ -214,6 +254,8 @@ docs/              设计、集成和部署文档
 - [管理后台设计](docs/ADMIN_DESIGN.md)
 - [部署指南](docs/DEPLOYMENT.md)
 - [Hysteria2 集成说明](docs/INTEGRATION.md)
+- [Trojan TCP 设计](docs/TROJAN_INBOUND_DESIGN.md)
+- [Trojan 验收清单](docs/TROJAN_INBOUND_TODO.md)
 - [开发路线图](docs/ROADMAP.md)
 
 ## License

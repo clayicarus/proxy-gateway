@@ -27,9 +27,12 @@ import (
 	"github.com/clayicarus/proxy-gateway/internal/subtoken"
 	"github.com/clayicarus/proxy-gateway/internal/systemd"
 	"github.com/clayicarus/proxy-gateway/internal/traffic"
+	"github.com/clayicarus/proxy-gateway/internal/trojan"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
+
+var version = "dev"
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "record-exit" {
@@ -94,6 +97,7 @@ func runGateway(args []string) error {
 
 	// Initialize components
 	authenticator := auth.NewAuthenticator(users, logger)
+	trojanAuthenticator := trojan.NewAuthenticator(users)
 	trafficLogger := traffic.NewTrafficLoggerWithLocation(users, store, logger, location)
 	routerEngine := router.NewRouter(users, logger)
 	outboundFactory := router.NewOutboundFactory(nodes, logger)
@@ -115,7 +119,7 @@ func runGateway(args []string) error {
 	// subscription listener. The old api.listen value is accepted as a legacy
 	// alias for admin.listen but no longer grants a JSON management API.
 	var httpServers []*http.Server
-	serviceErrCh := make(chan error, 3)
+	serviceErrCh := make(chan error, 4)
 	adminListen := cfg.Admin.Listen
 	if adminListen == "" {
 		adminListen = cfg.API.Listen
@@ -154,7 +158,7 @@ func runGateway(args []string) error {
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		refreshUserState(userRefreshStop, store, users, authenticator, trafficLogger, logger)
+		refreshUserState(userRefreshStop, store, users, authenticator, trojanAuthenticator, trafficLogger, logger)
 	}()
 
 	systemdStop := make(chan struct{})
@@ -191,7 +195,25 @@ func runGateway(args []string) error {
 		logger.Fatal("failed to create hysteria2 server", zap.Error(err))
 	}
 
-	logger.Info("proxy-gateway starting", zap.String("listen", cfg.Listen))
+	var trojanServer *trojan.Server
+	if cfg.Trojan != nil && cfg.Trojan.Listen != "" {
+		trojanServer, err = trojan.NewServer(trojan.ServerConfig{
+			Listen:                cfg.Trojan.Listen,
+			TLSConfig:             &tls.Config{Certificates: []tls.Certificate{tlsCert}, MinVersion: tls.VersionTLS12},
+			Authenticator:         trojanAuthenticator,
+			Outbound:              routingOutbound,
+			TrafficLogger:         trafficLogger,
+			ConnectionTracker:     connectionTracker,
+			HandshakeTimeout:      cfg.Trojan.HandshakeTimeout,
+			MaxPendingConnections: cfg.Trojan.MaxPendingConnections,
+			Logger:                logger,
+		})
+		if err != nil {
+			logger.Fatal("failed to create Trojan server", zap.Error(err))
+		}
+	}
+
+	logger.Info("proxy-gateway starting", zap.String("version", version), zap.String("hysteria2Listen", cfg.Listen))
 
 	// Start serving in background
 	var gatewayServing atomic.Bool
@@ -204,6 +226,16 @@ func runGateway(args []string) error {
 		}
 		serviceErrCh <- fmt.Errorf("Gateway server stopped: %w", err)
 	}()
+	if trojanServer != nil {
+		go func() {
+			err := trojanServer.Serve()
+			if err == nil {
+				err = fmt.Errorf("serve loop stopped without an error")
+			}
+			serviceErrCh <- fmt.Errorf("Trojan server stopped: %w", err)
+		}()
+		logger.Info("Trojan TCP inbound started", zap.String("listen", trojanServer.Addr().String()))
+	}
 
 	state, err := store.GetConfigState()
 	if err != nil {
@@ -258,8 +290,22 @@ func runGateway(args []string) error {
 		}
 	}
 	shutdownCancel()
+	trafficLogger.BeginShutdown()
+	var inboundShutdown sync.WaitGroup
+	if trojanServer != nil {
+		inboundShutdown.Add(1)
+		go func() {
+			defer inboundShutdown.Done()
+			if err := trojanServer.Close(); err != nil {
+				logger.Warn("Trojan server shutdown failed", zap.Error(err))
+			}
+		}()
+	}
 	hyServerInstance.Close()
+	// Closing the shared clients unblocks Trojan handlers waiting for a remote
+	// Hy2 CONNECT response; waiting for those handlers first could deadlock.
 	outboundFactory.Close()
+	inboundShutdown.Wait()
 	background.Wait()
 	trafficLogger.Stop()
 	logger.Info("proxy-gateway stopped")
@@ -364,7 +410,7 @@ func serveHTTP(logger *zap.Logger, name string, server *http.Server, listener ne
 	}
 }
 
-func refreshUserState(stop <-chan struct{}, store *storage.SQLiteStore, active map[string]config.UserConfig, authenticator *auth.Authenticator, trafficLogger *traffic.TrafficLogger, logger *zap.Logger) {
+func refreshUserState(stop <-chan struct{}, store *storage.SQLiteStore, active map[string]config.UserConfig, authenticator *auth.Authenticator, trojanAuthenticator *trojan.Authenticator, trafficLogger *traffic.TrafficLogger, logger *zap.Logger) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -380,17 +426,9 @@ func refreshUserState(stop <-chan struct{}, store *storage.SQLiteStore, active m
 			// Preserve the startup routes. This applies deletion, expiry,
 			// passwords, quota and speed immediately while leaving any user-node
 			// authorization change pending until restart.
-			updated := make(map[string]config.UserConfig, len(active))
-			for username, startupUser := range active {
-				if user, ok := loaded[username]; ok {
-					user.Routes = append([]string(nil), startupUser.Routes...)
-					updated[username] = user
-				} else {
-					startupUser.Disabled = true
-					updated[username] = startupUser
-				}
-			}
+			updated := auth.RefreshSnapshot(active, loaded)
 			authenticator.UpdateUsers(updated)
+			trojanAuthenticator.UpdateUsers(updated)
 			trafficLogger.UpdateUsers(updated)
 		}
 	}

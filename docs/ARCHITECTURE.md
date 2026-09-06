@@ -2,7 +2,7 @@
 
 ## 系统边界
 
-Proxy Gateway 在 Hysteria2 核心库之上实现多用户入口、显式节点路由、流量策略和 SQLite 控制面。Gateway、本地管理 Web、公开订阅 HTTP 服务、重启调度器和 watchdog 都运行在同一进程中；systemd 负责进程守护和异常重启。
+Proxy Gateway 提供 Hysteria2 QUIC/UDP 与可选 Trojan TCP/TLS 多用户入口、显式节点路由、流量策略和 SQLite 控制面。两个入站、本地管理 Web、公开订阅 HTTP 服务、重启调度器和 watchdog 都运行在同一进程中；systemd 负责进程守护和异常重启。
 
 ```mermaid
 flowchart LR
@@ -13,6 +13,7 @@ flowchart LR
 
     subgraph Gateway 主机
         G[Hysteria2 Gateway<br/>UDP :8443]
+        T[Trojan TCP CONNECT<br/>TLS / TCP :8443]
         W[管理 Web<br/>TCP 127.0.0.1:9090]
         S[订阅服务<br/>TCP 127.0.0.1:9091]
         DB[(SQLite)]
@@ -26,22 +27,29 @@ flowchart LR
     end
 
     C -->|QUIC / UDP| G
+    C -->|Trojan / TLS / TCP| T
     A --> SSH --> W
     C -->|HTTPS /sub/token| N --> S
     W --> DB
     S --> DB
     G --> DB
+    T --> DB
     W -->|受限 D-Bus 重启| SD
     SD -->|守护 / watchdog| G
     G --> D --> I
     G -->|QUIC / UDP| H --> I
+    T --> D
+    T -->|QUIC / UDP| H
 ```
 
-三个监听端口互不复用：
+监听职责如下：
 
 - `listen` 是 Hysteria2 QUIC/UDP 入口。
+- `trojan.listen` 是可选 Trojan TCP/TLS 入口，可与 UDP 入口使用同一数字端口。
 - `admin.listen` 是仅本机访问的管理 HTTP/TCP 入口。
 - `sub.listen` 是可由 Nginx 发布到公网的订阅 HTTP/TCP 入口。
+
+三个 TCP 服务不能绑定相同地址。两个代理入站共享顶层 TLS 证书。
 
 ## 配置来源
 
@@ -96,6 +104,8 @@ sequenceDiagram
 
 路由采用 fail-closed：上下文缺失或错配、ID 缺少节点、节点不存在、节点未授权或拨号失败都直接报错。服务端不会替换为 `direct`，也不会自动选择其他节点。客户端可在订阅中拿到多个获授权的代理条目，并在客户端侧配置选择或故障切换。
 
+Trojan 在 TLS 内接收 `lowercase_hex(SHA224(username:node:password))`，通过不可变原子索引得到相同的 `username:node`。请求解析后直接调用 `RoutingOutbound.GetOutboundForID`，不使用 Hy2 的事件交接 channel。索引与 Hy2 共用保留启动用户及授权的刷新快照；详见 [Trojan 设计](TROJAN_INBOUND_DESIGN.md)。
+
 ## 出站生命周期
 
 `OutboundFactory` 持有启动时加载的 Hysteria2 节点定义；`direct` 是唯一内建出站。Gateway 启动时最多并发预连接 8 个节点，并等待首轮连接结果最多 10 秒。一个节点阻塞或失败不会占用全局锁，也不会阻止其他节点完成连接；预热超时后 Gateway 继续启动，未完成节点留在后台处理。
@@ -106,16 +116,18 @@ sequenceDiagram
 
 ## 流量、配额和连接
 
-Hysteria2 将认证 ID、`tx` 和 `rx` 交给 TrafficLogger。Gateway 按 `username + node` 维护内存累计值，定期把增量写入 `traffic_logs` 并更新 `traffic_summary`。
+Hysteria2 与 Trojan 将相同认证 ID、`tx` 和 `rx` 交给共享 TrafficLogger。Gateway 按 `username + node` 维护内存累计值，按自然月保存待刷盘增量，定期写入 `traffic_logs` 并更新 `traffic_summary`。跨月及失败重试保留原月份；月度用量重载与正在写入的批次串行，避免重复或遗漏基数。
 
 - `tx`：客户端经 Gateway 发往 Node 或目标。
 - `rx`：Node 或目标经 Gateway 发往客户端。
 - 用户自然月额度：该用户所有节点的 `tx + rx`。
-- 用户下载限速：该用户所有连接共享的 `rx` 令牌桶。
+- 用户下载限速：该用户所有节点与协议的连接共享 `rx` 预约时间线，首个 chunk 可立即通过。
 
 数据库时间统一为 UTC Unix 秒；自然月边界按 YAML `timezone` 换算到 UTC 查询。异常退出最多损失一个 flush 周期的内存增量。
 
-停用、到期或超额后，Authenticator 拒绝新连接；TrafficLogger 在已有会话产生下一笔流量时、转发和计量该有效负载之前返回 false，使 Hysteria2 关闭整条客户端 QUIC 连接。完全空闲的会话不会被主动清理，可能继续出现在活跃连接中，直到客户端断开、再次产生流量、QUIC idle timeout 或 Gateway 重启；当前上游 server API 没有暴露按用户关闭空闲 QUIC 连接的句柄。密码重置只影响后续认证。
+停用、到期后 Authenticator 拒绝新连接；TrafficLogger 在已有会话下一笔有效负载时再次检查状态并返回 false，使对应 QUIC 连接或 Trojan 会话关闭。停用、到期或取消的 chunk 不计量；超额检测发生在计量后，触发超额的 chunk 计入用量但不转发。写入失败也不扣回读取的完整 chunk。完全空闲的会话不主动清理，密码重置只影响后续认证。
+
+热更新会唤醒发生策略变化的下载等待，不重置未变用户的限速时间线。Trojan relay 使用可取消计量 context；一个方向结束会取消另一个方向的等待。进程停机先调用 `BeginShutdown` 解除全部限速等待，最终 flush 在入站退出后执行。
 
 `TraceStream`、`UntraceStream` 与 EventLogger 共同维护内存中的连接和目标快照，管理后台的 `/live` 每 2 秒读取该快照。连接明细不持久化。
 
@@ -127,13 +139,15 @@ Hysteria2 将认证 ID、`tx` 和 `rx` 交给 TrafficLogger。Gateway 按 `usern
 
 `sub.publicURL` 只决定后台展示的订阅 URL，`sub.serverAddr` 决定生成配置中每个 Hysteria2 代理连接的 Gateway 地址。所有代理都先连接 Gateway，不会把远端 Node 地址直接发给用户。
 
+包括 `direct` 在内的所有订阅条目使用相同 Gateway TLS 参数，HTTP 响应禁止缓存。Trojan 第一期使用手工客户端配置，不增加订阅条目或数据库表。未接入运行时的 `obfs`、`masquerade` 配置会明确报错。
+
 ## systemd 与停机
 
 后台通过 godbus 调用 systemd D-Bus，只请求 YAML 中固定 unit 的重启，不执行 shell 命令。计划任务存入 SQLite；调度器每 5 秒领取到期任务。成功接受的任务会关联下一条进程运行记录，失败任务保留原始 D-Bus 错误；watchdog/OOM/信号等恢复启动从上一进程的 systemd result 推导。
 
 启用 watchdog 时，应用仅在 Gateway serve loop 正常且 SQLite `Ping` 成功时发送心跳。Node 不可用不会触发整个 Gateway 重启。`ExecStopPost` 使用轻量的 `record-exit` 子命令写入 systemd 的 `SERVICE_RESULT`、`EXIT_CODE` 和 `EXIT_STATUS`，供故障分析页面展示。
 
-收到 SIGINT/SIGTERM 后，进程依次停止后台刷新和调度、关闭两个 HTTP server、关闭 QUIC server、关闭缓存出站、flush 流量并关闭 SQLite。systemd 的 `TimeoutStopSec` 应大于应用内部关闭宽限时间。
+收到 SIGINT/SIGTERM 后，进程停止后台刷新和调度，关闭两个 HTTP server，取消流量等待，关闭 Trojan 与 QUIC 入站及缓存出站，等待 Trojan handler 和后台线程退出，再 flush 流量并关闭 SQLite。共享 Hy2 客户端必须在等待 Trojan handler 完成之前关闭，以解除远端 CONNECT 响应等待；Direct 拨号可用 context 取消。systemd 的 `TimeoutStopSec` 应大于应用内部关闭宽限时间。
 
 ## 模块
 
@@ -149,8 +163,9 @@ internal/storage/     SQLite schema、迁移和查询
 internal/subtoken/    随机 token 与旧 HMAC token
 internal/systemd/     D-Bus 和 sd_notify
 internal/traffic/     计量、配额、限速和 flush
+internal/trojan/      凭据索引、有界 parser、TLS listener 与计量 relay
 test/integration/     组件集成测试
-test/e2e/             真实 Hysteria2 请求链路测试
+test/e2e/             真实 Hysteria2、Trojan Direct 与 Trojan 两跳链路测试
 ```
 
 ## 关键约束

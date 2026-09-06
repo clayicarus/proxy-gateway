@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	hyServer "github.com/apernet/hysteria/core/v2/server"
 	"github.com/clayicarus/proxy-gateway/internal/auth"
 	"github.com/clayicarus/proxy-gateway/internal/config"
+	"github.com/clayicarus/proxy-gateway/internal/connection"
 	"github.com/clayicarus/proxy-gateway/internal/event"
 	"github.com/clayicarus/proxy-gateway/internal/router"
 	"github.com/clayicarus/proxy-gateway/internal/traffic"
@@ -111,7 +113,8 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 	routerEngine := router.NewRouter(users, logger)
 	outboundFactory := router.NewOutboundFactory(nodes, logger)
 	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
-	eventLogger := event.NewEventLogger(routingOutbound, logger)
+	connectionTracker := connection.NewTracker()
+	eventLogger := event.NewEventLogger(routingOutbound, logger, connectionTracker)
 
 	// --- 4. Start Hysteria2 server ---
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
@@ -189,6 +192,12 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 		if response != expected {
 			t.Errorf("expected %q, got %q", expected, response)
 		}
+		eventuallyE2E(t, time.Second, func() bool {
+			snapshot := trafficLogger.GetSnapshot("alice:direct")
+			connections := connectionTracker.Snapshots()
+			return snapshot != nil && snapshot.OnlineCount == 1 && len(connections) == 1 &&
+				connections[0].Username == "alice" && connections[0].Node == "direct" && len(connections[0].Requests) == 1
+		})
 
 		t.Logf("alice received: %s", response)
 	})
@@ -250,6 +259,11 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 		if response != expected {
 			t.Errorf("expected %q, got %q", expected, response)
 		}
+		eventuallyE2E(t, time.Second, func() bool {
+			snapshot := trafficLogger.GetSnapshot("bob:direct")
+			connections := connectionTracker.Snapshots()
+			return snapshot != nil && snapshot.OnlineCount == 1 && len(connections) == 1 && connections[0].Username == "bob"
+		})
 
 		t.Logf("bob received: %s", response)
 	})
@@ -266,8 +280,8 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 		}
 		t.Logf("alice:direct traffic: tx=%d rx=%d", aliceSnap.TxBytes, aliceSnap.RxBytes)
 
-		if aliceSnap.TxBytes == 0 && aliceSnap.RxBytes == 0 {
-			t.Error("expected non-zero traffic for alice:direct")
+		if aliceSnap.TxBytes != uint64(len("hello from alice")) || aliceSnap.RxBytes != uint64(len("echo:hello from alice")) {
+			t.Errorf("alice traffic = %d/%d, want %d/%d", aliceSnap.TxBytes, aliceSnap.RxBytes, len("hello from alice"), len("echo:hello from alice"))
 		}
 
 		bobSnap := trafficLogger.GetSnapshot("bob:direct")
@@ -276,10 +290,97 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 		}
 		t.Logf("bob:direct traffic: tx=%d rx=%d", bobSnap.TxBytes, bobSnap.RxBytes)
 
-		if bobSnap.TxBytes == 0 && bobSnap.RxBytes == 0 {
-			t.Error("expected non-zero traffic for bob:direct")
+		if bobSnap.TxBytes != uint64(len("hello from bob")) || bobSnap.RxBytes != uint64(len("echo:hello from bob")) {
+			t.Errorf("bob traffic = %d/%d, want %d/%d", bobSnap.TxBytes, bobSnap.RxBytes, len("hello from bob"), len("echo:hello from bob"))
 		}
+		eventuallyE2E(t, time.Second, func() bool {
+			return aliceSnap.OnlineCount == 0 && bobSnap.OnlineCount == 0 && len(connectionTracker.Snapshots()) == 0
+		})
 	})
+}
+
+func TestHy2E2E_PasswordResetOnlyAffectsNewAuthentication(t *testing.T) {
+	targetAddr, _ := startEchoTarget(t)
+	certificate, err := generateSelfSignedCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	users := map[string]config.UserConfig{
+		"alice": {Password: "old", Routes: []string{"direct"}},
+	}
+	authenticator := auth.NewAuthenticator(users, zap.NewNop())
+	trafficLogger := traffic.NewTrafficLogger(users, nil, zap.NewNop())
+	outboundFactory := router.NewOutboundFactory(nil, zap.NewNop())
+	defer outboundFactory.Close()
+	routingOutbound := router.NewRoutingOutbound(router.NewRouter(users, zap.NewNop()), outboundFactory, zap.NewNop())
+	packetConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := hyServer.NewServer(&hyServer.Config{
+		TLSConfig:     hyServer.TLSConfig{Certificates: []tls.Certificate{certificate}},
+		Conn:          packetConn,
+		Authenticator: authenticator,
+		Outbound:      routingOutbound,
+		TrafficLogger: trafficLogger,
+		EventLogger:   event.NewEventLogger(routingOutbound, zap.NewNop()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go server.Serve()
+	defer server.Close()
+
+	serverAddr, err := net.ResolveUDPAddr("udp", packetConn.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConfig := func(password string) *hyClient.Config {
+		return &hyClient.Config{
+			ServerAddr: serverAddr,
+			Auth:       "alice:direct:" + password,
+			TLSConfig: hyClient.TLSConfig{
+				ServerName:         "localhost",
+				InsecureSkipVerify: true,
+			},
+		}
+	}
+	existingClient, _, err := hyClient.NewClient(clientConfig("old"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer existingClient.Close()
+	existingConn, err := existingClient.TCP(targetAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer existingConn.Close()
+
+	resetUsers := map[string]config.UserConfig{
+		"alice": {Password: "new", Routes: []string{"direct"}},
+	}
+	authenticator.UpdateUsers(resetUsers)
+	trafficLogger.UpdateUsers(resetUsers)
+	if _, _, err := hyClient.NewClient(clientConfig("old")); err == nil {
+		t.Fatal("old password authenticated a new Hysteria2 connection")
+	}
+	newClient, _, err := hyClient.NewClient(clientConfig("new"))
+	if err != nil {
+		t.Fatalf("new password was rejected: %v", err)
+	}
+	_ = newClient.Close()
+
+	payload := []byte("existing session remains valid")
+	if _, err := existingConn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, len(payload))
+	if err := existingConn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(existingConn, response); err != nil || string(response) != string(payload) {
+		t.Fatalf("existing session response=%q err=%v", response, err)
+	}
 }
 
 // TestHy2E2E_UnknownUser tests that an unknown user is rejected.

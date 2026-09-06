@@ -2,7 +2,9 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoad_ValidConfig(t *testing.T) {
@@ -83,6 +85,145 @@ api:
 	}
 	if cfg.DBPath != "proxy-gateway.db" {
 		t.Errorf("expected default dbPath, got %s", cfg.DBPath)
+	}
+}
+
+func TestLoad_TrojanDefaultsAndSharedNumericPort(t *testing.T) {
+	content := `
+listen: ":443"
+trojan:
+  listen: ":443"
+tls:
+  cert: test.crt
+  key: test.key
+`
+	cfg, err := Load(writeTempFile(t, content))
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	if cfg.Trojan == nil || cfg.Trojan.Listen != ":443" {
+		t.Fatalf("unexpected Trojan config: %#v", cfg.Trojan)
+	}
+	if cfg.Trojan.HandshakeTimeout != DefaultTrojanHandshakeTimeout {
+		t.Fatalf("handshake timeout = %v, want %v", cfg.Trojan.HandshakeTimeout, DefaultTrojanHandshakeTimeout)
+	}
+	if cfg.Trojan.MaxPendingConnections != DefaultTrojanMaxPendingConnections {
+		t.Fatalf("pending limit = %d, want %d", cfg.Trojan.MaxPendingConnections, DefaultTrojanMaxPendingConnections)
+	}
+}
+
+func TestLoad_TrojanDisabledWhenOmittedOrEmpty(t *testing.T) {
+	for name, trojanBlock := range map[string]string{
+		"omitted": "",
+		"empty":   "trojan: {}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			content := trojanBlock + "tls:\n  cert: test.crt\n  key: test.key\n"
+			cfg, err := Load(writeTempFile(t, content))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Trojan != nil && cfg.Trojan.Listen != "" {
+				t.Fatalf("Trojan unexpectedly enabled: %#v", cfg.Trojan)
+			}
+		})
+	}
+}
+
+func TestLoad_TrojanCustomResourceBounds(t *testing.T) {
+	content := `
+trojan:
+  listen: "127.0.0.1:8443"
+  handshakeTimeout: 15s
+  maxPendingConnections: 64
+tls:
+  cert: test.crt
+  key: test.key
+`
+	cfg, err := Load(writeTempFile(t, content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Trojan.HandshakeTimeout != 15*time.Second || cfg.Trojan.MaxPendingConnections != 64 {
+		t.Fatalf("unexpected resource bounds: %#v", cfg.Trojan)
+	}
+}
+
+func TestLoad_RejectsInvalidTrojanConfiguration(t *testing.T) {
+	tests := map[string]string{
+		"missing port":         "listen: localhost",
+		"zero port":            "listen: ':0'",
+		"port out of range":    "listen: ':70000'",
+		"short timeout":        "listen: ':443'\n  handshakeTimeout: 500ms",
+		"long timeout":         "listen: ':443'\n  handshakeTimeout: 3m",
+		"negative pending":     "listen: ':443'\n  maxPendingConnections: -1",
+		"excessive pending":    "listen: ':443'\n  maxPendingConnections: 65536",
+		"future metadata typo": "listen: ':443'\n  serverAddr: example.com:443",
+	}
+	for name, trojanBlock := range tests {
+		t.Run(name, func(t *testing.T) {
+			content := "trojan:\n  " + trojanBlock + "\ntls:\n  cert: test.crt\n  key: test.key\n"
+			if _, err := Load(writeTempFile(t, content)); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+func TestLoad_RejectsTrojanTCPListenerConflicts(t *testing.T) {
+	tests := map[string]string{
+		"admin":        "admin:\n  listen: '127.0.0.1:8443'",
+		"padded port":  "admin:\n  listen: '127.0.0.1:08443'",
+		"legacy admin": "api:\n  listen: '127.0.0.1:8443'",
+		"subscription": "sub:\n  listen: '127.0.0.1:8443'\n  serverAddr: 'gateway.example:443'",
+	}
+	for name, conflicting := range tests {
+		t.Run(name, func(t *testing.T) {
+			content := "trojan:\n  listen: ':8443'\ntls:\n  cert: test.crt\n  key: test.key\n" + conflicting + "\n"
+			if _, err := Load(writeTempFile(t, content)); err == nil || !strings.Contains(err.Error(), "conflicts") {
+				t.Fatalf("expected listener conflict, got %v", err)
+			}
+		})
+	}
+}
+
+func TestLoad_RejectsUnsupportedTransportOptions(t *testing.T) {
+	for _, option := range []string{"obfs", "masquerade"} {
+		content := "tls:\n  cert: test.crt\n  key: test.key\n" + option + ": {}\n"
+		if _, err := Load(writeTempFile(t, content)); err == nil || !strings.Contains(err.Error(), option+" is not supported") {
+			t.Fatalf("unsupported %s was silently accepted: %v", option, err)
+		}
+	}
+}
+
+func TestLoad_SubscriptionRequiresExplicitClientAddress(t *testing.T) {
+	for _, address := range []string{"", ":8443", "0.0.0.0:8443", "[::]:8443", "gateway.example", "gateway.example:0"} {
+		content := "tls:\n  cert: test.crt\n  key: test.key\nsub:\n  listen: '127.0.0.1:9091'\n  serverAddr: '" + address + "'\n"
+		if _, err := Load(writeTempFile(t, content)); err == nil || !strings.Contains(err.Error(), "sub.serverAddr") {
+			t.Fatalf("unusable subscription address %q was accepted: %v", address, err)
+		}
+	}
+	content := "tls:\n  cert: test.crt\n  key: test.key\nsub:\n  listen: '127.0.0.1:9091'\n  serverAddr: 'gateway.example:8443'\n"
+	if _, err := Load(writeTempFile(t, content)); err != nil {
+		t.Fatalf("explicit client address was rejected: %v", err)
+	}
+}
+
+func TestLoad_RejectsNegativeTrafficFlushInterval(t *testing.T) {
+	content := "tls:\n  cert: test.crt\n  key: test.key\ntrafficFlushInterval: -1s\n"
+	if _, err := Load(writeTempFile(t, content)); err == nil || !strings.Contains(err.Error(), "trafficFlushInterval") {
+		t.Fatalf("expected traffic flush validation error, got %v", err)
+	}
+}
+
+func TestLoad_RejectsUnknownFieldsAndMultipleDocuments(t *testing.T) {
+	unknown := "tls:\n  cert: test.crt\n  key: test.key\nlistenTypo: ':443'\n"
+	if _, err := Load(writeTempFile(t, unknown)); err == nil {
+		t.Fatal("expected unknown field to be rejected")
+	}
+	multiple := "tls:\n  cert: test.crt\n  key: test.key\n---\ntls:\n  cert: other.crt\n  key: other.key\n"
+	if _, err := Load(writeTempFile(t, multiple)); err == nil {
+		t.Fatal("expected multiple YAML documents to be rejected")
 	}
 }
 

@@ -1,8 +1,13 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
+	"net"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -12,6 +17,10 @@ import (
 type Config struct {
 	Listen string    `yaml:"listen"`
 	TLS    TLSConfig `yaml:"tls"`
+
+	// Trojan is an optional TCP/TLS inbound. It can share the numeric port
+	// with Listen because Hysteria2 uses UDP while Trojan uses TCP.
+	Trojan *TrojanConfig `yaml:"trojan,omitempty"`
 
 	// Obfuscation (optional, must match client)
 	Obfs *ObfsConfig `yaml:"obfs,omitempty"`
@@ -56,6 +65,20 @@ type Config struct {
 
 	// Optional systemd integration for restart requests and watchdog support.
 	Systemd *SystemdConfig `yaml:"systemd,omitempty"`
+}
+
+const (
+	DefaultTrojanHandshakeTimeout      = 10 * time.Second
+	DefaultTrojanMaxPendingConnections = 256
+)
+
+// TrojanConfig controls the first-phase Trojan TCP CONNECT inbound.
+// Client subscription metadata deliberately remains out of this contract
+// until Trojan subscriptions are implemented.
+type TrojanConfig struct {
+	Listen                string        `yaml:"listen,omitempty"`
+	HandshakeTimeout      time.Duration `yaml:"handshakeTimeout,omitempty"`
+	MaxPendingConnections int           `yaml:"maxPendingConnections,omitempty"`
 }
 
 type TLSConfig struct {
@@ -166,7 +189,16 @@ func Load(path string) (*Config, error) {
 	}
 
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("failed to parse config file: multiple YAML documents are not supported")
+		}
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
@@ -201,11 +233,109 @@ func (c *Config) validate() error {
 	if c.TrafficFlushInterval == 0 {
 		c.TrafficFlushInterval = 10 * time.Second
 	}
+	if c.TrafficFlushInterval < 0 {
+		return fmt.Errorf("trafficFlushInterval must be greater than zero")
+	}
 	if c.DBPath == "" {
 		c.DBPath = "proxy-gateway.db"
 	}
+	if c.Obfs != nil {
+		return fmt.Errorf("obfs is not supported by the gateway; remove the obfs block")
+	}
+	if c.Masquerade != nil {
+		return fmt.Errorf("masquerade is not supported by the gateway; remove the masquerade block")
+	}
+	if c.Sub != nil && (c.Sub.Listen != "" || c.Sub.PublicURL != "" || c.Sub.ServerAddr != "") {
+		if err := validateTCPListen(c.Sub.ServerAddr); err != nil {
+			return fmt.Errorf("sub.serverAddr must explicitly specify the client-facing host and port: %w", err)
+		}
+		host, _, _ := net.SplitHostPort(c.Sub.ServerAddr)
+		if isWildcardHost(normalizeListenHost(host)) {
+			return fmt.Errorf("sub.serverAddr must use a client-facing host, not a wildcard listen address")
+		}
+	}
+
+	if c.Trojan != nil && c.Trojan.Listen != "" {
+		if err := validateTCPListen(c.Trojan.Listen); err != nil {
+			return fmt.Errorf("invalid trojan.listen %q: %w", c.Trojan.Listen, err)
+		}
+		if c.Trojan.HandshakeTimeout == 0 {
+			c.Trojan.HandshakeTimeout = DefaultTrojanHandshakeTimeout
+		}
+		if c.Trojan.HandshakeTimeout < time.Second || c.Trojan.HandshakeTimeout > 2*time.Minute {
+			return fmt.Errorf("trojan.handshakeTimeout must be between 1s and 2m")
+		}
+		if c.Trojan.MaxPendingConnections == 0 {
+			c.Trojan.MaxPendingConnections = DefaultTrojanMaxPendingConnections
+		}
+		if c.Trojan.MaxPendingConnections < 1 || c.Trojan.MaxPendingConnections > 65535 {
+			return fmt.Errorf("trojan.maxPendingConnections must be between 1 and 65535")
+		}
+
+		adminListen := c.Admin.Listen
+		if adminListen == "" {
+			adminListen = c.API.Listen
+		}
+		for name, listen := range map[string]string{
+			"admin.listen": adminListen,
+			"sub.listen":   subListen(c.Sub),
+		} {
+			if listen != "" && tcpListensConflict(c.Trojan.Listen, listen) {
+				return fmt.Errorf("trojan.listen conflicts with %s", name)
+			}
+		}
+	}
 
 	return nil
+}
+
+func subListen(sub *SubConfig) string {
+	if sub == nil {
+		return ""
+	}
+	return sub.Listen
+}
+
+func validateTCPListen(addr string) error {
+	host, rawPort, err := net.SplitHostPort(addr)
+	if err != nil {
+		return err
+	}
+	port, err := strconv.Atoi(rawPort)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("port must be an integer between 1 and 65535")
+	}
+	if strings.ContainsRune(host, '\x00') {
+		return fmt.Errorf("host contains NUL")
+	}
+	return nil
+}
+
+func tcpListensConflict(a, b string) bool {
+	aHost, aPort, errA := net.SplitHostPort(a)
+	bHost, bPort, errB := net.SplitHostPort(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	aNumber, aErr := strconv.Atoi(aPort)
+	bNumber, bErr := strconv.Atoi(bPort)
+	if aErr != nil || bErr != nil || aNumber != bNumber {
+		return false
+	}
+	aHost = normalizeListenHost(aHost)
+	bHost = normalizeListenHost(bHost)
+	return aHost == bHost || isWildcardHost(aHost) || isWildcardHost(bHost)
+}
+
+func normalizeListenHost(host string) string {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String()
+	}
+	return strings.ToLower(host)
+}
+
+func isWildcardHost(host string) bool {
+	return host == "" || host == "0.0.0.0" || host == "::"
 }
 
 // ValidateLegacy validates the deprecated static user/node data used only by

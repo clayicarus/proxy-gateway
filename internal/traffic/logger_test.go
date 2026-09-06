@@ -1,6 +1,8 @@
 package traffic
 
 import (
+	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -187,7 +189,8 @@ func TestTrafficLogger_StopWaitsForFinalFlush(t *testing.T) {
 }
 
 func TestTrafficLogger_FailedFlushRestoresDeltas(t *testing.T) {
-	store, err := storage.NewSQLiteStore(t.TempDir()+"/traffic.db", zap.NewNop())
+	path := t.TempDir() + "/traffic.db"
+	store, err := storage.NewSQLiteStore(path, zap.NewNop())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,13 +206,106 @@ func TestTrafficLogger_FailedFlushRestoresDeltas(t *testing.T) {
 	}
 
 	tl.Flush()
-	value, ok := tl.stats.Load("alice:direct")
-	if !ok {
-		t.Fatal("traffic stats missing after failed flush")
+	reopened, err := storage.NewSQLiteStore(path, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
 	}
-	stats := value.(*UserNodeStats)
-	if tx, rx := stats.TxDelta.Load(), stats.RxDelta.Load(); tx != 100 || rx != 200 {
-		t.Fatalf("failed flush deltas = %d/%d, want 100/200", tx, rx)
+	defer reopened.Close()
+	tl.store = reopened
+	if !tl.LogTraffic("alice:direct", 50, 30) {
+		t.Fatal("traffic after reopening the database was rejected")
+	}
+	tl.Flush()
+	tl.Flush()
+	if tx, rx, err := reopened.GetSummary("alice", "direct"); err != nil || tx != 150 || rx != 230 {
+		t.Fatalf("retried traffic = %d/%d, error=%v; want 150/230 exactly once", tx, rx, err)
+	}
+}
+
+func TestTrafficLogger_MonthRolloverPreservesPendingTrafficAndQuota(t *testing.T) {
+	for _, location := range []*time.Location{time.UTC, time.FixedZone("UTC+8", 8*3600), time.FixedZone("UTC-5", -5*3600)} {
+		for _, failFlush := range []bool{false, true} {
+			name := location.String()
+			if failFlush {
+				name += "/retry"
+			}
+			t.Run(name, func(t *testing.T) {
+				path := t.TempDir() + "/traffic.db"
+				store, err := storage.NewSQLiteStore(path, zap.NewNop())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { store.Close() }()
+				oldMonth := time.Date(2026, time.January, 31, 23, 59, 59, 0, location)
+				newMonth := oldMonth.Add(time.Second)
+				// Existing persisted usage must still count when a month is loaded.
+				if err := store.FlushTraffic([]storage.TrafficRecord{{UserID: "alice", NodeID: "direct", TxBytes: 10, RxBytes: 10, Timestamp: newMonth}}); err != nil {
+					t.Fatal(err)
+				}
+				users := map[string]config.UserConfig{"alice": {Routes: []string{"direct", "node1"}, MaxBytes: 100}}
+				tl := NewTrafficLoggerWithLocation(users, store, zap.NewNop(), location)
+				now := oldMonth
+				tl.now = func() time.Time { return now }
+				if !tl.LogTraffic("alice:node1", 60, 40) {
+					t.Fatal("old-month traffic at quota was rejected")
+				}
+				if failFlush {
+					if err := store.Close(); err != nil {
+						t.Fatal(err)
+					}
+					tl.Flush()
+					store, err = storage.NewSQLiteStore(path, zap.NewNop())
+					if err != nil {
+						t.Fatal(err)
+					}
+					tl.store = store
+				}
+				now = newMonth
+				if !tl.LogTraffic("alice:direct", 20, 10) {
+					t.Fatal("old-month pending bytes consumed the new-month quota")
+				}
+				if tl.LogTraffic("alice:node1", 51, 0) {
+					t.Fatal("new-month persisted usage was omitted from the shared quota")
+				}
+				tl.Flush()
+				tl.Flush() // No duplicate accounting on repeated flushes.
+				for _, check := range []struct {
+					time time.Time
+					want [2]uint64
+				}{{oldMonth, [2]uint64{60, 40}}, {newMonth, [2]uint64{81, 20}}} {
+					_, start, end := tl.monthBounds(check.time)
+					usage, err := store.GetUserMonthlyUsage(start, end)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if usage["alice"] != check.want {
+						t.Fatalf("usage at %v = %v, want %v", check.time, usage["alice"], check.want)
+					}
+				}
+				restarted := NewTrafficLoggerWithLocation(users, store, zap.NewNop(), location)
+				restarted.now = func() time.Time { return newMonth }
+				if restarted.LogTraffic("alice:direct", 1, 0) {
+					t.Fatal("restart reset persisted new-month usage")
+				}
+			})
+		}
+	}
+}
+
+func TestTrafficLogger_MonthReloadFailureRejectsUnaccountedTraffic(t *testing.T) {
+	store, err := storage.NewSQLiteStore(t.TempDir()+"/traffic.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tl := NewTrafficLogger(map[string]config.UserConfig{"alice": {Routes: []string{"direct"}, MaxBytes: 100}}, store, zap.NewNop())
+	if tl.LogTraffic("alice:direct", 1, 0) {
+		t.Fatal("failed monthly usage query granted traffic")
+	}
+	if snapshot := tl.GetSnapshot("alice:direct"); snapshot.TxBytes != 0 {
+		t.Fatal("traffic without a known quota base was partially accounted")
 	}
 }
 
@@ -250,5 +346,158 @@ func TestTrafficLogger_GetAllSnapshots(t *testing.T) {
 	}
 	if all["bob:node1"].RxBytes != 60 {
 		t.Errorf("bob:node1 rx: expected 60, got %d", all["bob:node1"].RxBytes)
+	}
+}
+
+func TestTrafficLogger_DownloadLimitIsSharedAcrossNodes(t *testing.T) {
+	users := map[string]config.UserConfig{
+		"alice": {Password: "p", Routes: []string{"node1", "node2"}, SpeedLimit: 1000},
+	}
+	tl := NewTrafficLogger(users, nil, zap.NewNop())
+
+	if ok := tl.LogTraffic("alice:node1", 0, 100); !ok {
+		t.Fatal("first download chunk was rejected")
+	}
+	started := time.Now()
+	if ok := tl.LogTraffic("alice:node2", 0, 1); !ok {
+		t.Fatal("second download chunk was rejected")
+	}
+	if elapsed := time.Since(started); elapsed < 70*time.Millisecond {
+		t.Fatalf("per-user limiter was not shared across nodes; wait=%v", elapsed)
+	}
+}
+
+func TestTrafficLogger_BeginShutdownCancelsLimitWaitWithoutAccounting(t *testing.T) {
+	users := map[string]config.UserConfig{
+		"alice": {Password: "p", Routes: []string{"direct"}, SpeedLimit: 1},
+	}
+	tl := NewTrafficLogger(users, nil, zap.NewNop())
+	if ok := tl.LogTraffic("alice:direct", 0, 2); !ok {
+		t.Fatal("first download chunk was rejected")
+	}
+
+	result := make(chan bool, 1)
+	var started sync.WaitGroup
+	started.Add(1)
+	go func() {
+		started.Done()
+		result <- tl.LogTraffic("alice:direct", 0, 1)
+	}()
+	started.Wait()
+	select {
+	case <-result:
+		t.Fatal("limited traffic returned before its reservation")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	tl.BeginShutdown()
+	select {
+	case ok := <-result:
+		if ok {
+			t.Fatal("shutdown-cancelled traffic was accepted")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not cancel download-limit wait")
+	}
+	snapshot := tl.GetSnapshot("alice:direct")
+	if snapshot.RxBytes != 2 {
+		t.Fatalf("cancelled chunk was accounted: rx=%d", snapshot.RxBytes)
+	}
+	if ok := tl.LogTraffic("alice:direct", 1, 0); ok {
+		t.Fatal("traffic was accepted after shutdown began")
+	}
+}
+
+func TestTrafficLogger_PolicyChangesWakeDownloadReservations(t *testing.T) {
+	expired := time.Now().Add(-time.Minute)
+	for _, test := range []struct {
+		name string
+		user config.UserConfig
+		want bool
+	}{
+		{"disabled", config.UserConfig{SpeedLimit: 1, Disabled: true}, false},
+		{"expired", config.UserConfig{SpeedLimit: 1, ExpiresAt: &expired}, false},
+		{"unlimited", config.UserConfig{}, true},
+		{"faster", config.UserConfig{SpeedLimit: 10000}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tl := NewTrafficLogger(map[string]config.UserConfig{"alice": {Routes: []string{"direct"}, SpeedLimit: 1}}, nil, zap.NewNop())
+			defer tl.Stop()
+			if !tl.LogTraffic("alice:direct", 0, 2) {
+				t.Fatal("first chunk was rejected")
+			}
+			result := make(chan bool, 1)
+			go func() { result <- tl.LogTraffic("alice:direct", 0, 1) }()
+			select {
+			case <-result:
+				t.Fatal("second chunk skipped the shared rate limit")
+			case <-time.After(50 * time.Millisecond):
+			}
+			tl.UpdateUsers(map[string]config.UserConfig{"alice": test.user})
+			select {
+			case got := <-result:
+				if got != test.want {
+					t.Fatalf("updated policy accepted=%v, want %v", got, test.want)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("policy update did not wake the old download reservation")
+			}
+			wantRx := uint64(2)
+			if test.want {
+				wantRx++
+			}
+			if got := tl.GetSnapshot("alice:direct").RxBytes; got != wantRx {
+				t.Fatalf("accounted rx=%d, want %d", got, wantRx)
+			}
+		})
+	}
+}
+
+func TestTrafficLogger_UnchangedRefreshPreservesLimitAndContextCancels(t *testing.T) {
+	users := map[string]config.UserConfig{"alice": {Routes: []string{"direct"}, SpeedLimit: 1}}
+	tl := NewTrafficLogger(users, nil, zap.NewNop())
+	defer tl.Stop()
+	tl.LogTraffic("alice:direct", 0, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan bool, 1)
+	go func() { result <- tl.LogTrafficContext(ctx, "alice:direct", 0, 1) }()
+	tl.UpdateUsers(users)
+	select {
+	case <-result:
+		t.Fatal("an unchanged refresh reset the rate limit")
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case accepted := <-result:
+		if accepted {
+			t.Fatal("cancelled relay traffic was accepted")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("relay cancellation did not release the rate-limit wait")
+	}
+	if tl.GetSnapshot("alice:direct").RxBytes != 2 {
+		t.Fatal("cancelled relay traffic was accounted")
+	}
+	if !tl.LogTraffic("alice:direct", 1, 0) {
+		t.Fatal("cancelling one relay stopped other traffic")
+	}
+}
+
+func TestTrafficLogger_ExpiryInterruptsDownloadWait(t *testing.T) {
+	expires := time.Now().Add(150 * time.Millisecond)
+	tl := NewTrafficLogger(map[string]config.UserConfig{"alice": {Routes: []string{"direct"}, SpeedLimit: 1, ExpiresAt: &expires}}, nil, zap.NewNop())
+	defer tl.Stop()
+	tl.LogTraffic("alice:direct", 0, 2)
+	result := make(chan bool, 1)
+	go func() { result <- tl.LogTraffic("alice:direct", 0, 1) }()
+	select {
+	case accepted := <-result:
+		if accepted || tl.GetSnapshot("alice:direct").RxBytes != 2 {
+			t.Fatal("traffic waiting past expiry was accepted or accounted")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expiry did not release the download wait")
 	}
 }

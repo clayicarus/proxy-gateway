@@ -80,17 +80,15 @@ func (h *DatabaseSubscriptionHandler) handle(w http.ResponseWriter, r *http.Requ
 	data := managedSubscriptionData{}
 	host, port := splitHostPort(h.gatewayAddress())
 	for _, route := range routes {
-		if route == "direct" {
-			data.Proxies = append(data.Proxies, managedProxy{Name: "direct", Server: host, Port: port, Auth: fmt.Sprintf("%s:%s:%s", user.Username, route, user.Password)})
-			continue
-		}
-		node, ok := h.nodes[route]
-		if !ok {
-			continue
-		}
-		name := node.Alias
-		if name == "" {
-			name = route
+		name := route
+		if route != "direct" {
+			node, ok := h.nodes[route]
+			if !ok {
+				continue
+			}
+			if node.Alias != "" {
+				name = node.Alias
+			}
 		}
 		proxy := managedProxy{Name: name, Server: host, Port: port, Auth: fmt.Sprintf("%s:%s:%s", user.Username, route, user.Password), SNI: h.sni(), Insecure: h.insecure()}
 		if h.cfg.Obfs != nil && h.cfg.Obfs.Type == "salamander" {
@@ -110,6 +108,7 @@ func (h *DatabaseSubscriptionHandler) handle(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": user.Username + ".yaml"}))
 	w.Header().Set("Profile-Update-Interval", "24")
 	// The standard header has no tx+rx notion. It is supplied as an advisory

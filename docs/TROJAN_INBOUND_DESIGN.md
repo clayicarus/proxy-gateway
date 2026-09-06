@@ -2,7 +2,7 @@
 
 ## 状态与范围
 
-本文定义 Proxy Gateway 的第一期 Trojan 入站。目标是在不改变现有出站、用户策略、SQLite 流量口径和管理数据模型的前提下，增加标准 Trojan TCP CONNECT 入站。
+本文定义并对应 `internal/trojan` 中的第一期实现：在不改变现有出站、用户策略、SQLite 流量口径和管理数据模型的前提下，增加标准 Trojan TCP CONNECT 入站。验收项见 [TODO](TROJAN_INBOUND_TODO.md)。
 
 第一期只支持 TCP CONNECT，不支持 UDP ASSOCIATE、BIND、协议 fallback 或 Trojan 专用数据库凭据。Gateway 继续坚持客户端显式选择节点、服务端不自动切换节点或回退到 `direct`。
 
@@ -20,15 +20,14 @@
 
 ```yaml
 trojan:
-  listen: ":443"                         # TCP/TLS 入站
-  serverAddr: "gateway.example.com:443"  # 仅供后续订阅生成使用
-  sni: "gateway.example.com"             # 仅供后续订阅生成使用
-  insecure: false                         # 仅供后续订阅生成使用
+  listen: ":443"                # TCP/TLS 入站
+  handshakeTimeout: 10s          # TLS 与完整 Trojan 请求头共用总期限
+  maxPendingConnections: 256    # 未完成认证/首包解析的连接数上限
 ```
 
-入站 TLS 始终复用顶层 `tls.cert`、`tls.key`。`serverAddr` 不能从 `listen` 推断：`listen` 可以是 `:443`、私网地址或本机地址，而订阅必须发布外部可访问的主机名和端口。
+入站 TLS 始终复用顶层 `tls.cert`、`tls.key`，最低 TLS 1.2。握手期限可设为 `1s`–`2m`，未认证连接数可设为 `1`–`65535`；超过并发上限的新连接立即关闭。TCP 监听冲突在配置和同步绑定阶段检查。
 
-本期没有 Trojan 订阅输出，因而 `serverAddr`、`sni` 与 `insecure` 可在第二期实现订阅时加入；若它们随第一期一并加入，必须明确仅影响生成的客户端配置，绝不改变服务端 TLS 验证或安全策略。
+本期只提供手工客户端配置，不接受 `trojan.serverAddr`、`trojan.sni` 或 `trojan.insecure`。这些订阅元数据留到第二期；未来的公开地址不能从 `listen` 推断。客户端 `password` 填入原始 `username:node:password`，由客户端生成 SHA-224，示例见 [README](../README.md)。
 
 ## 凭据与身份映射
 
@@ -82,7 +81,7 @@ targetConn, err := outbound.TCP(target)
 
 这仍会使用同一个 `OutboundFactory`，因此 Direct TCP timeout、远端 Hysteria2 节点状态、预热、DNS 刷新和后台重连全部保持一致。`id` 的格式与现有 Hy2 完全相同，因此不需要修改路由数据模型或 SQLite 表。
 
-成功认证后调用：
+成功认证、解析请求且出站拨号成功后调用：
 
 ```text
 trafficLogger.LogOnlineState(id, true)
@@ -105,13 +104,18 @@ target -> client: TrafficLogger.LogTraffic(id, 0, n)
 
 计量只涵盖 relay 的应用有效负载，不计 Trojan 认证、命令、地址和分帧头。实现须锁定并测试当前语义：超额触发的 chunk 不再继续写出；因对端写入失败造成的部分写入如何计量必须与现有 Hy2 口径一致并在测试中固定，不能在两个入站间产生无说明的差异。
 
+当前两个入站均先计量整次读取的 chunk，再执行一次 Write；超额 chunk 不转发，但仍计入用量。短写或写入失败不扣回计数。停用、到期、停机或连接取消导致的拒绝则不计量。下载限速在用户全部节点与两个协议间共用时间线，允许首个 chunk 立即通过；政策变更会唤醒等待，Trojan 单连接关闭会取消该连接的等待。数据库待刷盘记录按自然月分组并保留实际计量时间，失败重试不改变月份。
+
 ## TLS、资源与停机
 
 - TCP listener 启动时同步绑定；绑定失败和 accept loop 异常都进入现有 `serviceErrCh`，使 systemd 以失败状态恢复进程。
 - 每个连接在 TLS handshake 和 Trojan 首包解析期间设置短 deadline，成功解析后清除 deadline。该 deadline 是防 Slowloris 的必要边界，不是空闲会话超时策略。
 - 限制并发握手/未认证连接数，并确保 accept 错误采用退避，避免文件描述符耗尽或忙循环。具体阈值应配置化或先以保守常量实现，并在压测后确定。
 - `TrojanServer.Close` 必须停止 accept、关闭所有已认证与握手中的连接并等待其 goroutine 退出；主进程必须在 `trafficLogger.Stop()` 前完成该步骤，避免关闭后的 relay 丢失最终 flush。
+- 主进程在关闭 Trojan 的同时关闭共享出站客户端，再等待入站退出；这是为了解除上游 Hy2 `TCP()` 对远端 CONNECT 响应的等待。Direct 拨号使用可取消 context。
 - 使用共享证书不代表自动得到 Web fallback 或 SNI 多路复用。若以后要同 TCP 端口提供 HTTPS 网站，需单独设计 TLS/SNI/ALPN 路由，不能混入第一期。
+
+资源验证入口为 `TestServerResourceBoundsUnderLoad`：保持 64 个已认证空闲 TLS 会话，同时占满 256 个未认证名额，确认额外 32 个连接被关闭，随后校验所有连接、pending 名额和 tracker 状态归零。该探针为便于观察使用 1 分钟握手期限；生产默认 10 秒期限另由 Slowloris 测试覆盖。`TestServerConcurrentRelays` 覆盖 32 个并行 TLS relay 的准确计量。探针输出整个测试进程（含客户端）的堆分配、goroutine 增量和停机耗时；这些是可复现的本地资源证据，部署容量仍需按目标主机测试。已认证连接总数的按用户限制属于后续运维能力。
 
 ## 订阅与管理后台
 

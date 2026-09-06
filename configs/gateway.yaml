@@ -1,30 +1,26 @@
 # Proxy Gateway 示例配置
 
-# 监听地址
+# Hysteria2 UDP 监听地址
 listen: :8443
+
+# 可选 Trojan TCP/TLS 入站；可与 Hysteria2 使用同一个数字端口。
+# 仅支持 TCP CONNECT，客户端 password 为 username:node:user.password。
+# trojan:
+#   listen: :8443
+#   handshakeTimeout: 10s
+#   maxPendingConnections: 256
 
 # TLS 证书文件
 tls:
   cert: ./cert.pem
   key: ./key.pem
 
-# 混淆（可选，需要客户端也配置相同密码）
-# obfs:
-#   type: salamander
-#   salamander:
-#     password: your_obfs_password
+# 当前未实现 obfs 或 masquerade；配置这两个段会明确报错。
 
 # QUIC 参数调优（可选）
 # quic:
 #   maxIdleTimeout: 30s
 #   maxIncomingStreams: 1024
-
-# 伪装（可选，用于抗审查）
-# masquerade:
-#   type: proxy
-#   proxy:
-#     url: https://www.bing.com
-#     rewriteHost: true
 
 # ============================================================
 # 管理后台（必须只绑定 loopback）
