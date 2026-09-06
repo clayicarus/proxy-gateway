@@ -5,12 +5,15 @@
 ## 已完成
 
 - [x] Hysteria2 Gateway 入口与 Direct、Hysteria2 出站
+- [x] 可选 Trojan TCP CONNECT 入站、SHA-224 凭据索引及启动授权快照
+- [x] Trojan 有界 parser、TLS 首包期限、未认证并发上限与计量 relay
 - [x] `username:node:password` 认证和显式多节点授权
 - [x] fail-closed 路由，不提供服务端隐式 fallback
 - [x] SQLite 用户、节点、授权、token、流量、revision、重启和进程历史
 - [x] 旧 YAML `migrate` 与 `migrate --replace-users`
 - [x] 用户软删除、到期、密码重置和订阅 token 重置
 - [x] 按配置时区的自然月 `tx + rx` 配额
+- [x] 跨月待刷盘流量隔离、失败重试及额度读取失败时拒绝流量
 - [x] 用户总下载限速和超额/到期/停用连接关闭
 - [x] 本地管理 Web 与 CSRF 防护
 - [x] 基本信息、用户管理、活跃连接、成本分析和故障分析页面
@@ -20,9 +23,15 @@
 - [x] systemd watchdog 和优雅停机
 - [x] 节点并发预热、故障隔离、运行状态、DNS 刷新和后台退避重连
 - [x] 单元、集成、真实 Hysteria2 链路和路由并发测试
+- [x] Trojan Direct/Hy2 两跳、策略、限速取消、并发与资源边界测试
+- [x] Go 测试、race、vet、parser fuzz 和 Linux CI 验收入口
 
 ## 近期候选
 
+- [ ] Trojan 第二期：Clash.Meta 订阅、后台配置可见性；详见 `TROJAN_INBOUND_TODO.md`
+- [ ] 独立 Trojan 凭据表与按协议撤销、轮换、审计
+- [ ] 设计 Trojan UDP ASSOCIATE；TCP 第一期明确拒绝 UDP 与 BIND
+- [ ] 为 Hysteria2 的 obfs/masquerade 完成运行时接入和真实链路验证；当前配置明确拒绝
 - [ ] 流量明细保留策略：把历史 `traffic_logs` 聚合为日桶并删除过细记录
 - [ ] 数据库备份、恢复和完整性检查操作手册
 - [ ] 审计日志：记录管理员写操作，不记录用户明文密码或订阅 token

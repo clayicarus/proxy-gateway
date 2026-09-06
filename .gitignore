@@ -6,8 +6,8 @@ build/
 *.pem
 *.crt
 *.key
-gateway
-proxy-gateway
+/gateway
+/proxy-gateway
 *.db
 *.db-shm
 *.db-wal

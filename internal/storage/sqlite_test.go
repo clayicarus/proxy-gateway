@@ -312,6 +312,17 @@ func TestSQLiteStore_ReplaceLegacyUsersPreservesNodesAndTraffic(t *testing.T) {
 	if err != nil || len(users) != 1 || users[0].Username != "bob" {
 		t.Fatalf("failed replacement was not rolled back: %#v err=%v", users, err)
 	}
+	if err := store.SaveNode("node1", initial.Nodes["node1"], false); err != nil {
+		t.Fatal(err)
+	}
+	invalid.Users["charlie"] = config.UserConfig{Password: "password", Routes: []string{"node1"}}
+	if err := store.ReplaceLegacyUsers(invalid, func(username string) string { return "invalid-" + username }); err == nil {
+		t.Fatal("disabled node should reject replacement before deleting existing users")
+	}
+	users, err = store.ListUsers()
+	if err != nil || len(users) != 1 || users[0].Username != "bob" {
+		t.Fatal("rejected disabled-node replacement changed existing users")
+	}
 }
 
 func TestSQLiteStore_UpdateUserOnlyRevisionsRouteChanges(t *testing.T) {

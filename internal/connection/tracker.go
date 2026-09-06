@@ -53,7 +53,7 @@ func (t *Tracker) Connect(addr net.Addr, id string) {
 		ip = host
 	}
 	t.mu.Lock()
-	t.sessions[address] = &session{
+	t.sessions[sessionKey(addr)] = &session{
 		clientAddr: address,
 		clientIP:   ip,
 		username:   username,
@@ -66,7 +66,7 @@ func (t *Tracker) Connect(addr net.Addr, id string) {
 
 func (t *Tracker) Disconnect(addr net.Addr) {
 	t.mu.Lock()
-	delete(t.sessions, addr.String())
+	delete(t.sessions, sessionKey(addr))
 	t.mu.Unlock()
 }
 
@@ -90,9 +90,15 @@ func udpKey(sessionID uint32) string {
 	return "udp:" + strconv.FormatUint(uint64(sessionID), 10)
 }
 
+// Trojan TCP and Hysteria2 UDP peers may share the same IP and port.
+// Keep their internal identities distinct while displaying the original addr.
+func sessionKey(addr net.Addr) string {
+	return addr.Network() + "/" + addr.String()
+}
+
 func (t *Tracker) startRequest(addr net.Addr, key, protocol, target string) {
 	t.mu.Lock()
-	if current := t.sessions[addr.String()]; current != nil {
+	if current := t.sessions[sessionKey(addr)]; current != nil {
 		current.requests[key] = append(current.requests[key], Request{Protocol: protocol, Target: target, StartedAt: time.Now().UTC()})
 	}
 	t.mu.Unlock()
@@ -100,7 +106,7 @@ func (t *Tracker) startRequest(addr net.Addr, key, protocol, target string) {
 
 func (t *Tracker) stopRequest(addr net.Addr, key string) {
 	t.mu.Lock()
-	if current := t.sessions[addr.String()]; current != nil {
+	if current := t.sessions[sessionKey(addr)]; current != nil {
 		requests := current.requests[key]
 		if len(requests) <= 1 {
 			delete(current.requests, key)

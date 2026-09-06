@@ -166,7 +166,7 @@ func (s *SQLiteStore) FlushTraffic(records []TrafficRecord) error {
 		ON CONFLICT(user_id, node_id) DO UPDATE SET
 			tx_total = tx_total + excluded.tx_total,
 			rx_total = rx_total + excluded.rx_total,
-			updated_at = excluded.updated_at
+			updated_at = MAX(traffic_summary.updated_at, excluded.updated_at)
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare upsert summary: %w", err)

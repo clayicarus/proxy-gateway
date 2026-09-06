@@ -1,0 +1,14 @@
+.git
+.github
+build
+*.exe
+*.test
+*.out
+*.db
+*.db-*
+*.pem
+*.crt
+*.key
+.env
+grill-with-docs-questions.txt
+proxy-gateway-audit-report.txt

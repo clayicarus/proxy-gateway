@@ -139,3 +139,41 @@ func TestDatabaseSubscriptionEscapesYAMLSpecialCharacters(t *testing.T) {
 		t.Fatalf("special characters did not round trip: %#v", decoded.Proxies)
 	}
 }
+
+func TestDatabaseSubscriptionDirectUsesGatewayTLSParameters(t *testing.T) {
+	store, err := storage.NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	node := config.NodeConfig{Type: "hysteria2", Hysteria2: &config.Hysteria2OutboundConfig{Addr: "node.example:443", Auth: "node-password"}}
+	if err := store.SaveNode("node1", node, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateUser(storage.ManagedUserInput{Username: "alice", Password: "gateway-password", Routes: []string{"direct", "node1"}}, "subscription-token"); err != nil {
+		t.Fatal(err)
+	}
+	users := map[string]config.UserConfig{"alice": {Routes: []string{"direct", "node1"}}}
+	cfg := &config.Config{Sub: &config.SubConfig{ServerAddr: "gateway.example:8443", SNI: "certificate.example", Insecure: true}}
+	handler := NewDatabaseSubscriptionHandler(cfg, store, users, map[string]config.NodeConfig{"node1": node}, zap.NewNop()).Handler()
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://sub.example/sub/subscription-token", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("subscription status=%d", response.Code)
+	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatal("bearer subscription response may be cached")
+	}
+	var decoded managedClashConfig
+	if err := yaml.Unmarshal(response.Body.Bytes(), &decoded); err != nil {
+		t.Fatal("subscription is not valid YAML")
+	}
+	if len(decoded.Proxies) != 2 {
+		t.Fatalf("proxy count=%d, want 2", len(decoded.Proxies))
+	}
+	for _, proxy := range decoded.Proxies {
+		if proxy.Server != "gateway.example" || proxy.Port != 8443 || proxy.SNI != "certificate.example" || !proxy.Insecure || proxy.Type != "hysteria2" {
+			t.Fatalf("proxy %q did not inherit Gateway transport parameters", proxy.Name)
+		}
+	}
+}

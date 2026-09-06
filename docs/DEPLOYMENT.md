@@ -2,7 +2,7 @@
 
 ## 前置条件
 
-- Gateway 主机和可用的 UDP 公网端口
+- Gateway 主机和可用的 UDP 公网端口；启用 Trojan 时还需 TCP 公网端口
 - 可选的远端 Hysteria2 Node
 - TLS 证书与私钥文件
 - 构建环境使用 Go 1.24+ 和 C 编译器；运行环境不需要 Go
@@ -21,6 +21,8 @@ CGO_ENABLED=1 go test ./...
 
 跨平台编译还需要目标平台的 C 交叉工具链。最省事的方式是在目标 Linux 主机上构建，或使用项目 Dockerfile。
 
+Windows 可使用已有 Conda/MinGW GCC，运行 `scripts/check.ps1`，通过 `-GoBin` 和 `-CCompiler` 指定安装路径。默认执行全量测试、race、vet、30 秒 fuzz、构建和格式检查；不依赖 Docker。Linux 的对应入口为 `make check`。
+
 ## 2. TLS 证书
 
 Gateway 只加载 YAML 中 `tls.cert` 和 `tls.key` 指定的证书文件。部署时把证书和私钥放到 service 用户可读的位置。使用自签证书测试时，生成的订阅必须配置 `sub.insecure: true`，或让客户端信任该证书：
@@ -28,7 +30,8 @@ Gateway 只加载 YAML 中 `tls.cert` 和 `tls.key` 指定的证书文件。部�
 ```bash
 openssl ecparam -genkey -name prime256v1 -out key.pem
 openssl req -new -x509 -key key.pem -out cert.pem -days 365 \
-  -subj "/CN=gateway.example.com"
+  -subj "/CN=gateway.example.com" \
+  -addext "subjectAltName=DNS:gateway.example.com"
 ```
 
 域名证书通常不包含 IP SAN。客户端用 IP 连接但仍校验证书时会收到 `cannot validate certificate ... because it doesn't contain any IP SANs`；应使用证书覆盖的域名作为 `sub.serverAddr`，并设置一致的 `sub.sni`。
@@ -40,15 +43,17 @@ openssl req -new -x509 -key key.pem -out cert.pem -days 365 \
 ```yaml
 listen: :8443
 
+# 可选 TCP/TLS 入站；删除该段可禁用 Trojan。
+trojan:
+  listen: :8443
+  handshakeTimeout: 10s
+  maxPendingConnections: 256
+
 tls:
   cert: /etc/proxy-gateway/cert.pem
   key: /etc/proxy-gateway/key.pem
 
-# 可选，客户端需配置同一密码
-# obfs:
-#   type: salamander
-#   salamander:
-#     password: change_me
+# 当前不支持 obfs、masquerade 或协议 fallback。
 
 # 可选的 QUIC 参数
 # quic:
@@ -79,10 +84,15 @@ systemd:
 | 配置 | 协议 | 用途 |
 |---|---|---|
 | `listen: :8443` | UDP/QUIC | Hysteria2 客户端流量入口 |
+| `trojan.listen: :8443` | TCP/TLS | 可选 Trojan TCP CONNECT 入口 |
 | `admin.listen: 127.0.0.1:9090` | HTTP/TCP | 本地管理后台 |
 | `sub.listen: 127.0.0.1:9091` | HTTP/TCP | 订阅内容服务 |
 
 `sub.publicURL` 是后台展示给用户的订阅链接前缀；`sub.serverAddr` 是生成配置里代理连接 Gateway 的公网地址。订阅服务不是 QUIC 网站，也不处理 Gateway UDP 端口上的 `/sub` 路径。
+
+启用订阅时，`sub.serverAddr` 必须显式提供主机与端口，不能从通配监听地址推断。Trojan 第一期使用 [README 中的手工客户端配置](../README.md#4-客户端连接)，现有订阅仍只下发 Hysteria2。客户端 password 填入 `username:node:user.password`，不是 SHA-224 哈希；`udp` 设为 `false`。
+
+Trojan 与 Hysteria2 可共用数字端口，因为一个使用 TCP、一个使用 UDP。Trojan 与 Nginx、后台、订阅 HTTP 则不能绑定相同 TCP 地址；例如启用 `trojan.listen: :443` 后，需给 Nginx HTTPS 选择不同 TCP 端口或独立 IP。
 
 用户、节点和授权都在首次启动后通过后台创建。正常运行 YAML 不应包含 `users`、`nodes` 或 `fallback`。
 
@@ -152,7 +162,7 @@ journalctl -u proxy-gateway.service -f
 
 watchdog 能处理“进程存在但应用不再发送健康心跳”的假死，超时后 systemd 会终止并按 `Restart=on-failure` 重启。僵尸进程本身已经退出，systemd 会根据主进程状态处理；watchdog不是僵尸回收机制。当前心跳要求 Hysteria2 serve loop 正常且 SQLite 可 `Ping`，远端 Node 故障不会重启整个 Gateway。
 
-管理后台和订阅服务在启动阶段同步绑定 TCP 端口。地址无效或端口占用会直接 fatal；启动后的 HTTP serve loop 异常退出也会让主进程以失败状态退出，避免 Gateway 存活但后台永久不可用。
+管理后台、订阅服务和 Trojan 在启动阶段同步绑定 TCP 端口。地址无效或端口占用会直接失败；启动后的任一 serve loop 异常退出也会让主进程以失败状态退出。
 
 ## 5. 后台重启权限
 
@@ -226,6 +236,8 @@ systemctl start proxy-gateway.service
 
 旧 YAML 必须包含用户、节点，以及 `sub.secret` 或回退使用的 `api.secret`。迁移在一个事务中导入用户、节点、授权，并保存旧 HMAC token 的哈希。数据库已有管理用户或已迁移时会拒绝覆盖。
 
+运行和迁移都采用严格 YAML 解析。迁移前从旧 YAML 删除已废弃的 `fallback` 和未实现的 `obfs`、`masquerade`；未知字段及多个 YAML 文档会明确报错。
+
 如果数据库用户表已错误，需要以旧 YAML 完整重建用户和授权：
 
 ```bash
@@ -236,7 +248,7 @@ sudo -u proxygateway /usr/local/bin/proxy-gateway migrate --replace-users \
 systemctl start proxy-gateway.service
 ```
 
-`--replace-users` 会删除 YAML 中不存在的管理用户，并替换密码、额度、限速和授权；节点、流量、进程和重启历史保留。YAML 引用的非 `direct` 节点必须已存在于数据库，任何失败都会回滚整个事务。
+`--replace-users` 会删除 YAML 中不存在的管理用户，并替换密码、额度、限速和授权；节点、流量、进程和重启历史保留。YAML 引用的非 `direct` 节点必须已存在于数据库且处于启用状态，任何失败都会回滚整个事务。
 
 ## 9. 验证
 
@@ -246,7 +258,7 @@ systemctl start proxy-gateway.service
 # 后台 HTTP 可达
 curl -I http://127.0.0.1:9090/
 
-# 监听端口；8443 应为 UDP，9090/9091 应为 TCP
+# 监听端口；8443 为 UDP，启用 Trojan 时还应有 TCP；9090/9091 为 TCP
 ss -lntup | grep proxy-gateway
 
 # 数据库完整性与用户数量
@@ -282,6 +294,9 @@ IPv6 字面量必须使用方括号，例如 `--server '[2001:db8::10]:8443'` �
 # Gateway Hysteria2 入口
 ufw allow 8443/udp
 
+# 可选 Trojan 入口
+ufw allow 8443/tcp
+
 # Nginx 公网 HTTPS（发布订阅时）
 ufw allow 443/tcp
 
@@ -292,19 +307,21 @@ ufw allow 443/tcp
 
 ## 11. Docker 限制
 
-基本容器运行示例：
+Dockerfile 使用 Go 1.24、CGO 与 C 编译器构建，运行镜像包含 CA 和时区数据。本轮 Go 验收不要求 Docker 构建；容器部署还需在目标环境验证。
+
+Linux 上可使用 host 网络保留后台和订阅的 loopback 绑定：
 
 ```bash
 docker run -d \
   --name proxy-gateway \
   --restart unless-stopped \
+  --network host \
   -v /etc/proxy-gateway:/etc/proxy-gateway:ro \
   -v /var/lib/proxy-gateway:/var/lib/proxy-gateway \
-  -p 8443:8443/udp \
-  -p 127.0.0.1:9090:9090/tcp \
-  -p 127.0.0.1:9091:9091/tcp \
   proxy-gateway -c /etc/proxy-gateway/gateway.yaml
 ```
+
+host 网络使用配置中的实际端口。普通 bridge 模式的 `-p` 端口映射不能访问容器内仅绑定 `127.0.0.1` 的后台；不能通过改为无鉴权公网绑定来解决。Docker Desktop 的网络行为需另行验证。
 
 普通容器内无法访问宿主 systemd D-Bus，也不会获得 systemd watchdog 环境。因此后台重启、进程级 systemd 状态、watchdog 和 `ExecStopPost` 退出记录不可用；容器重启应交给 Docker 或外部编排器。不要为了这些功能把宿主 D-Bus 和高权限直接暴露进容器。
 
@@ -330,8 +347,8 @@ Gateway 启动时最多并发预连接 8 个 Node，等待首轮结果最多 10 
 
 ### 流量统计有延迟
 
-SQLite 默认每 10 秒写入一次，进程被强制终止时最多损失一个 flush 周期。正常 flush 使用事务；写入失败会把整批增量恢复到内存，并在下一个周期重试。实时速度来自后台 `/live` 的内存快照；范围查询会先触发一次 flush。所有数值都是有效负载，不含协议包头和重传。
+SQLite 默认每 10 秒写入一次，正常持久化期间进程被强制终止时最多损失一个 flush 周期。正常 flush 使用事务；写入失败会保留整批增量及其所属自然月，在下个周期重试；持续写入故障期间未落盘数据会继续积累。读取月度用量失败时拒绝新流量，避免额度归零。实时速度来自后台 `/live` 的内存快照；范围查询会先触发一次 flush。所有数值都是有效负载，不含协议包头和重传。
 
 ### 停用或到期后旧连接仍短暂存在
 
-生命周期状态最多约 2 秒刷新。刷新后新连接会被拒绝；已有会话的下一笔 TCP/UDP 有效负载会在转发和计量前被拒绝，随后关闭整条 QUIC 连接。完全空闲的连接不会被后台主动扫描并立刻关闭，仍可能显示在活跃连接中，直到客户端断开、再次发送流量、QUIC idle timeout 或 Gateway 重启。这是当前 Hysteria2 server API 未提供按用户主动关闭空闲连接所带来的限制，不代表过期用户仍可继续传输数据。
+生命周期状态最多约 2 秒刷新。刷新后新连接会被拒绝；已有会话的下一笔有效负载会在转发和计量前被拒绝，随后关闭 QUIC 连接或 Trojan TCP 会话。下载限速中的等待会因停用、到期或策略变更而唤醒；Trojan 连接断开也会取消该连接的等待。完全空闲的连接不会被后台主动扫描清理，仍可能显示在活跃连接中，直到客户端断开、再次发送流量、QUIC idle timeout（仅 Hysteria2）或 Gateway 重启。
