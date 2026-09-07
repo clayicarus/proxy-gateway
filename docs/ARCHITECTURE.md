@@ -67,34 +67,26 @@ username:node:password
 
 第一个冒号前是用户名，第二段是客户端明确选择的节点，剩余内容是密码，因此密码可以包含冒号。Authenticator 同时检查用户状态、到期时间、密码和节点授权，成功后返回 `username:node` 作为连接 ID。
 
-Hysteria2 的 `Outbound` 接口只携带目标地址，不携带连接 ID。上游当前调用顺序是：
-
-```text
-EventLogger.TCPRequest(addr, id, target)
-Outbound.TCP(target)
-```
-
-UDP 请求也遵循对应顺序。EventLogger 将 `{protocol, id, target}` 放入容量为 1 的 channel，紧随其后的 RoutingOutbound 取出并校验协议和目标，再从 ID 解析节点。这个短交接段会串行化，实际拨号和数据转发仍然并发。
+Hy2 adapter 在认证成功时将 `username:node` 绑定到私有 session。每次 TCP/UDP 请求都由上游携带该 session 和稳定 request ID 回调 adapter；adapter 将 ID 与目标显式传给协议无关的 `router.Service`，不使用 event callback、channel 或按目标匹配来交接身份。
 
 ```mermaid
 sequenceDiagram
     participant C as 客户端
     participant A as Authenticator
-    participant E as EventLogger
-    participant R as RoutingOutbound
+    participant H as Hy2 adapter/session
+    participant R as router.Service
     participant O as 显式节点 Outbound
 
     C->>A: auth = alice:node1:password
     A-->>C: id = alice:node1
-    C->>E: TCPRequest(target, id)
-    E->>R: handoff(protocol, id, target)
-    C->>R: TCP(target)
-    R->>R: 校验 handoff 并解析 node1
+    C->>H: TCP request(session, request ID, target)
+    H->>R: TCPContext(id, target)
+    R->>R: 解析 node1
     R->>O: TCP(target)
     O-->>C: 双向 relay
 ```
 
-路由采用 fail-closed：上下文缺失或错配、ID 缺少节点、节点不存在、节点未授权或拨号失败都直接报错。服务端不会替换为 `direct`，也不会自动选择其他节点。客户端可在订阅中拿到多个获授权的代理条目，并在客户端侧配置选择或故障切换。
+路由采用 fail-closed：session 类型无效、ID 缺少节点、节点不存在、节点未授权或拨号失败都直接报错。服务端不会替换为 `direct`，也不会自动选择其他节点。客户端可在订阅中拿到多个获授权的代理条目，并在客户端侧配置选择或故障切换。
 
 ## 出站生命周期
 
@@ -117,7 +109,7 @@ Hysteria2 将认证 ID、`tx` 和 `rx` 交给 TrafficLogger。Gateway 按 `usern
 
 停用、到期或超额后，Authenticator 拒绝新连接；TrafficLogger 在已有会话产生下一笔流量时、转发和计量该有效负载之前返回 false，使 Hysteria2 关闭整条客户端 QUIC 连接。完全空闲的会话不会被主动清理，可能继续出现在活跃连接中，直到客户端断开、再次产生流量、QUIC idle timeout 或 Gateway 重启；当前上游 server API 没有暴露按用户关闭空闲 QUIC 连接的句柄。密码重置只影响后续认证。
 
-`TraceStream`、`UntraceStream` 与 EventLogger 共同维护内存中的连接和目标快照，管理后台的 `/live` 每 2 秒读取该快照。连接明细不持久化。
+`TraceStream`、`UntraceStream` 与 adapter 的 session/request 回调共同维护内存中的连接和目标快照，管理后台的 `/live` 每 2 秒读取该快照。连接明细不持久化。
 
 ## 管理与订阅
 
@@ -143,8 +135,8 @@ internal/api/         管理 Web、静态资源和订阅 handler
 internal/auth/        auth 解析、鉴权和用户快照更新
 internal/config/      启动 YAML 与旧 YAML 类型
 internal/connection/  活跃连接和请求追踪
-internal/event/       上游事件和请求上下文交接
-internal/router/      路由决策、出站工厂与出站实现
+internal/inbound/     协议 adapter 与协议库边界
+internal/router/      协议无关的路由决策、出站工厂与出站实现
 internal/storage/     SQLite schema、迁移和查询
 internal/subtoken/    随机 token 与旧 HMAC token
 internal/systemd/     D-Bus 和 sd_notify
@@ -155,7 +147,7 @@ test/e2e/             真实 Hysteria2 请求链路测试
 
 ## 关键约束
 
-- Hysteria2 上游若改变 EventLogger 与 Outbound 的调用时序，必须重新验证上下文交接。
+- Hysteria2 上游若改变 session/request callback 或取消语义，必须重新验证 adapter 的身份、计量和关闭边界。
 - SQLite 是单实例控制面，不支持多个 Gateway 进程共享运行配置。
 - 节点和授权不是热更新，后台必须清楚展示保存 revision 与运行 revision。
 - `direct` 是特殊的显式节点，不存入 `managed_nodes`。

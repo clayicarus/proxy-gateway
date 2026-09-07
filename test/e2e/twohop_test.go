@@ -11,7 +11,8 @@ import (
 	hyServer "github.com/apernet/hysteria/core/v2/server"
 	"github.com/clayicarus/proxy-gateway/internal/auth"
 	"github.com/clayicarus/proxy-gateway/internal/config"
-	"github.com/clayicarus/proxy-gateway/internal/event"
+	"github.com/clayicarus/proxy-gateway/internal/connection"
+	hyInbound "github.com/clayicarus/proxy-gateway/internal/inbound/hysteria2"
 	"github.com/clayicarus/proxy-gateway/internal/router"
 	"github.com/clayicarus/proxy-gateway/internal/traffic"
 	"go.uber.org/zap"
@@ -118,8 +119,8 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 		t.Fatalf("failed to warm up node outbound: %v", err)
 	}
 	warmupCancel()
-	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
-	eventLogger := event.NewEventLogger(routingOutbound, logger)
+	routingService := router.NewService(routerEngine, outboundFactory, logger)
+	adapter := hyInbound.New("two-hop", authenticator, routingService, trafficLogger, connection.NewTracker(), logger)
 
 	gatewayUDP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
@@ -132,11 +133,11 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 		TLSConfig: hyServer.TLSConfig{
 			Certificates: []tls.Certificate{gatewayCert},
 		},
-		Conn:          gatewayUDP,
-		Authenticator: authenticator,
-		Outbound:      routingOutbound,
-		TrafficLogger: trafficLogger,
-		EventLogger:   eventLogger,
+		Conn:                 gatewayUDP,
+		SessionAuthenticator: adapter,
+		SessionOutbound:      adapter,
+		SessionTrafficLogger: adapter,
+		SessionEventLogger:   adapter,
 	})
 	if err != nil {
 		t.Fatalf("failed to create gateway server: %v", err)

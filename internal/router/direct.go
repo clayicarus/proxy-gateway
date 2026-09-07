@@ -5,12 +5,8 @@ import (
 	"net"
 	"time"
 
-	hyServer "github.com/apernet/hysteria/core/v2/server"
 	"go.uber.org/zap"
 )
-
-// Compile-time check.
-var _ hyServer.Outbound = (*DirectOutbound)(nil)
 
 // DirectOutbound connects directly to the target address.
 type DirectOutbound struct {
@@ -31,11 +27,11 @@ func (d *DirectOutbound) TCPContext(ctx context.Context, reqAddr string) (net.Co
 	return conn, nil
 }
 
-func (d *DirectOutbound) UDP(reqAddr string) (hyServer.UDPConn, error) {
+func (d *DirectOutbound) UDP(reqAddr string) (UDPConn, error) {
 	return d.UDPContext(context.Background(), reqAddr)
 }
 
-func (d *DirectOutbound) UDPContext(ctx context.Context, _ string) (hyServer.UDPConn, error) {
+func (d *DirectOutbound) UDPContext(ctx context.Context, _ string) (UDPConn, error) {
 	conn, err := (&net.ListenConfig{}).ListenPacket(ctx, "udp", "")
 	if err != nil {
 		return nil, err
@@ -43,7 +39,7 @@ func (d *DirectOutbound) UDPContext(ctx context.Context, _ string) (hyServer.UDP
 	return &directUDPConn{conn: conn}, nil
 }
 
-// directUDPConn wraps net.PacketConn to implement hyServer.UDPConn.
+// directUDPConn wraps net.PacketConn as a protocol-neutral UDP association.
 type directUDPConn struct {
 	conn net.PacketConn
 }

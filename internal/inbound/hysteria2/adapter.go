@@ -23,13 +23,13 @@ var globalSessionID atomic.Uint64
 type Adapter struct {
 	inbound string
 	auth    *auth.Authenticator
-	router  *router.RoutingOutbound
+	router  *router.Service
 	traffic *traffic.TrafficLogger
 	tracker *connection.Tracker
 	logger  *zap.Logger
 }
 
-func New(inbound string, authenticator *auth.Authenticator, routing *router.RoutingOutbound, accounting *traffic.TrafficLogger, tracker *connection.Tracker, logger *zap.Logger) *Adapter {
+func New(inbound string, authenticator *auth.Authenticator, routing *router.Service, accounting *traffic.TrafficLogger, tracker *connection.Tracker, logger *zap.Logger) *Adapter {
 	return &Adapter{inbound: inbound, auth: authenticator, router: routing, traffic: accounting, tracker: tracker, logger: logger}
 }
 

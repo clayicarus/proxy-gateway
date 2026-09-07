@@ -98,7 +98,7 @@ func runGateway(args []string) error {
 	trafficLogger := traffic.NewTrafficLoggerWithLocation(users, store, logger, location)
 	routerEngine := router.NewRouter(users, logger)
 	outboundFactory := router.NewOutboundFactory(nodes, logger)
-	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
+	routingService := router.NewService(routerEngine, outboundFactory, logger)
 	connectionTracker := connection.NewTracker()
 
 	// Load TLS before acquiring listeners so certificate failure owns no bound
@@ -171,7 +171,7 @@ func runGateway(args []string) error {
 			cleanupConstructed()
 			return fmt.Errorf("inbound %s listen: %w", inbound.Name, err)
 		}
-		adapter := hyInbound.New(inbound.Name, authenticator, routingOutbound, trafficLogger, connectionTracker, logger)
+		adapter := hyInbound.New(inbound.Name, authenticator, routingService, trafficLogger, connectionTracker, logger)
 		server, err := hyServer.NewServer(&hyServer.Config{
 			TLSConfig:  hyServer.TLSConfig{Certificates: []tls.Certificate{tlsCert}},
 			QUICConfig: buildInboundQUICConfig(inbound.QUIC), Conn: udpConn,

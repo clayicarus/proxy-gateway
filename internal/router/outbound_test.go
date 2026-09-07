@@ -14,7 +14,6 @@ import (
 	"time"
 
 	coreErrors "github.com/apernet/hysteria/core/v2/errors"
-	hyServer "github.com/apernet/hysteria/core/v2/server"
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"go.uber.org/zap"
 )
@@ -145,7 +144,7 @@ type fakeConnectedOutbound struct {
 }
 
 func (f *fakeConnectedOutbound) TCP(string) (net.Conn, error) { return nil, f.tcpErr }
-func (f *fakeConnectedOutbound) UDP(string) (hyServer.UDPConn, error) {
+func (f *fakeConnectedOutbound) UDP(string) (UDPConn, error) {
 	return nil, f.tcpErr
 }
 func (f *fakeConnectedOutbound) Close() error {
@@ -431,7 +430,7 @@ func TestOutboundFactory_Unknown(t *testing.T) {
 	}
 }
 
-func TestRoutingOutbound_UserContext(t *testing.T) {
+func TestServiceRoutesExplicitIdentity(t *testing.T) {
 	logger := zap.NewNop()
 	nodes := map[string]config.NodeConfig{}
 
@@ -439,9 +438,7 @@ func TestRoutingOutbound_UserContext(t *testing.T) {
 		"alice": {Password: "p", Routes: []string{"direct"}},
 	}, logger)
 	f := NewOutboundFactory(nodes, logger)
-	ro := NewRoutingOutbound(r, f, logger)
-
-	addr := &net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 12345}
+	service := NewService(r, f, logger)
 
 	// Create a local listener for the test
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -457,10 +454,7 @@ func TestRoutingOutbound_UserContext(t *testing.T) {
 		}
 	}()
 
-	// Set request context (simulating EventLogger.TCPRequest)
-	ro.SetRequestContext(addr, "alice:direct", "tcp", ln.Addr().String())
-
-	conn, err := ro.TCP(ln.Addr().String())
+	conn, err := service.TCPContext(context.Background(), "alice:direct", ln.Addr().String())
 	if err != nil {
 		t.Fatalf("routing TCP failed: %v", err)
 	}
@@ -468,30 +462,15 @@ func TestRoutingOutbound_UserContext(t *testing.T) {
 
 }
 
-func TestRoutingOutbound_MissingOrMismatchedContextFailsClosed(t *testing.T) {
+func TestServiceRejectsMalformedIdentity(t *testing.T) {
 	logger := zap.NewNop()
-	ro := NewRoutingOutbound(NewRouter(nil, logger), NewOutboundFactory(nil, logger), logger)
-
-	if _, err := ro.TCP("example.com:443"); err == nil || !strings.Contains(err.Error(), "context missing") {
-		t.Fatalf("TCP without context should fail closed, got %v", err)
-	}
-	if _, err := ro.UDP("example.com:443"); err == nil || !strings.Contains(err.Error(), "context missing") {
-		t.Fatalf("UDP without context should fail closed, got %v", err)
-	}
-
-	addr := &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 12345}
-	ro.SetRequestContext(addr, "alice:direct", "tcp", "expected.example:443")
-	if _, err := ro.TCP("other.example:443"); err == nil || !strings.Contains(err.Error(), "context mismatch") {
-		t.Fatalf("mismatched context should fail closed, got %v", err)
-	}
-
-	ro.SetRequestContext(addr, "alice", "tcp", "example.com:443")
-	if _, err := ro.TCP("example.com:443"); err == nil || !strings.Contains(err.Error(), "node is required") {
+	service := NewService(NewRouter(nil, logger), NewOutboundFactory(nil, logger), logger)
+	if _, err := service.TCPContext(context.Background(), "alice", "example.com:443"); err == nil || !strings.Contains(err.Error(), "node is required") {
 		t.Fatalf("authenticated ID without an explicit node should fail closed, got %v", err)
 	}
 }
 
-func TestRoutingOutbound_ConcurrentSameTargetKeepsUserRoute(t *testing.T) {
+func TestServiceConcurrentSameTargetKeepsExplicitRoute(t *testing.T) {
 	logger := zap.NewNop()
 	const requests = 100
 	nodes := make(map[string]config.NodeConfig, requests)
@@ -499,7 +478,7 @@ func TestRoutingOutbound_ConcurrentSameTargetKeepsUserRoute(t *testing.T) {
 		route := fmt.Sprintf("route-%03d", i)
 		nodes[route] = config.NodeConfig{Type: "test-invalid"}
 	}
-	ro := NewRoutingOutbound(NewRouter(nil, logger), NewOutboundFactory(nodes, logger), logger)
+	service := NewService(NewRouter(nil, logger), NewOutboundFactory(nodes, logger), logger)
 
 	var wg sync.WaitGroup
 	errors := make(chan error, requests)
@@ -509,9 +488,7 @@ func TestRoutingOutbound_ConcurrentSameTargetKeepsUserRoute(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			route := fmt.Sprintf("route-%03d", i)
-			addr := &net.UDPAddr{IP: net.ParseIP("192.0.2.20"), Port: 20000 + i}
-			ro.SetRequestContext(addr, "user:"+route, "tcp", "same.example:443")
-			_, err := ro.TCP("same.example:443")
+			_, err := service.TCPContext(context.Background(), "user:"+route, "same.example:443")
 			if err == nil || !strings.Contains(err.Error(), "node "+route+" unavailable:") {
 				errors <- fmt.Errorf("request %d used wrong route: %v", i, err)
 			}

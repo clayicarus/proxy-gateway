@@ -22,7 +22,6 @@ import (
 	"github.com/clayicarus/proxy-gateway/internal/auth"
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"github.com/clayicarus/proxy-gateway/internal/connection"
-	"github.com/clayicarus/proxy-gateway/internal/event"
 	hyInbound "github.com/clayicarus/proxy-gateway/internal/inbound/hysteria2"
 	"github.com/clayicarus/proxy-gateway/internal/router"
 	"github.com/clayicarus/proxy-gateway/internal/traffic"
@@ -245,9 +244,9 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
 	routerEngine := router.NewRouter(users, logger)
 	outboundFactory := router.NewOutboundFactory(nodes, logger)
-	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
+	routingService := router.NewService(routerEngine, outboundFactory, logger)
 	tracker := connection.NewTracker()
-	adapter := hyInbound.New("hy2-e2e", authenticator, routingOutbound, trafficLogger, tracker, logger)
+	adapter := hyInbound.New("hy2-e2e", authenticator, routingService, trafficLogger, tracker, logger)
 
 	// --- 4. Start Hysteria2 server ---
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
@@ -481,8 +480,8 @@ func TestHy2E2E_UnknownUser(t *testing.T) {
 	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
 	routerEngine := router.NewRouter(users, logger)
 	outboundFactory := router.NewOutboundFactory(nodes, logger)
-	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
-	eventLogger := event.NewEventLogger(routingOutbound, logger)
+	routingService := router.NewService(routerEngine, outboundFactory, logger)
+	adapter := hyInbound.New("unknown-user", authenticator, routingService, trafficLogger, connection.NewTracker(), logger)
 
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
@@ -493,11 +492,11 @@ func TestHy2E2E_UnknownUser(t *testing.T) {
 		TLSConfig: hyServer.TLSConfig{
 			Certificates: []tls.Certificate{tlsCert},
 		},
-		Conn:          udpConn,
-		Authenticator: authenticator,
-		Outbound:      routingOutbound,
-		TrafficLogger: trafficLogger,
-		EventLogger:   eventLogger,
+		Conn:                 udpConn,
+		SessionAuthenticator: adapter,
+		SessionOutbound:      adapter,
+		SessionTrafficLogger: adapter,
+		SessionEventLogger:   adapter,
 	})
 	if err != nil {
 		t.Fatalf("failed to create hy2 server: %v", err)
@@ -565,18 +564,19 @@ func TestHy2E2E_ExpiredUserDisconnectsExistingConnection(t *testing.T) {
 	}
 	authenticator := auth.NewAuthenticator(users, logger)
 	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
-	routingOutbound := router.NewRoutingOutbound(router.NewRouter(users, logger), router.NewOutboundFactory(nil, logger), logger)
+	routingService := router.NewService(router.NewRouter(users, logger), router.NewOutboundFactory(nil, logger), logger)
+	adapter := hyInbound.New("expiry", authenticator, routingService, trafficLogger, connection.NewTracker(), logger)
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
 	server, err := hyServer.NewServer(&hyServer.Config{
-		TLSConfig:     hyServer.TLSConfig{Certificates: []tls.Certificate{tlsCert}},
-		Conn:          udpConn,
-		Authenticator: authenticator,
-		Outbound:      routingOutbound,
-		TrafficLogger: trafficLogger,
-		EventLogger:   event.NewEventLogger(routingOutbound, logger),
+		TLSConfig:            hyServer.TLSConfig{Certificates: []tls.Certificate{tlsCert}},
+		Conn:                 udpConn,
+		SessionAuthenticator: adapter,
+		SessionOutbound:      adapter,
+		SessionTrafficLogger: adapter,
+		SessionEventLogger:   adapter,
 	})
 	if err != nil {
 		t.Fatal(err)

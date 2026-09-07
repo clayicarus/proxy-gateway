@@ -8,14 +8,11 @@ import (
 	"sync"
 
 	hyClient "github.com/apernet/hysteria/core/v2/client"
-	hyServer "github.com/apernet/hysteria/core/v2/server"
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"go.uber.org/zap"
 )
 
 // Compile-time check.
-var _ hyServer.Outbound = (*Hysteria2Outbound)(nil)
-
 // Hysteria2Outbound is one established connection to a remote Hysteria2 node.
 // Reconnection and DNS refresh are owned by the node entry in factory.go.
 type Hysteria2Outbound struct {
@@ -71,11 +68,11 @@ func (h *Hysteria2Outbound) TCPContext(ctx context.Context, reqAddr string) (net
 // UDP implements server.Outbound.
 // Creates a new UDP session on the existing QUIC connection and wraps
 // the HyUDPConn into a server.UDPConn compatible interface.
-func (h *Hysteria2Outbound) UDP(reqAddr string) (hyServer.UDPConn, error) {
+func (h *Hysteria2Outbound) UDP(reqAddr string) (UDPConn, error) {
 	return h.UDPContext(context.Background(), reqAddr)
 }
 
-func (h *Hysteria2Outbound) UDPContext(_ context.Context, reqAddr string) (hyServer.UDPConn, error) {
+func (h *Hysteria2Outbound) UDPContext(_ context.Context, reqAddr string) (UDPConn, error) {
 	h.logger.Debug("hy2 outbound UDP",
 		zap.String("remote", h.cfg.Addr),
 		zap.String("reqAddr", reqAddr),
@@ -103,7 +100,7 @@ func (h *Hysteria2Outbound) Close() error {
 }
 
 // hyUDPConnAdapter adapts hyClient.HyUDPConn (Send/Receive) to
-// hyServer.UDPConn (ReadFrom/WriteTo/Close).
+// the protocol-neutral UDP association contract (ReadFrom/WriteTo/Close).
 type hyUDPConnAdapter struct {
 	inner hyClient.HyUDPConn
 }

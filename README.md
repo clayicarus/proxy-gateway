@@ -188,7 +188,7 @@ FROM traffic_logs ORDER BY created_at DESC LIMIT 20;
 
 | 字段 | 说明 |
 |---|---|
-| `listen` | Gateway Hysteria2 UDP 监听地址，默认 `:443` |
+| `inbounds[].listen` | 具名 Gateway Hysteria2 UDP 监听地址 |
 | `tls.cert` / `tls.key` | 必填的 TLS 证书和私钥文件 |
 | `admin.listen` | 本地管理后台，必须绑定 loopback |
 | `sub.listen` | 独立订阅 HTTP 服务监听地址 |
@@ -209,8 +209,8 @@ internal/api/      管理 Web 与数据库订阅服务
 internal/auth/     用户认证和热刷新
 internal/config/   YAML 启动配置及旧配置解析
 internal/connection/ 活跃连接追踪
-internal/event/    Hysteria2 事件与路由上下文交接
-internal/router/   路由和出站实现
+internal/inbound/  协议 adapter 与协议库边界
+internal/router/   协议无关的策略路由和出站管理
 internal/storage/  SQLite schema 与查询
 internal/subtoken/ 订阅 token
 internal/systemd/  D-Bus 重启和 watchdog 通知

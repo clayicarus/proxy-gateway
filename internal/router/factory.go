@@ -15,7 +15,6 @@ import (
 	"time"
 
 	coreErrors "github.com/apernet/hysteria/core/v2/errors"
-	hyServer "github.com/apernet/hysteria/core/v2/server"
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"go.uber.org/zap"
 )
@@ -44,7 +43,7 @@ type NodeStatus struct {
 }
 
 type connectedOutbound interface {
-	hyServer.Outbound
+	Outbound
 	Close() error
 }
 
@@ -289,18 +288,18 @@ func (e *nodeEntry) TCPContext(ctx context.Context, reqAddr string) (net.Conn, e
 	return conn, err
 }
 
-func (e *nodeEntry) UDP(reqAddr string) (hyServer.UDPConn, error) {
+func (e *nodeEntry) UDP(reqAddr string) (UDPConn, error) {
 	return e.UDPContext(context.Background(), reqAddr)
 }
 
-func (e *nodeEntry) UDPContext(ctx context.Context, reqAddr string) (hyServer.UDPConn, error) {
+func (e *nodeEntry) UDPContext(ctx context.Context, reqAddr string) (UDPConn, error) {
 	client, err := e.currentClient()
 	if err != nil {
 		return nil, err
 	}
-	var conn hyServer.UDPConn
+	var conn UDPConn
 	if contextual, ok := client.(interface {
-		UDPContext(context.Context, string) (hyServer.UDPConn, error)
+		UDPContext(context.Context, string) (UDPConn, error)
 	}); ok {
 		conn, err = contextual.UDPContext(ctx, reqAddr)
 	} else {
@@ -361,7 +360,7 @@ func isClosedConnection(err error) bool {
 }
 
 type nodeUDPConn struct {
-	hyServer.UDPConn
+	UDPConn
 	failed      func(error)
 	localClosed atomic.Bool
 }
@@ -483,7 +482,7 @@ func (f *OutboundFactory) Warmup(ctx context.Context) error {
 	}
 }
 
-func (f *OutboundFactory) Get(name string) (hyServer.Outbound, error) {
+func (f *OutboundFactory) Get(name string) (Outbound, error) {
 	if name == "direct" {
 		return f.direct, nil
 	}
