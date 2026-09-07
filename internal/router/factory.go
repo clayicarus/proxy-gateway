@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	coreErrors "github.com/apernet/hysteria/core/v2/errors"
@@ -339,11 +340,15 @@ func isClosedConnection(err error) bool {
 
 type nodeUDPConn struct {
 	hyServer.UDPConn
-	failed func(error)
+	failed      func(error)
+	localClosed atomic.Bool
 }
 
 func (c *nodeUDPConn) ReadFrom(b []byte) (int, string, error) {
 	n, addr, err := c.UDPConn.ReadFrom(b)
+	if c.localClosed.Load() {
+		return n, addr, err
+	}
 	if isClosedConnection(err) {
 		c.failed(err)
 	} else if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
@@ -354,10 +359,15 @@ func (c *nodeUDPConn) ReadFrom(b []byte) (int, string, error) {
 
 func (c *nodeUDPConn) WriteTo(b []byte, addr string) (int, error) {
 	n, err := c.UDPConn.WriteTo(b, addr)
-	if isClosedConnection(err) || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+	if !c.localClosed.Load() && (isClosedConnection(err) || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)) {
 		c.failed(err)
 	}
 	return n, err
+}
+
+func (c *nodeUDPConn) Close() error {
+	c.localClosed.Store(true)
+	return c.UDPConn.Close()
 }
 
 type OutboundFactory struct {

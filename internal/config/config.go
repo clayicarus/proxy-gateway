@@ -41,7 +41,8 @@ type Config struct {
 	// Subscription config for generating client configs
 	Sub *SubConfig `yaml:"sub,omitempty"`
 
-	// Masquerade (optional)
+	// Deprecated: retained only to reject a configuration that the data plane
+	// never implemented.
 	Masquerade *MasqueradeConfig `yaml:"masquerade,omitempty"`
 
 	// SQLite database path for traffic persistence
@@ -164,6 +165,16 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+	if hasTopLevelKey(&root, "obfs") {
+		return nil, fmt.Errorf("config validation failed: obfs is not supported by the Gateway data plane; remove obfs before starting")
+	}
+	if hasTopLevelKey(&root, "masquerade") {
+		return nil, fmt.Errorf("config validation failed: masquerade is not supported by the Gateway data plane; remove masquerade before starting")
+	}
 
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
@@ -178,6 +189,12 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) validate() error {
+	if c.Obfs != nil {
+		return fmt.Errorf("obfs is not supported by the Gateway data plane; remove obfs before starting")
+	}
+	if c.Masquerade != nil {
+		return fmt.Errorf("masquerade is not supported by the Gateway data plane; remove masquerade before starting")
+	}
 	if c.Listen == "" {
 		c.Listen = ":443"
 	}

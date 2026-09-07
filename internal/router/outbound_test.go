@@ -2,7 +2,9 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"strings"
@@ -16,6 +18,89 @@ import (
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"go.uber.org/zap"
 )
+
+type closeAwareUDPConn struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newCloseAwareUDPConn() *closeAwareUDPConn {
+	return &closeAwareUDPConn{closed: make(chan struct{})}
+}
+
+func (c *closeAwareUDPConn) ReadFrom([]byte) (int, string, error) {
+	<-c.closed
+	return 0, "", io.EOF
+}
+
+func (c *closeAwareUDPConn) WriteTo([]byte, string) (int, error) {
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+		return 1, nil
+	}
+}
+
+func (c *closeAwareUDPConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func TestNodeUDPConnLocalCloseDoesNotFailSharedNode(t *testing.T) {
+	inner := newCloseAwareUDPConn()
+	var failures atomic.Int32
+	conn := &nodeUDPConn{
+		UDPConn: inner,
+		failed:  func(error) { failures.Add(1) },
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		_, _, err := conn.ReadFrom(nil)
+		readDone <- err
+	}()
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-readDone; !errors.Is(err, io.EOF) {
+		t.Fatalf("read error = %v, want EOF", err)
+	}
+	if failures.Load() != 0 {
+		t.Fatalf("local association close failed shared node %d times", failures.Load())
+	}
+	if _, err := conn.WriteTo([]byte("x"), "example.com:53"); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("write after close error = %v, want net.ErrClosed", err)
+	}
+	if failures.Load() != 0 {
+		t.Fatalf("write after local close failed shared node %d times", failures.Load())
+	}
+}
+
+type failingUDPConn struct{ err error }
+
+func (c failingUDPConn) ReadFrom([]byte) (int, string, error) { return 0, "", c.err }
+func (c failingUDPConn) WriteTo([]byte, string) (int, error)  { return 0, c.err }
+func (c failingUDPConn) Close() error                         { return nil }
+
+func TestNodeUDPConnConnectionFailureFailsSharedNode(t *testing.T) {
+	for _, operation := range []string{"read", "write"} {
+		t.Run(operation, func(t *testing.T) {
+			var failures atomic.Int32
+			conn := &nodeUDPConn{
+				UDPConn: failingUDPConn{err: io.EOF},
+				failed:  func(error) { failures.Add(1) },
+			}
+			if operation == "read" {
+				_, _, _ = conn.ReadFrom(nil)
+			} else {
+				_, _ = conn.WriteTo(nil, "example.com:53")
+			}
+			if failures.Load() != 1 {
+				t.Fatalf("connection failure callback count = %d, want 1", failures.Load())
+			}
+		})
+	}
+}
 
 func TestDirectOutbound_TCP(t *testing.T) {
 	if directDialer.Timeout != 10*time.Second {
