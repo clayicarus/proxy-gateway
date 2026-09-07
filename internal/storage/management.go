@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
@@ -569,7 +570,11 @@ func (s *SQLiteStore) SetActiveRevision(revision int64) error {
 // GetUserMonthlyUsage returns persisted traffic totals for the supplied UTC
 // boundaries. In-memory deltas are added by TrafficLogger before enforcement.
 func (s *SQLiteStore) GetUserMonthlyUsage(start, end time.Time) (map[string][2]uint64, error) {
-	rows, err := s.db.Query(`SELECT user_id, COALESCE(SUM(tx_bytes), 0), COALESCE(SUM(rx_bytes), 0) FROM traffic_logs WHERE created_at >= ? AND created_at < ? GROUP BY user_id`, start.UTC().Unix(), end.UTC().Unix())
+	return s.GetUserMonthlyUsageContext(context.Background(), start, end)
+}
+
+func (s *SQLiteStore) GetUserMonthlyUsageContext(ctx context.Context, start, end time.Time) (map[string][2]uint64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT user_id, COALESCE(SUM(tx_bytes), 0), COALESCE(SUM(rx_bytes), 0) FROM traffic_logs WHERE created_at >= ? AND created_at < ? GROUP BY user_id`, start.UTC().Unix(), end.UTC().Unix())
 	if err != nil {
 		return nil, err
 	}

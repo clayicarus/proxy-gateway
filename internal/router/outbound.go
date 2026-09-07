@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"fmt"
 	"net"
 
@@ -28,6 +29,35 @@ type RoutingOutbound struct {
 	factory        *OutboundFactory
 	requestContext chan outboundRequestContext
 	logger         *zap.Logger
+}
+
+// TCPContext routes one explicitly authenticated request without using the
+// legacy event-to-outbound handoff.
+func (ro *RoutingOutbound) TCPContext(ctx context.Context, id, reqAddr string) (net.Conn, error) {
+	ob, err := ro.GetOutboundForID(id)
+	if err != nil {
+		return nil, err
+	}
+	if contextual, ok := ob.(interface {
+		TCPContext(context.Context, string) (net.Conn, error)
+	}); ok {
+		return contextual.TCPContext(ctx, reqAddr)
+	}
+	return ob.TCP(reqAddr)
+}
+
+// UDPContext is the UDP counterpart of TCPContext.
+func (ro *RoutingOutbound) UDPContext(ctx context.Context, id, reqAddr string) (hyServer.UDPConn, error) {
+	ob, err := ro.GetOutboundForID(id)
+	if err != nil {
+		return nil, err
+	}
+	if contextual, ok := ob.(interface {
+		UDPContext(context.Context, string) (hyServer.UDPConn, error)
+	}); ok {
+		return contextual.UDPContext(ctx, reqAddr)
+	}
+	return ob.UDP(reqAddr)
 }
 
 type outboundRequestContext struct {

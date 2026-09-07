@@ -86,6 +86,29 @@ func TestSQLiteStore_FlushAndQuery(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreSummaryTimestampNeverMovesBackward(t *testing.T) {
+	store, err := NewSQLiteStore(t.TempDir()+"/traffic.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	newer := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	older := newer.Add(-time.Hour)
+	if err := store.FlushTraffic([]TrafficRecord{{UserID: "alice", NodeID: "direct", TxBytes: 1, Timestamp: newer}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FlushTraffic([]TrafficRecord{{UserID: "alice", NodeID: "direct", TxBytes: 1, Timestamp: older}}); err != nil {
+		t.Fatal(err)
+	}
+	var updated int64
+	if err := store.db.QueryRow(`SELECT updated_at FROM traffic_summary WHERE user_id='alice' AND node_id='direct'`).Scan(&updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated != newer.Unix() {
+		t.Fatalf("updated_at = %d, want %d", updated, newer.Unix())
+	}
+}
+
 func TestSQLiteStore_UnknownUser(t *testing.T) {
 	dbPath := t.TempDir() + "/test.db"
 	defer os.Remove(dbPath)

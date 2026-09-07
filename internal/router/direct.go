@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"net"
 	"time"
 
@@ -19,7 +20,11 @@ type DirectOutbound struct {
 var directDialer = net.Dialer{Timeout: 10 * time.Second}
 
 func (d *DirectOutbound) TCP(reqAddr string) (net.Conn, error) {
-	conn, err := directDialer.Dial("tcp", reqAddr)
+	return d.TCPContext(context.Background(), reqAddr)
+}
+
+func (d *DirectOutbound) TCPContext(ctx context.Context, reqAddr string) (net.Conn, error) {
+	conn, err := directDialer.DialContext(ctx, "tcp", reqAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -27,7 +32,11 @@ func (d *DirectOutbound) TCP(reqAddr string) (net.Conn, error) {
 }
 
 func (d *DirectOutbound) UDP(reqAddr string) (hyServer.UDPConn, error) {
-	conn, err := net.ListenPacket("udp", "")
+	return d.UDPContext(context.Background(), reqAddr)
+}
+
+func (d *DirectOutbound) UDPContext(ctx context.Context, _ string) (hyServer.UDPConn, error) {
+	conn, err := (&net.ListenConfig{}).ListenPacket(ctx, "udp", "")
 	if err != nil {
 		return nil, err
 	}

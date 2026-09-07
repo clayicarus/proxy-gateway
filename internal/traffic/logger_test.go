@@ -1,6 +1,7 @@
 package traffic
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -36,6 +37,36 @@ func TestTrafficLogger_BasicAccounting(t *testing.T) {
 	}
 	if snap.Username != "alice" || snap.Node != "node1" {
 		t.Errorf("expected username=alice node=node1, got %s/%s", snap.Username, snap.Node)
+	}
+}
+
+func TestTrafficLoggerLimitWaitIsCancellableAndUncharged(t *testing.T) {
+	tl := NewTrafficLogger(map[string]config.UserConfig{
+		"alice": {Routes: []string{"direct"}, SpeedLimit: 1},
+	}, nil, zap.NewNop())
+	if !tl.LogTraffic("alice:direct", 0, 1) {
+		t.Fatal("first burst was rejected")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if tl.LogTrafficContext(ctx, "alice:direct", 0, 100) {
+		t.Fatal("canceled traffic was accepted")
+	}
+	if got := tl.GetSnapshot("alice:direct"); got.RxBytes != 1 {
+		t.Fatalf("canceled traffic was charged: %#v", got)
+	}
+}
+
+func TestTrafficLoggerStopAdmissionRejectsWithoutCharging(t *testing.T) {
+	tl := NewTrafficLogger(map[string]config.UserConfig{
+		"alice": {Routes: []string{"direct"}},
+	}, nil, zap.NewNop())
+	tl.StopAdmission()
+	if tl.LogTraffic("alice:direct", 10, 20) {
+		t.Fatal("traffic accepted after stopping")
+	}
+	if got := tl.GetSnapshot("alice:direct"); got.TxBytes != 0 || got.RxBytes != 0 {
+		t.Fatalf("traffic charged after stopping: %#v", got)
 	}
 }
 

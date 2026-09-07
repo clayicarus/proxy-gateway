@@ -1,6 +1,8 @@
 package router
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -18,7 +20,7 @@ var _ hyServer.Outbound = (*Hysteria2Outbound)(nil)
 // Reconnection and DNS refresh are owned by the node entry in factory.go.
 type Hysteria2Outbound struct {
 	cfg    *config.Hysteria2OutboundConfig
-	client hyClient.Client
+	client hyClient.ContextClient
 	logger *zap.Logger
 
 	mu     sync.Mutex
@@ -26,7 +28,11 @@ type Hysteria2Outbound struct {
 }
 
 func newHysteria2Outbound(cfg *config.Hysteria2OutboundConfig, serverAddr *net.UDPAddr, sni string, logger *zap.Logger) (*Hysteria2Outbound, error) {
-	client, info, err := hyClient.NewClient(&hyClient.Config{
+	return newHysteria2OutboundContext(context.Background(), cfg, serverAddr, sni, logger)
+}
+
+func newHysteria2OutboundContext(ctx context.Context, cfg *config.Hysteria2OutboundConfig, serverAddr *net.UDPAddr, sni string, logger *zap.Logger) (*Hysteria2Outbound, error) {
+	client, info, err := hyClient.NewClientContext(ctx, &hyClient.Config{
 		ServerAddr: serverAddr,
 		Auth:       cfg.Auth,
 		TLSConfig: hyClient.TLSConfig{
@@ -51,17 +57,25 @@ func newHysteria2Outbound(cfg *config.Hysteria2OutboundConfig, serverAddr *net.U
 // Opens a new QUIC stream on the existing connection to the remote node
 // and sends a TCP proxy request.
 func (h *Hysteria2Outbound) TCP(reqAddr string) (net.Conn, error) {
+	return h.TCPContext(context.Background(), reqAddr)
+}
+
+func (h *Hysteria2Outbound) TCPContext(ctx context.Context, reqAddr string) (net.Conn, error) {
 	h.logger.Debug("hy2 outbound TCP",
 		zap.String("remote", h.cfg.Addr),
 		zap.String("reqAddr", reqAddr),
 	)
-	return h.client.TCP(reqAddr)
+	return h.client.TCPContext(ctx, reqAddr)
 }
 
 // UDP implements server.Outbound.
 // Creates a new UDP session on the existing QUIC connection and wraps
 // the HyUDPConn into a server.UDPConn compatible interface.
 func (h *Hysteria2Outbound) UDP(reqAddr string) (hyServer.UDPConn, error) {
+	return h.UDPContext(context.Background(), reqAddr)
+}
+
+func (h *Hysteria2Outbound) UDPContext(_ context.Context, reqAddr string) (hyServer.UDPConn, error) {
 	h.logger.Debug("hy2 outbound UDP",
 		zap.String("remote", h.cfg.Addr),
 		zap.String("reqAddr", reqAddr),
@@ -84,7 +98,8 @@ func (h *Hysteria2Outbound) Close() error {
 	}
 	h.closed = true
 	h.logger.Info("hy2 outbound closing", zap.String("addr", h.cfg.Addr))
-	return h.client.Close()
+	err := h.client.Close()
+	return errors.Join(err, h.client.Wait(context.Background()))
 }
 
 // hyUDPConnAdapter adapts hyClient.HyUDPConn (Send/Receive) to

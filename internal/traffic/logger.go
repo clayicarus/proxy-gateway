@@ -1,6 +1,7 @@
 package traffic
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,11 +61,14 @@ type TrafficLogger struct {
 	flushDone    chan struct{}
 	flushStarted atomic.Bool
 	flushMu      sync.Mutex
+	lastFlushErr error
 
 	location     *time.Location
 	monthKey     string
 	monthlyUsage map[string]uint64 // persisted current-month base plus in-memory deltas
 	usageMu      sync.Mutex
+	pending      map[pendingKey]storage.TrafficRecord
+	stopping     atomic.Bool
 	limiters     map[string]*downloadLimiter
 	limiterMu    sync.Mutex
 }
@@ -73,8 +77,14 @@ type TrafficLogger struct {
 // reservation timeline. It intentionally has no burst: multiple streams
 // therefore share the configured aggregate rate.
 type downloadLimiter struct {
-	mu   sync.Mutex
-	next time.Time
+	mu     sync.Mutex
+	next   time.Time
+	notify chan struct{}
+}
+
+type pendingKey struct {
+	id    string
+	month string
 }
 
 // NewTrafficLogger creates a new TrafficLogger.
@@ -97,9 +107,10 @@ func NewTrafficLoggerWithLocation(users map[string]config.UserConfig, store *sto
 		flushDone:    make(chan struct{}),
 		location:     location,
 		monthlyUsage: make(map[string]uint64),
+		pending:      make(map[pendingKey]storage.TrafficRecord),
 		limiters:     make(map[string]*downloadLimiter),
 	}
-	tl.ensureMonthlyUsage(time.Now())
+	_ = tl.ensureMonthlyUsage(context.Background(), time.Now())
 	// Pre-populate stats for known (user, node) pairs, loading persisted totals
 	for name, u := range users {
 		for _, route := range u.Routes {
@@ -139,27 +150,47 @@ func (tl *TrafficLogger) monthBounds(now time.Time) (key string, start, end time
 	return start.Format("2006-01"), start.UTC(), end.UTC()
 }
 
-func (tl *TrafficLogger) ensureMonthlyUsage(now time.Time) {
+func (tl *TrafficLogger) ensureMonthlyUsage(ctx context.Context, now time.Time) error {
 	key, start, end := tl.monthBounds(now)
 	tl.usageMu.Lock()
-	defer tl.usageMu.Unlock()
 	if tl.monthKey == key {
-		return
+		tl.usageMu.Unlock()
+		return nil
 	}
+	tl.usageMu.Unlock()
+
+	// Serialize the baseline read with an in-flight flush so persisted data and
+	// detached pending data cannot both be counted as the baseline.
+	tl.flushMu.Lock()
+	defer tl.flushMu.Unlock()
+	tl.usageMu.Lock()
+	if tl.monthKey == key {
+		tl.usageMu.Unlock()
+		return nil
+	}
+	tl.usageMu.Unlock()
 	total := make(map[string][2]uint64)
 	if tl.store != nil {
-		loaded, err := tl.store.GetUserMonthlyUsage(start, end)
+		loaded, err := tl.store.GetUserMonthlyUsageContext(ctx, start, end)
 		if err != nil {
 			tl.logger.Warn("failed to load current month traffic", zap.Error(err))
-		} else {
-			total = loaded
+			return err
 		}
+		total = loaded
 	}
+	tl.usageMu.Lock()
+	defer tl.usageMu.Unlock()
 	tl.monthKey = key
 	tl.monthlyUsage = make(map[string]uint64, len(total))
 	for username, value := range total {
 		tl.monthlyUsage[username] = value[0] + value[1]
 	}
+	for pendingKey, record := range tl.pending {
+		if pendingKey.month == key {
+			tl.monthlyUsage[record.UserID] += record.TxBytes + record.RxBytes
+		}
+	}
+	return nil
 }
 
 // StartPeriodicFlush starts a goroutine that flushes traffic deltas
@@ -175,9 +206,8 @@ func (tl *TrafficLogger) StartPeriodicFlush(interval time.Duration) {
 		for {
 			select {
 			case <-ticker.C:
-				tl.Flush()
+				_ = tl.FlushContext(context.Background())
 			case <-tl.stopCh:
-				tl.Flush() // final flush on shutdown
 				return
 			}
 		}
@@ -186,66 +216,97 @@ func (tl *TrafficLogger) StartPeriodicFlush(interval time.Duration) {
 
 // Stop signals the periodic flush goroutine to stop and does a final flush.
 func (tl *TrafficLogger) Stop() {
+	_ = tl.StopContext(context.Background())
+}
+
+func (tl *TrafficLogger) StopAdmission() {
+	tl.stopping.Store(true)
+	tl.wakeLimiters()
+}
+
+func (tl *TrafficLogger) StopContext(ctx context.Context) error {
+	tl.StopAdmission()
 	tl.stopOnce.Do(func() { close(tl.stopCh) })
 	if tl.flushStarted.Load() {
-		<-tl.flushDone
-		return
+		select {
+		case <-tl.flushDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	tl.Flush()
+	return tl.FlushContext(ctx)
 }
 
 // Flush writes accumulated deltas to SQLite and resets them.
 func (tl *TrafficLogger) Flush() {
+	_ = tl.FlushContext(context.Background())
+}
+
+func (tl *TrafficLogger) FlushContext(ctx context.Context) error {
 	if tl.store == nil {
-		return
+		return nil
 	}
 	tl.flushMu.Lock()
 	defer tl.flushMu.Unlock()
 
-	var records []storage.TrafficRecord
-	now := time.Now()
-
-	tl.stats.Range(func(key, value any) bool {
-		id := key.(string)
-		stats := value.(*UserNodeStats)
-		tx := stats.TxDelta.Swap(0)
-		rx := stats.RxDelta.Swap(0)
-		if tx > 0 || rx > 0 {
-			username, nodeName := auth.ParseID(id)
-			records = append(records, storage.TrafficRecord{
-				UserID:    username,
-				NodeID:    nodeName,
-				TxBytes:   tx,
-				RxBytes:   rx,
-				Timestamp: now,
-			})
-		}
-		return true
-	})
-
-	if len(records) == 0 {
-		return
+	tl.usageMu.Lock()
+	batch := tl.pending
+	tl.pending = make(map[pendingKey]storage.TrafficRecord)
+	for _, record := range batch {
+		stats := tl.getOrCreate(record.UserID + ":" + record.NodeID)
+		stats.TxDelta.Add(^(record.TxBytes - 1))
+		stats.RxDelta.Add(^(record.RxBytes - 1))
+	}
+	tl.usageMu.Unlock()
+	records := make([]storage.TrafficRecord, 0, len(batch))
+	for _, record := range batch {
+		records = append(records, record)
 	}
 
-	if err := tl.store.FlushTraffic(records); err != nil {
+	if len(records) == 0 {
+		return nil
+	}
+
+	if err := tl.store.FlushTrafficContext(ctx, records); err != nil {
 		// FlushTraffic is transactional, so none of this batch was persisted.
 		// Restore the deltas alongside traffic accumulated during the failed write;
 		// the next periodic flush will retry the complete amount.
-		for _, record := range records {
+		tl.usageMu.Lock()
+		for key, record := range batch {
+			current := tl.pending[key]
+			current.UserID, current.NodeID = record.UserID, record.NodeID
+			current.TxBytes += record.TxBytes
+			current.RxBytes += record.RxBytes
+			if current.Timestamp.Before(record.Timestamp) {
+				current.Timestamp = record.Timestamp
+			}
+			tl.pending[key] = current
 			stats := tl.getOrCreate(record.UserID + ":" + record.NodeID)
 			stats.TxDelta.Add(record.TxBytes)
 			stats.RxDelta.Add(record.RxBytes)
 		}
+		tl.usageMu.Unlock()
 		tl.logger.Error("failed to flush traffic to sqlite", zap.Error(err))
+		tl.lastFlushErr = err
+		return err
 	} else {
 		tl.logger.Debug("flushed traffic to sqlite", zap.Int("records", len(records)))
 	}
+	tl.lastFlushErr = nil
+	return nil
 }
 
 // LogTraffic implements server.TrafficLogger.
 // id is "username:node_name".
 // Returns false to disconnect the user (e.g., quota exceeded).
 func (tl *TrafficLogger) LogTraffic(id string, tx, rx uint64) bool {
+	return tl.LogTrafficContext(context.Background(), id, tx, rx)
+}
+
+func (tl *TrafficLogger) LogTrafficContext(ctx context.Context, id string, tx, rx uint64) bool {
+	if tl.stopping.Load() || ctx.Err() != nil {
+		return false
+	}
 	username, _ := auth.ParseID(id)
 	tl.mu.RLock()
 	user, exists := tl.users[username]
@@ -269,17 +330,47 @@ func (tl *TrafficLogger) LogTraffic(id string, tx, rx uint64) bool {
 
 	stats := tl.getOrCreate(id)
 	if rx > 0 {
-		tl.limitDownload(username, rx)
+		if err := tl.limitDownloadContext(ctx, username, rx); err != nil {
+			return false
+		}
+	}
+	if tl.stopping.Load() || ctx.Err() != nil {
+		return false
+	}
+	now := time.Now()
+	if err := tl.ensureMonthlyUsage(ctx, now); err != nil {
+		return false
+	}
+	key, _, _ := tl.monthBounds(now)
+	tl.usageMu.Lock()
+	if tl.stopping.Load() || ctx.Err() != nil || tl.monthKey != key {
+		tl.usageMu.Unlock()
+		return false
 	}
 	stats.TxBytes.Add(tx)
 	stats.RxBytes.Add(rx)
 	stats.TxDelta.Add(tx)
 	stats.RxDelta.Add(rx)
-	stats.LastActive.Store(time.Now().Unix())
+	stats.LastActive.Store(now.Unix())
+	username, nodeName := auth.ParseID(id)
+	pendingKey := pendingKey{id: id, month: key}
+	record := tl.pending[pendingKey]
+	record.UserID, record.NodeID = username, nodeName
+	record.TxBytes += tx
+	record.RxBytes += rx
+	if record.Timestamp.Before(now) {
+		record.Timestamp = now
+	}
+	tl.pending[pendingKey] = record
 
 	// Check the calendar-month quota across all nodes. The same mutex makes
 	// concurrent streams observe a single shared accounting value.
-	total, maxBytes := tl.addMonthlyUsage(username, tx+rx)
+	tl.monthlyUsage[username] += tx + rx
+	total := tl.monthlyUsage[username]
+	tl.mu.RLock()
+	maxBytes := tl.users[username].MaxBytes
+	tl.mu.RUnlock()
+	tl.usageMu.Unlock()
 	if maxBytes > 0 && total > maxBytes {
 		tl.logger.Warn("user quota exceeded, disconnecting",
 			zap.String("id", id),
@@ -292,45 +383,78 @@ func (tl *TrafficLogger) LogTraffic(id string, tx, rx uint64) bool {
 	return true
 }
 
-func (tl *TrafficLogger) addMonthlyUsage(username string, delta uint64) (uint64, uint64) {
-	tl.ensureMonthlyUsage(time.Now())
-	tl.usageMu.Lock()
-	tl.monthlyUsage[username] += delta
-	total := tl.monthlyUsage[username]
-	tl.mu.RLock()
-	maxBytes := tl.users[username].MaxBytes
-	tl.mu.RUnlock()
-	tl.usageMu.Unlock()
-	return total, maxBytes
+func (tl *TrafficLogger) limitDownload(username string, bytes uint64) {
+	_ = tl.limitDownloadContext(context.Background(), username, bytes)
 }
 
-func (tl *TrafficLogger) limitDownload(username string, bytes uint64) {
-	tl.mu.RLock()
-	rate := tl.users[username].SpeedLimit
-	tl.mu.RUnlock()
-	if rate == 0 {
-		return
+func (tl *TrafficLogger) limitDownloadContext(ctx context.Context, username string, bytes uint64) error {
+	for {
+		tl.mu.RLock()
+		rate := tl.users[username].SpeedLimit
+		tl.mu.RUnlock()
+		if rate == 0 {
+			return nil
+		}
+		tl.limiterMu.Lock()
+		limiter := tl.limiters[username]
+		if limiter == nil {
+			limiter = &downloadLimiter{notify: make(chan struct{})}
+			tl.limiters[username] = limiter
+		}
+		tl.limiterMu.Unlock()
+
+		limiter.mu.Lock()
+		now := time.Now()
+		if limiter.next.Before(now) {
+			limiter.next = now
+		}
+		waitUntil := limiter.next
+		seconds := float64(bytes) / float64(rate)
+		end := limiter.next.Add(time.Duration(seconds * float64(time.Second)))
+		limiter.next = end
+		notify := limiter.notify
+		limiter.mu.Unlock()
+		if wait := time.Until(waitUntil); wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-timer.C:
+				return nil
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				tl.cancelReservation(limiter, end, waitUntil)
+				return ctx.Err()
+			case <-notify:
+				if !timer.Stop() {
+					<-timer.C
+				}
+				tl.cancelReservation(limiter, end, waitUntil)
+				continue
+			}
+		}
+		return nil
 	}
+}
+
+func (tl *TrafficLogger) cancelReservation(limiter *downloadLimiter, end, start time.Time) {
+	limiter.mu.Lock()
+	if limiter.next.Equal(end) {
+		limiter.next = start
+	}
+	limiter.mu.Unlock()
+}
+
+func (tl *TrafficLogger) wakeLimiters() {
 	tl.limiterMu.Lock()
-	limiter := tl.limiters[username]
-	if limiter == nil {
-		limiter = &downloadLimiter{}
-		tl.limiters[username] = limiter
+	for _, limiter := range tl.limiters {
+		limiter.mu.Lock()
+		close(limiter.notify)
+		limiter.notify = make(chan struct{})
+		limiter.next = time.Time{}
+		limiter.mu.Unlock()
 	}
 	tl.limiterMu.Unlock()
-
-	limiter.mu.Lock()
-	now := time.Now()
-	if limiter.next.Before(now) {
-		limiter.next = now
-	}
-	waitUntil := limiter.next
-	seconds := float64(bytes) / float64(rate)
-	limiter.next = limiter.next.Add(time.Duration(seconds * float64(time.Second)))
-	limiter.mu.Unlock()
-	if wait := time.Until(waitUntil); wait > 0 {
-		time.Sleep(wait)
-	}
 }
 
 // UpdateUsers replaces runtime user state without changing the static node
@@ -338,8 +462,18 @@ func (tl *TrafficLogger) limitDownload(username string, bytes uint64) {
 // changes that must affect new and existing connections immediately.
 func (tl *TrafficLogger) UpdateUsers(users map[string]config.UserConfig) {
 	tl.mu.Lock()
+	changedRate := false
+	for name, old := range tl.users {
+		if current, ok := users[name]; !ok || current.SpeedLimit != old.SpeedLimit {
+			changedRate = true
+			break
+		}
+	}
 	tl.users = copyUsers(users)
 	tl.mu.Unlock()
+	if changedRate {
+		tl.wakeLimiters()
+	}
 }
 
 // LogOnlineState implements server.TrafficLogger.

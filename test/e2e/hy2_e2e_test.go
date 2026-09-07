@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -8,8 +9,11 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
+	"io"
 	"math/big"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,7 +21,9 @@ import (
 	hyServer "github.com/apernet/hysteria/core/v2/server"
 	"github.com/clayicarus/proxy-gateway/internal/auth"
 	"github.com/clayicarus/proxy-gateway/internal/config"
+	"github.com/clayicarus/proxy-gateway/internal/connection"
 	"github.com/clayicarus/proxy-gateway/internal/event"
+	hyInbound "github.com/clayicarus/proxy-gateway/internal/inbound/hysteria2"
 	"github.com/clayicarus/proxy-gateway/internal/router"
 	"github.com/clayicarus/proxy-gateway/internal/traffic"
 	"go.uber.org/zap"
@@ -56,6 +62,120 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 	return tls.X509KeyPair(certPEM, keyPEM)
 }
 
+type cancellationSession struct{ id string }
+
+func (s *cancellationSession) ID() string  { return s.id }
+func (s *cancellationSession) Close(error) {}
+
+type cancellationHarness struct {
+	started chan struct{}
+	calls   atomic.Int32
+}
+
+func (h *cancellationHarness) AuthenticateSession(context.Context, hyServer.Transport, string, uint64) (hyServer.Session, bool) {
+	return &cancellationSession{id: "cancel-test"}, true
+}
+func (h *cancellationHarness) TCPContext(ctx context.Context, _ hyServer.Session, _ hyServer.RequestInfo) (net.Conn, error) {
+	if h.calls.Add(1) == 1 {
+		close(h.started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	server, target := net.Pipe()
+	go func() {
+		defer target.Close()
+		buf := make([]byte, 64)
+		n, err := target.Read(buf)
+		if err == nil {
+			_, _ = target.Write(buf[:n])
+		}
+	}()
+	return server, nil
+}
+func (h *cancellationHarness) UDPContext(context.Context, hyServer.Session, hyServer.RequestInfo) (hyServer.UDPConn, error) {
+	return nil, errors.New("UDP disabled")
+}
+func (h *cancellationHarness) LogTrafficContext(context.Context, hyServer.Session, hyServer.RequestInfo, uint64, uint64) bool {
+	return true
+}
+func (h *cancellationHarness) LogOnlineStateSession(hyServer.Session, bool) {}
+
+func TestHy2TCPContextCancellationKeepsConnectionUsable(t *testing.T) {
+	cert, err := generateSelfSignedCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := &cancellationHarness{started: make(chan struct{})}
+	server, err := hyServer.NewServer(&hyServer.Config{
+		TLSConfig: hyServer.TLSConfig{Certificates: []tls.Certificate{cert}},
+		Conn:      udpConn, DisableUDP: true,
+		SessionAuthenticator: harness, SessionOutbound: harness, SessionTrafficLogger: harness,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = server.Serve() }()
+	serverAddr, _ := net.ResolveUDPAddr("udp", udpConn.LocalAddr().String())
+	client, _, err := hyClient.NewClientContext(context.Background(), &hyClient.Config{
+		ServerAddr: serverAddr, Auth: "ok",
+		TLSConfig: hyClient.TLSConfig{ServerName: "localhost", InsecureSkipVerify: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = client.Close()
+		_ = server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := client.Wait(ctx); err != nil {
+			t.Errorf("client wait: %v", err)
+		}
+		if err := server.Wait(ctx); err != nil {
+			t.Errorf("server wait: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { _, err := client.TCPContext(ctx, "blocked.example:443"); result <- err }()
+	select {
+	case <-harness.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("blocked request did not reach outbound")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("canceled CONNECT unexpectedly succeeded")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("canceled CONNECT did not return")
+	}
+
+	conn, err := client.TCPContext(context.Background(), "echo.example:443")
+	if err != nil {
+		t.Fatalf("second request failed after cancellation: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("still-alive")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 32)
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	n, err := conn.Read(buf)
+	if (err != nil && !errors.Is(err, io.EOF)) || string(buf[:n]) != "still-alive" {
+		t.Fatalf("second request response n=%d err=%v data=%q", n, err, buf[:n])
+	}
+}
+
 // TestHy2E2E_ClientServerConnect tests a real Hysteria2 client connecting
 // to our gateway server, authenticating, and proxying TCP traffic.
 func TestHy2E2E_ClientServerConnect(t *testing.T) {
@@ -92,6 +212,21 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 
 	targetAddr := targetLn.Addr().String()
 	t.Logf("target server listening on %s", targetAddr)
+	udpTarget, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create UDP target: %v", err)
+	}
+	defer udpTarget.Close()
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, addr, err := udpTarget.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = udpTarget.WriteTo(buf[:n], addr)
+		}
+	}()
 
 	// --- 2. Generate self-signed TLS cert ---
 	tlsCert, err := generateSelfSignedCert()
@@ -111,7 +246,8 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 	routerEngine := router.NewRouter(users, logger)
 	outboundFactory := router.NewOutboundFactory(nodes, logger)
 	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
-	eventLogger := event.NewEventLogger(routingOutbound, logger)
+	tracker := connection.NewTracker()
+	adapter := hyInbound.New("hy2-e2e", authenticator, routingOutbound, trafficLogger, tracker, logger)
 
 	// --- 4. Start Hysteria2 server ---
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
@@ -126,11 +262,11 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 		TLSConfig: hyServer.TLSConfig{
 			Certificates: []tls.Certificate{tlsCert},
 		},
-		Conn:          udpConn,
-		Authenticator: authenticator,
-		Outbound:      routingOutbound,
-		TrafficLogger: trafficLogger,
-		EventLogger:   eventLogger,
+		Conn:                 udpConn,
+		SessionAuthenticator: adapter,
+		SessionOutbound:      adapter,
+		SessionTrafficLogger: adapter,
+		SessionEventLogger:   adapter,
 	})
 	if err != nil {
 		t.Fatalf("failed to create hy2 server: %v", err)
@@ -139,7 +275,14 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 	go func() {
 		server.Serve()
 	}()
-	defer server.Close()
+	defer func() {
+		_ = server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := server.Wait(ctx); err != nil {
+			t.Errorf("server wait: %v", err)
+		}
+	}()
 
 	// Give server a moment to start
 	time.Sleep(100 * time.Millisecond)
@@ -148,7 +291,7 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 	// Auth format: username:node_name:password
 	t.Run("alice_auth_and_proxy", func(t *testing.T) {
 		sAddr, _ := net.ResolveUDPAddr("udp", serverAddr)
-		client, info, err := hyClient.NewClient(&hyClient.Config{
+		client, info, err := hyClient.NewClientContext(context.Background(), &hyClient.Config{
 			ServerAddr: sAddr,
 			Auth:       "alice:direct:pass123",
 			TLSConfig: hyClient.TLSConfig{
@@ -159,7 +302,14 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to create hy2 client: %v", err)
 		}
-		defer client.Close()
+		defer func() {
+			_ = client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := client.Wait(ctx); err != nil {
+				t.Errorf("client wait: %v", err)
+			}
+		}()
 
 		t.Logf("client connected, UDP enabled: %v, Tx: %d", info.UDPEnabled, info.Tx)
 
@@ -191,6 +341,37 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 		}
 
 		t.Logf("alice received: %s", response)
+		beforeUDP := trafficLogger.GetSnapshot("alice:direct")
+		if beforeUDP == nil {
+			t.Fatal("missing traffic before UDP")
+		}
+		beforeTx, beforeRx := beforeUDP.TxBytes, beforeUDP.RxBytes
+
+		udp, err := client.UDP()
+		if err != nil {
+			t.Fatalf("client UDP failed: %v", err)
+		}
+		defer udp.Close()
+		payload := make([]byte, 3000)
+		for i := range payload {
+			payload[i] = byte(i)
+		}
+		if err := udp.Send(payload, udpTarget.LocalAddr().String()); err != nil {
+			t.Fatalf("UDP send: %v", err)
+		}
+		timeout := time.AfterFunc(5*time.Second, func() { _ = client.Close() })
+		got, gotAddr, err := udp.Receive()
+		timeout.Stop()
+		if err != nil {
+			t.Fatalf("UDP receive: %v", err)
+		}
+		if gotAddr != udpTarget.LocalAddr().String() || len(got) != len(payload) || string(got) != string(payload) {
+			t.Fatalf("UDP echo mismatch: addr=%q bytes=%d", gotAddr, len(got))
+		}
+		afterUDP := trafficLogger.GetSnapshot("alice:direct")
+		if afterUDP.TxBytes-beforeTx != 3000 || afterUDP.RxBytes-beforeRx != 6000 {
+			t.Fatalf("UDP accounting delta = tx:%d rx:%d, want 3000/6000", afterUDP.TxBytes-beforeTx, afterUDP.RxBytes-beforeRx)
+		}
 	})
 
 	// --- 6. Test auth failure ---

@@ -18,6 +18,8 @@ type Tracker struct {
 }
 
 type session struct {
+	id         string
+	inbound    string
 	clientAddr string
 	clientIP   string
 	username   string
@@ -27,18 +29,65 @@ type session struct {
 }
 
 type Request struct {
+	ID        uint64    `json:"id,omitempty"`
 	Protocol  string    `json:"protocol"`
 	Target    string    `json:"target"`
 	StartedAt time.Time `json:"startedAt"`
 }
 
 type Snapshot struct {
+	SessionID   string    `json:"sessionId,omitempty"`
+	Inbound     string    `json:"inbound,omitempty"`
 	ClientAddr  string    `json:"clientAddr"`
 	ClientIP    string    `json:"clientIp"`
 	Username    string    `json:"username"`
 	Node        string    `json:"node"`
 	ConnectedAt time.Time `json:"connectedAt"`
 	Requests    []Request `json:"requests"`
+}
+
+// ConnectSession records a session by its server-issued stable identity.
+func (t *Tracker) ConnectSession(sessionID, inbound string, addr net.Addr, id string) {
+	username, node := auth.ParseID(id)
+	address := addr.String()
+	ip := address
+	if host, _, err := net.SplitHostPort(address); err == nil {
+		ip = host
+	}
+	t.mu.Lock()
+	t.sessions[sessionID] = &session{
+		id: sessionID, inbound: inbound, clientAddr: address, clientIP: ip,
+		username: username, node: node, connected: time.Now().UTC(),
+		requests: make(map[string][]Request),
+	}
+	t.mu.Unlock()
+}
+
+func (t *Tracker) DisconnectSession(sessionID string) {
+	t.mu.Lock()
+	delete(t.sessions, sessionID)
+	t.mu.Unlock()
+}
+
+func (t *Tracker) StartRequest(sessionID string, requestID uint64, protocol, target string) {
+	t.mu.Lock()
+	if current := t.sessions[sessionID]; current != nil {
+		key := requestKey(requestID)
+		current.requests[key] = []Request{{ID: requestID, Protocol: protocol, Target: target, StartedAt: time.Now().UTC()}}
+	}
+	t.mu.Unlock()
+}
+
+func (t *Tracker) StopRequest(sessionID string, requestID uint64) {
+	t.mu.Lock()
+	if current := t.sessions[sessionID]; current != nil {
+		delete(current.requests, requestKey(requestID))
+	}
+	t.mu.Unlock()
+}
+
+func requestKey(requestID uint64) string {
+	return "request:" + strconv.FormatUint(requestID, 10)
 }
 
 func NewTracker() *Tracker {
@@ -121,6 +170,8 @@ func (t *Tracker) Snapshots() []Snapshot {
 		}
 		sort.Slice(requests, func(i, j int) bool { return requests[i].StartedAt.Before(requests[j].StartedAt) })
 		result = append(result, Snapshot{
+			SessionID:   current.id,
+			Inbound:     current.inbound,
 			ClientAddr:  current.clientAddr,
 			ClientIP:    current.clientIP,
 			Username:    current.username,

@@ -75,7 +75,7 @@ func (c *hysteria2Connector) Connect(ctx context.Context, name string, cfg *conf
 		dial := c.dial
 		if dial == nil {
 			dial = func(cfg *config.Hysteria2OutboundConfig, addr *net.UDPAddr, sni string, logger *zap.Logger) (connectedOutbound, error) {
-				return newHysteria2Outbound(cfg, addr, sni, logger)
+				return newHysteria2OutboundContext(ctx, cfg, addr, sni, logger)
 			}
 		}
 		outbound, err := dial(cfg, addr, sni, c.logger)
@@ -267,23 +267,45 @@ func (e *nodeEntry) currentClient() (connectedOutbound, error) {
 }
 
 func (e *nodeEntry) TCP(reqAddr string) (net.Conn, error) {
+	return e.TCPContext(context.Background(), reqAddr)
+}
+
+func (e *nodeEntry) TCPContext(ctx context.Context, reqAddr string) (net.Conn, error) {
 	client, err := e.currentClient()
 	if err != nil {
 		return nil, err
 	}
-	conn, err := client.TCP(reqAddr)
-	if isClosedConnection(err) {
+	var conn net.Conn
+	if contextual, ok := client.(interface {
+		TCPContext(context.Context, string) (net.Conn, error)
+	}); ok {
+		conn, err = contextual.TCPContext(ctx, reqAddr)
+	} else {
+		conn, err = client.TCP(reqAddr)
+	}
+	if ctx.Err() == nil && isClosedConnection(err) {
 		e.markUnavailable(client, err)
 	}
 	return conn, err
 }
 
 func (e *nodeEntry) UDP(reqAddr string) (hyServer.UDPConn, error) {
+	return e.UDPContext(context.Background(), reqAddr)
+}
+
+func (e *nodeEntry) UDPContext(ctx context.Context, reqAddr string) (hyServer.UDPConn, error) {
 	client, err := e.currentClient()
 	if err != nil {
 		return nil, err
 	}
-	conn, err := client.UDP(reqAddr)
+	var conn hyServer.UDPConn
+	if contextual, ok := client.(interface {
+		UDPContext(context.Context, string) (hyServer.UDPConn, error)
+	}); ok {
+		conn, err = contextual.UDPContext(ctx, reqAddr)
+	} else {
+		conn, err = client.UDP(reqAddr)
+	}
 	if err != nil {
 		if isClosedConnection(err) {
 			e.markUnavailable(client, err)
