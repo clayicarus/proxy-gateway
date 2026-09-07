@@ -244,6 +244,54 @@ func TestTrafficLogger_FailedFlushRestoresDeltas(t *testing.T) {
 	}
 }
 
+func TestTrafficLoggerFlushKeepsPendingTrafficInItsCalendarMonth(t *testing.T) {
+	store, err := storage.NewSQLiteStore(t.TempDir()+"/traffic.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	timeNow := time.Date(2026, time.January, 31, 23, 59, 59, 0, time.UTC)
+	tl := NewTrafficLogger(map[string]config.UserConfig{
+		"alice": {Password: "p", Routes: []string{"direct"}},
+	}, store, zap.NewNop())
+	tl.now = func() time.Time { return timeNow }
+
+	if !tl.LogTraffic("alice:direct", 10, 20) {
+		t.Fatal("January traffic was rejected")
+	}
+	if err := tl.FlushContext(context.Background()); err != nil {
+		t.Fatalf("flush January: %v", err)
+	}
+	timeNow = time.Date(2026, time.February, 1, 0, 0, 1, 0, time.UTC)
+	if !tl.LogTraffic("alice:direct", 30, 40) {
+		t.Fatal("February traffic was rejected")
+	}
+	if err := tl.FlushContext(context.Background()); err != nil {
+		t.Fatalf("flush February: %v", err)
+	}
+
+	january, err := store.GetUserMonthlyUsage(
+		time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, time.February, 1, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	february, err := store.GetUserMonthlyUsage(
+		time.Date(2026, time.February, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := january["alice"]; got != [2]uint64{10, 20} {
+		t.Fatalf("January usage = %v, want [10 20]", got)
+	}
+	if got := february["alice"]; got != [2]uint64{30, 40} {
+		t.Fatalf("February usage = %v, want [30 40]", got)
+	}
+}
+
 func TestTrafficLogger_Reset(t *testing.T) {
 	logger := zap.NewNop()
 	users := map[string]config.UserConfig{

@@ -48,6 +48,7 @@ type TrafficLogger struct {
 	mu     sync.RWMutex
 	store  *storage.SQLiteStore
 	logger *zap.Logger
+	now    func() time.Time
 
 	stopCh       chan struct{}
 	stopOnce     sync.Once
@@ -96,6 +97,7 @@ func NewTrafficLoggerWithLocation(users map[string]config.UserConfig, store *sto
 		users:        copyUsers(users),
 		store:        store,
 		logger:       logger,
+		now:          time.Now,
 		stopCh:       make(chan struct{}),
 		flushDone:    make(chan struct{}),
 		location:     location,
@@ -103,7 +105,7 @@ func NewTrafficLoggerWithLocation(users map[string]config.UserConfig, store *sto
 		pending:      make(map[pendingKey]storage.TrafficRecord),
 		limiters:     make(map[string]*downloadLimiter),
 	}
-	_ = tl.ensureMonthlyUsage(context.Background(), time.Now())
+	_ = tl.ensureMonthlyUsage(context.Background(), tl.now())
 	// Pre-populate stats for known (user, node) pairs, loading persisted totals
 	for name, u := range users {
 		for _, route := range u.Routes {
@@ -309,7 +311,7 @@ func (tl *TrafficLogger) LogTrafficContext(ctx context.Context, id string, tx, r
 		reason = "unknown_user"
 	case user.Disabled:
 		reason = "disabled"
-	case user.ExpiresAt != nil && !user.ExpiresAt.After(time.Now()):
+	case user.ExpiresAt != nil && !user.ExpiresAt.After(tl.now()):
 		reason = "expired"
 	}
 	tl.mu.RUnlock()
@@ -330,7 +332,7 @@ func (tl *TrafficLogger) LogTrafficContext(ctx context.Context, id string, tx, r
 	if tl.stopping.Load() || ctx.Err() != nil {
 		return false
 	}
-	now := time.Now()
+	now := tl.now()
 	if err := tl.ensureMonthlyUsage(ctx, now); err != nil {
 		return false
 	}
