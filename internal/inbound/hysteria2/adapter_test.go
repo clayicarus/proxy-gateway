@@ -10,6 +10,7 @@ import (
 	"github.com/clayicarus/proxy-gateway/internal/auth"
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"github.com/clayicarus/proxy-gateway/internal/connection"
+	"github.com/clayicarus/proxy-gateway/internal/outbound"
 	"github.com/clayicarus/proxy-gateway/internal/router"
 	"github.com/clayicarus/proxy-gateway/internal/traffic"
 	"go.uber.org/zap"
@@ -36,7 +37,7 @@ func TestAdapterBindsIdentityToStableSessions(t *testing.T) {
 	users := map[string]config.UserConfig{"alice": {Password: "secret", Routes: []string{"direct"}}}
 	tracker := connection.NewTracker()
 	accounting := traffic.NewTrafficLogger(users, nil, logger)
-	adapter := New("public", auth.NewAuthenticator(users, logger), router.NewService(router.NewRouter(users, logger), router.NewOutboundFactory(nil, logger), logger), accounting, tracker, logger)
+	adapter := New("public", auth.NewAuthenticator(users, logger), router.NewService(router.NewRouter(users, logger), outbound.NewOutboundFactory(nil, logger), logger), accounting, tracker, logger)
 	transport := &testTransport{ctx: context.Background(), addr: &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443}, closed: make(chan error, 1)}
 
 	first, ok := adapter.AuthenticateSession(context.Background(), transport, "alice:direct:secret", 0)

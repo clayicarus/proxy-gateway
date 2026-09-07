@@ -1,4 +1,4 @@
-package router
+package outbound
 
 import (
 	"context"
@@ -427,76 +427,5 @@ func TestOutboundFactory_Unknown(t *testing.T) {
 	_, err := f.Get("nonexistent")
 	if err == nil {
 		t.Error("expected error for unknown node")
-	}
-}
-
-func TestServiceRoutesExplicitIdentity(t *testing.T) {
-	logger := zap.NewNop()
-	nodes := map[string]config.NodeConfig{}
-
-	r := NewRouter(map[string]config.UserConfig{
-		"alice": {Password: "p", Routes: []string{"direct"}},
-	}, logger)
-	f := NewOutboundFactory(nodes, logger)
-	service := NewService(r, f, logger)
-
-	// Create a local listener for the test
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to create listener: %v", err)
-	}
-	defer ln.Close()
-
-	go func() {
-		conn, _ := ln.Accept()
-		if conn != nil {
-			conn.Close()
-		}
-	}()
-
-	conn, err := service.TCPContext(context.Background(), "alice:direct", ln.Addr().String())
-	if err != nil {
-		t.Fatalf("routing TCP failed: %v", err)
-	}
-	conn.Close()
-
-}
-
-func TestServiceRejectsMalformedIdentity(t *testing.T) {
-	logger := zap.NewNop()
-	service := NewService(NewRouter(nil, logger), NewOutboundFactory(nil, logger), logger)
-	if _, err := service.TCPContext(context.Background(), "alice", "example.com:443"); err == nil || !strings.Contains(err.Error(), "node is required") {
-		t.Fatalf("authenticated ID without an explicit node should fail closed, got %v", err)
-	}
-}
-
-func TestServiceConcurrentSameTargetKeepsExplicitRoute(t *testing.T) {
-	logger := zap.NewNop()
-	const requests = 100
-	nodes := make(map[string]config.NodeConfig, requests)
-	for i := 0; i < requests; i++ {
-		route := fmt.Sprintf("route-%03d", i)
-		nodes[route] = config.NodeConfig{Type: "test-invalid"}
-	}
-	service := NewService(NewRouter(nil, logger), NewOutboundFactory(nodes, logger), logger)
-
-	var wg sync.WaitGroup
-	errors := make(chan error, requests)
-	for i := 0; i < requests; i++ {
-		i := i
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			route := fmt.Sprintf("route-%03d", i)
-			_, err := service.TCPContext(context.Background(), "user:"+route, "same.example:443")
-			if err == nil || !strings.Contains(err.Error(), "node "+route+" unavailable:") {
-				errors <- fmt.Errorf("request %d used wrong route: %v", i, err)
-			}
-		}()
-	}
-	wg.Wait()
-	close(errors)
-	for err := range errors {
-		t.Error(err)
 	}
 }

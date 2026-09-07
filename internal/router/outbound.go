@@ -4,43 +4,24 @@ import (
 	"context"
 	"net"
 
+	"github.com/clayicarus/proxy-gateway/internal/outbound"
 	"go.uber.org/zap"
 )
-
-// UDPConn is the protocol-neutral datagram association required by Gateway
-// egress. Protocol adapters may convert it to their library's identical
-// interface at their boundary.
-type UDPConn interface {
-	ReadFrom([]byte) (int, string, error)
-	WriteTo([]byte, string) (int, error)
-	Close() error
-}
-
-// Outbound is the protocol-neutral outbound contract.
-type Outbound interface {
-	TCP(string) (net.Conn, error)
-	UDP(string) (UDPConn, error)
-}
-
-type contextualOutbound interface {
-	TCPContext(context.Context, string) (net.Conn, error)
-	UDPContext(context.Context, string) (UDPConn, error)
-}
 
 // Service resolves an explicitly authenticated route and opens its outbound.
 // It deliberately has no protocol callback or mutable request-handoff state.
 type Service struct {
 	router  *Router
-	factory *OutboundFactory
+	factory *outbound.OutboundFactory
 	logger  *zap.Logger
 }
 
-func NewService(router *Router, factory *OutboundFactory, logger *zap.Logger) *Service {
+func NewService(router *Router, factory *outbound.OutboundFactory, logger *zap.Logger) *Service {
 	return &Service{router: router, factory: factory, logger: logger}
 }
 
 // OutboundForID returns the outbound authorized for one authenticated route.
-func (s *Service) OutboundForID(id string) (Outbound, error) {
+func (s *Service) OutboundForID(id string) (outbound.Outbound, error) {
 	route, err := s.router.GetRoute(id)
 	if err != nil {
 		return nil, err
@@ -57,13 +38,13 @@ func (s *Service) TCPContext(ctx context.Context, id, reqAddr string) (net.Conn,
 		zap.String("id", id),
 		zap.String("reqAddr", reqAddr),
 	)
-	if contextual, ok := ob.(contextualOutbound); ok {
+	if contextual, ok := ob.(outbound.ContextualOutbound); ok {
 		return contextual.TCPContext(ctx, reqAddr)
 	}
 	return ob.TCP(reqAddr)
 }
 
-func (s *Service) UDPContext(ctx context.Context, id, reqAddr string) (UDPConn, error) {
+func (s *Service) UDPContext(ctx context.Context, id, reqAddr string) (outbound.UDPConn, error) {
 	ob, err := s.OutboundForID(id)
 	if err != nil {
 		return nil, err
@@ -72,7 +53,7 @@ func (s *Service) UDPContext(ctx context.Context, id, reqAddr string) (UDPConn, 
 		zap.String("id", id),
 		zap.String("reqAddr", reqAddr),
 	)
-	if contextual, ok := ob.(contextualOutbound); ok {
+	if contextual, ok := ob.(outbound.ContextualOutbound); ok {
 		return contextual.UDPContext(ctx, reqAddr)
 	}
 	return ob.UDP(reqAddr)

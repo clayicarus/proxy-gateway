@@ -13,7 +13,7 @@ import (
 
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"github.com/clayicarus/proxy-gateway/internal/connection"
-	"github.com/clayicarus/proxy-gateway/internal/router"
+	"github.com/clayicarus/proxy-gateway/internal/outbound"
 	"github.com/clayicarus/proxy-gateway/internal/storage"
 	"github.com/clayicarus/proxy-gateway/internal/traffic"
 	"go.uber.org/zap"
@@ -392,9 +392,9 @@ func TestDirectRouteSetOnlyIncludesBuiltInRoute(t *testing.T) {
 	}
 }
 
-type staticNodeStatuses map[string]router.NodeStatus
+type staticNodeStatuses map[string]outbound.NodeStatus
 
-func (s staticNodeStatuses) NodeStatuses() map[string]router.NodeStatus { return s }
+func (s staticNodeStatuses) NodeStatuses() map[string]outbound.NodeStatus { return s }
 
 func TestManagerRendersRuntimeNodeStatus(t *testing.T) {
 	store, err := storage.NewSQLiteStore(t.TempDir()+"/admin.db", zap.NewNop())
@@ -416,7 +416,7 @@ func TestManagerRendersRuntimeNodeStatus(t *testing.T) {
 	now := time.Date(2026, 8, 9, 10, 11, 12, 0, time.UTC)
 	manager.SetNodeStatusProvider(staticNodeStatuses{"ready-node": {
 		Name:         "ready-node",
-		State:        router.NodeReady,
+		State:        outbound.NodeReady,
 		ResolvedAddr: "[2001:db8::1]:443",
 		LastSuccess:  now,
 	}})

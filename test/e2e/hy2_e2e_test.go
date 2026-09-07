@@ -23,6 +23,7 @@ import (
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"github.com/clayicarus/proxy-gateway/internal/connection"
 	hyInbound "github.com/clayicarus/proxy-gateway/internal/inbound/hysteria2"
+	"github.com/clayicarus/proxy-gateway/internal/outbound"
 	"github.com/clayicarus/proxy-gateway/internal/router"
 	"github.com/clayicarus/proxy-gateway/internal/traffic"
 	"go.uber.org/zap"
@@ -243,7 +244,7 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 	authenticator := auth.NewAuthenticator(users, logger)
 	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
 	routerEngine := router.NewRouter(users, logger)
-	outboundFactory := router.NewOutboundFactory(nodes, logger)
+	outboundFactory := outbound.NewOutboundFactory(nodes, logger)
 	routingService := router.NewService(routerEngine, outboundFactory, logger)
 	tracker := connection.NewTracker()
 	adapter := hyInbound.New("hy2-e2e", authenticator, routingService, trafficLogger, tracker, logger)
@@ -479,7 +480,7 @@ func TestHy2E2E_UnknownUser(t *testing.T) {
 	authenticator := auth.NewAuthenticator(users, logger)
 	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
 	routerEngine := router.NewRouter(users, logger)
-	outboundFactory := router.NewOutboundFactory(nodes, logger)
+	outboundFactory := outbound.NewOutboundFactory(nodes, logger)
 	routingService := router.NewService(routerEngine, outboundFactory, logger)
 	adapter := hyInbound.New("unknown-user", authenticator, routingService, trafficLogger, connection.NewTracker(), logger)
 
@@ -564,7 +565,7 @@ func TestHy2E2E_ExpiredUserDisconnectsExistingConnection(t *testing.T) {
 	}
 	authenticator := auth.NewAuthenticator(users, logger)
 	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
-	routingService := router.NewService(router.NewRouter(users, logger), router.NewOutboundFactory(nil, logger), logger)
+	routingService := router.NewService(router.NewRouter(users, logger), outbound.NewOutboundFactory(nil, logger), logger)
 	adapter := hyInbound.New("expiry", authenticator, routingService, trafficLogger, connection.NewTracker(), logger)
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {

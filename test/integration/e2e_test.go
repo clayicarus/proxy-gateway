@@ -8,6 +8,7 @@ import (
 
 	"github.com/clayicarus/proxy-gateway/internal/auth"
 	"github.com/clayicarus/proxy-gateway/internal/config"
+	"github.com/clayicarus/proxy-gateway/internal/outbound"
 	"github.com/clayicarus/proxy-gateway/internal/router"
 	"github.com/clayicarus/proxy-gateway/internal/storage"
 	"github.com/clayicarus/proxy-gateway/internal/traffic"
@@ -62,7 +63,7 @@ func TestE2E_FullPipeline(t *testing.T) {
 	authenticator := auth.NewAuthenticator(users, logger)
 	trafficLogger := traffic.NewTrafficLogger(users, store, logger)
 	routerEngine := router.NewRouter(users, logger)
-	outboundFactory := router.NewOutboundFactory(nodes, logger)
+	outboundFactory := outbound.NewOutboundFactory(nodes, logger)
 	routingService := router.NewService(routerEngine, outboundFactory, logger)
 
 	// --- Simulate client connection ---
@@ -180,7 +181,7 @@ func TestE2E_MultiUserRouting(t *testing.T) {
 		"bob":   {Password: "p", Routes: []string{"direct"}},
 	}
 	routerEngine := router.NewRouter(multiUsers, logger)
-	outboundFactory := router.NewOutboundFactory(nodes, logger)
+	outboundFactory := outbound.NewOutboundFactory(nodes, logger)
 	routingService := router.NewService(routerEngine, outboundFactory, logger)
 
 	conn1, err := routingService.TCPContext(context.Background(), "alice:direct", target1Ln.Addr().String())
@@ -230,7 +231,7 @@ func TestE2E_NodeFailureIsReturned(t *testing.T) {
 	}
 
 	routerEngine := router.NewRouter(users, logger)
-	outboundFactory := router.NewOutboundFactory(nodes, logger)
+	outboundFactory := outbound.NewOutboundFactory(nodes, logger)
 	routingService := router.NewService(routerEngine, outboundFactory, logger)
 	_, err := routingService.TCPContext(context.Background(), "alice:broken_node", "example.com:443")
 	if err == nil {

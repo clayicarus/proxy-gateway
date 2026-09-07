@@ -23,6 +23,7 @@ import (
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"github.com/clayicarus/proxy-gateway/internal/connection"
 	hyInbound "github.com/clayicarus/proxy-gateway/internal/inbound/hysteria2"
+	"github.com/clayicarus/proxy-gateway/internal/outbound"
 	"github.com/clayicarus/proxy-gateway/internal/router"
 	"github.com/clayicarus/proxy-gateway/internal/storage"
 	"github.com/clayicarus/proxy-gateway/internal/subtoken"
@@ -101,7 +102,7 @@ func runGatewayContext(runCtx context.Context, args []string) error {
 	authenticator := auth.NewAuthenticator(users, logger)
 	trafficLogger := traffic.NewTrafficLoggerWithLocation(users, store, logger, location)
 	routerEngine := router.NewRouter(users, logger)
-	outboundFactory := router.NewOutboundFactory(nodes, logger)
+	outboundFactory := outbound.NewOutboundFactory(nodes, logger)
 	routingService := router.NewService(routerEngine, outboundFactory, logger)
 	connectionTracker := connection.NewTracker()
 

@@ -13,6 +13,7 @@ import (
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"github.com/clayicarus/proxy-gateway/internal/connection"
 	hyInbound "github.com/clayicarus/proxy-gateway/internal/inbound/hysteria2"
+	"github.com/clayicarus/proxy-gateway/internal/outbound"
 	"github.com/clayicarus/proxy-gateway/internal/router"
 	"github.com/clayicarus/proxy-gateway/internal/traffic"
 	"go.uber.org/zap"
@@ -111,7 +112,7 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 	authenticator := auth.NewAuthenticator(users, logger)
 	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
 	routerEngine := router.NewRouter(users, logger)
-	outboundFactory := router.NewOutboundFactory(nodes, logger)
+	outboundFactory := outbound.NewOutboundFactory(nodes, logger)
 	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := outboundFactory.Warmup(warmupCtx); err != nil {
 		warmupCancel()
