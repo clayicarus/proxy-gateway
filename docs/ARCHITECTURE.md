@@ -136,7 +136,8 @@ internal/auth/        auth 解析、鉴权和用户快照更新
 internal/config/      启动 YAML 与旧 YAML 类型
 internal/connection/  活跃连接和请求追踪
 internal/inbound/     协议 adapter 与协议库边界
-internal/router/      协议无关的路由决策、出站工厂与出站实现
+internal/outbound/    Direct、Hy2 node client、重试与连接资源管理
+internal/router/      协议无关的路由决策
 internal/storage/     SQLite schema、迁移和查询
 internal/subtoken/    随机 token 与旧 HMAC token
 internal/systemd/     D-Bus 和 sd_notify

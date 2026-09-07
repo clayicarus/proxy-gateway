@@ -24,7 +24,7 @@ nodes, err := store.LoadNodes()
 authenticator := auth.NewAuthenticator(users, logger)
 trafficLogger := traffic.NewTrafficLoggerWithLocation(users, store, logger, location)
 routerEngine := router.NewRouter(users, logger)
-outboundFactory := router.NewOutboundFactory(nodes, logger)
+outboundFactory := outbound.NewOutboundFactory(nodes, logger)
 warmupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 _ = outboundFactory.Warmup(warmupCtx)
 cancel()
@@ -80,7 +80,7 @@ adapter 会拒绝未知 session；router.Service 会拒绝 ID 缺少节点、未
 
 ## 出站适配
 
-`OutboundFactory` 只提供内建 Direct 与数据库中的 Hysteria2 节点。Direct TCP 使用带 10 秒超时的标准 `net.Dialer`。Hysteria2 outbound 使用上游 `client.NewClient`，Gateway 自己管理每个节点的 eager 连接状态和重试生命周期。
+`outbound.OutboundFactory` 只提供内建 Direct 与数据库中的 Hysteria2 节点。Direct TCP 使用带 10 秒超时的标准 `net.Dialer`。Hysteria2 outbound 使用 fork 的 `client.NewClientContext`，Gateway 自己管理每个节点的 eager 连接状态和重试生命周期。
 
 启动时最多同时预连接 8 个节点，首轮预热最多等待 10 秒；节点失败互相隔离。请求路径只使用 Ready client，不可用时立即报错；后台以最长 60 秒的指数退避重连。每次尝试都以 3 秒超时重新查询 DNS，并依次尝试 A/AAAA 地址；连接到解析 IP 时仍将配置域名作为默认 SNI。Hy2 握手保留上游默认 5 秒超时。当前每节点一条活动 client 连接，不是连接池。
 

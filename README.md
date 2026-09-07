@@ -210,7 +210,8 @@ internal/auth/     用户认证和热刷新
 internal/config/   YAML 启动配置及旧配置解析
 internal/connection/ 活跃连接追踪
 internal/inbound/  协议 adapter 与协议库边界
-internal/router/   协议无关的策略路由和出站管理
+internal/outbound/ Direct、Hy2 node client、重试与连接资源管理
+internal/router/   协议无关的策略路由
 internal/storage/  SQLite schema 与查询
 internal/subtoken/ 订阅 token
 internal/systemd/  D-Bus 重启和 watchdog 通知

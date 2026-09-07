@@ -2,7 +2,7 @@
 
 日期：2026-09-08
 
-状态：S0–S2 已实施并完成对应回归；S3/S4 的可启动 Hy2 生产路径、多具名 inbound 运行时 schema 与有界停机已激活。S3 的旧公共类型删除、完全协议无关的共享内核与进程级生命周期覆盖仍未完成，本文仍是其验收契约。
+状态：S0–S4 已实施并完成常规与 race 回归；Hy2 生产路径使用 session adapter，运行时启用多具名 inbound schema 和有界停机。本文保留后续 Trojan 与更细粒度并发/生产 CI 验收契约。
 
 修订对象：[INBOUND_POLICY_REFACTOR.md](INBOUND_POLICY_REFACTOR.md)。
 
@@ -494,9 +494,9 @@ S0 的能力实验与迁移工具可以单独交付；独立共享缺陷修复�
 - S0 固定了仓库内 Hy2 v2.8.1 fork，提供 session/request/transport、取消与 `Wait` 能力；严格 validator、排他写入迁移工具，以及上游 client/server 双向互通测试已加入。fork 全量测试和仓库全量测试均已执行。
 - S1 明确拒绝未接入数据面的 `obfs`/`masquerade`，并修复单个 UDP association 本地关闭误伤共享 node 的问题。
 - S2 接入稳定 session/request identity、显式 route ID、可取消 direct/node 出站与统一 TCP/UDP 账本；3000 字节 UDP echo 的兼容计量断言为 tx=3000、rx=6000。
-- S3/S4 已将生产 Gateway 切换到 session-aware Hy2 adapter 和唯一 `inbounds` schema；多个 listener 在全部构造成功后才启动，停机保留 12 秒 worker 与至少 3 秒最终刷盘/SQLite close 预算。
+- S3/S4 已将生产 Gateway 切换到 session-aware Hy2 adapter 和唯一 `inbounds` schema；多个 listener 在全部构造成功后才启动，停机保留 12 秒 worker 与至少 3 秒最终刷盘/SQLite close 预算。`internal/event` 和旧 `router.RoutingOutbound` 单槽 API 已删除；`internal/router` 只保留协议无关的显式策略路由，Direct/Hy2 node client、重试和连接资源管理收敛到 `internal/outbound`。Gateway 生命周期测试覆盖了后续 inbound bind 失败时释放已取得 listener，以及正常运行在取消后的收敛。
 
-尚未完成的工作是 S3 的结构收敛：`internal/event`、旧 `router.RoutingOutbound` 单槽兼容 API 和 Hy2 类型依赖仍保留给旧调用者与测试，尚未形成完全独立的协议无关 policy/session kernel。多 inbound bind 失败回收、停机预算耗尽、跨月 pending/flush 竞争等仍需要补进程级或可控并发测试；全量 race、fuzz 和目标 Linux CI 也尚未重新执行。未完成这些门槛前，不宣称核心重构或后续 Trojan 阶段已完成。
+仍需扩展的验证包括 worker 预算耗尽、跨月 pending/flush 竞争、完整 fuzz 和目标 Linux CI。它们不改变已激活的请求身份、路由或计量语义；Trojan 阶段仍按独立范围和验收执行。
 
 ## 15. 后续 TODO
 
