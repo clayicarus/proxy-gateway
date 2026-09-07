@@ -6,15 +6,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	hyServer "github.com/apernet/hysteria/core/v2/server"
 	"github.com/clayicarus/proxy-gateway/internal/auth"
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"github.com/clayicarus/proxy-gateway/internal/storage"
 	"go.uber.org/zap"
 )
-
-// Compile-time check that TrafficLogger implements server.TrafficLogger.
-var _ hyServer.TrafficLogger = (*TrafficLogger)(nil)
 
 // UserNodeStats holds traffic statistics for a single (user, node) pair.
 type UserNodeStats struct {
@@ -42,9 +38,8 @@ type StatsSnapshot struct {
 	LastActive  int64  `json:"lastActive"`
 }
 
-// TrafficLogger implements the Hysteria2 TrafficLogger interface
-// and provides per-(user, node) traffic accounting with quota enforcement
-// and periodic SQLite persistence.
+// TrafficLogger provides protocol-neutral per-(user, node) traffic accounting
+// with quota enforcement and periodic SQLite persistence.
 //
 // The id passed to LogTraffic is "username:node_name" as returned by Authenticator.
 type TrafficLogger struct {
@@ -53,8 +48,6 @@ type TrafficLogger struct {
 	mu     sync.RWMutex
 	store  *storage.SQLiteStore
 	logger *zap.Logger
-
-	tracedStreams sync.Map // map[quic.StreamID]*server.StreamStats
 
 	stopCh       chan struct{}
 	stopOnce     sync.Once
@@ -572,14 +565,4 @@ func (tl *TrafficLogger) userLimits(username string) (maxBytes, speedLimit uint6
 	user := tl.users[username]
 	tl.mu.RUnlock()
 	return user.MaxBytes, user.SpeedLimit
-}
-
-// TraceStream implements server.TrafficLogger.
-func (tl *TrafficLogger) TraceStream(stream hyServer.HyStream, stats *hyServer.StreamStats) {
-	tl.tracedStreams.Store(stream.StreamID(), stats)
-}
-
-// UntraceStream implements server.TrafficLogger.
-func (tl *TrafficLogger) UntraceStream(stream hyServer.HyStream) {
-	tl.tracedStreams.Delete(stream.StreamID())
 }
