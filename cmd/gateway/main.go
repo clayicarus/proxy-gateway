@@ -47,6 +47,10 @@ func main() {
 }
 
 func runGateway(args []string) error {
+	return runGatewayContext(context.Background(), args)
+}
+
+func runGatewayContext(runCtx context.Context, args []string) error {
 	flags := flag.NewFlagSet("proxy-gateway", flag.ExitOnError)
 	configPath := flags.String("c", "configs/gateway.yaml", "path to config file")
 	_ = flags.Parse(args)
@@ -249,11 +253,9 @@ func runGateway(args []string) error {
 	}
 
 	// Wait for shutdown signal or server error
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	var serviceErr error
 	select {
@@ -261,7 +263,8 @@ func runGateway(args []string) error {
 		logger.Info("received signal, shutting down", zap.String("signal", sig.String()))
 	case serviceErr = <-serviceErrCh:
 		logger.Error("service error", zap.Error(serviceErr))
-	case <-ctx.Done():
+	case <-runCtx.Done():
+		logger.Info("gateway context canceled, shutting down", zap.Error(runCtx.Err()))
 	}
 
 	// Graceful shutdown: 12s maximum for workers and a separately preserved
