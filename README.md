@@ -2,7 +2,7 @@
 
 基于 Hysteria2 的多用户网关。客户端显式选择获授权的出站节点，Gateway 负责认证、路由、流量计量、配额和下载限速，并通过 SQLite 和本地 Web 后台管理运行配置。
 
-项目直接实现 Hysteria2 核心接口，不修改上游源码。
+项目固定使用基于 Hysteria2 core v2.8.1 的仓库内最小补丁；补丁只增加请求身份、取消和完整生命周期能力，不修改 wire protocol。
 
 ## 功能
 
@@ -45,7 +45,10 @@ CGO_ENABLED=1 go test ./...
 ### 1. 配置启动参数
 
 ```yaml
-listen: :8443
+inbounds:
+  - name: hy2-public
+    type: hysteria2
+    listen: :8443
 
 tls:
   cert: /etc/proxy-gateway/cert.pem
@@ -57,6 +60,7 @@ admin:
 sub:
   listen: "127.0.0.1:9091"
   publicURL: "https://sub.example.com/sub/"
+  inbound: hy2-public
   serverAddr: "gateway.example.com:8443"
   sni: "gateway.example.com"
 
@@ -69,7 +73,7 @@ systemd:
   watchdog: true
 ```
 
-必须提供 `tls.cert` 与 `tls.key` 证书文件。`listen` 是 Hysteria2 的 UDP 端口；`admin.listen` 和 `sub.listen` 是两个独立的 HTTP/TCP 端口。`sub.publicURL` 是用户获取订阅的 URL 前缀，`sub.serverAddr` 则是订阅内容中客户端连接 Gateway 的地址。
+必须提供 `tls.cert` 与 `tls.key` 证书文件。`inbounds` 是具名 Hysteria2 UDP 入口列表，`sub.inbound` 明确选择订阅对应的入口；`admin.listen` 和 `sub.listen` 是两个独立的 HTTP/TCP 端口。`sub.publicURL` 是用户获取订阅的 URL 前缀，`sub.serverAddr` 则是订阅内容中客户端连接 Gateway 的地址。
 
 用户和节点不写在正常运行 YAML 中。首次启动后通过管理后台创建。
 
@@ -113,7 +117,14 @@ tls:
 proxy-gateway migrate -c /etc/proxy-gateway/legacy-gateway.yaml
 ```
 
-旧订阅 token 使用 YAML 的 `sub.secret`，缺省时使用 `api.secret`。迁移会将旧 HMAC token 的哈希写入数据库，使已发布链接继续可用。完成后从正常运行 YAML 删除 `users`、`nodes` 和 `fallback`。
+旧订阅 token 使用 YAML 的 `sub.secret`，缺省时使用 `api.secret`。迁移会将旧 HMAC token 的哈希写入数据库，使已发布链接继续可用。数据库迁移完成后，再将不含管理数据和 secret 的旧运行参数转换为唯一运行时 schema：
+
+```bash
+scripts/migrate-inbounds --input /etc/proxy-gateway/legacy-runtime.yaml --output /etc/proxy-gateway/gateway.yaml
+scripts/validate-inbounds --input /etc/proxy-gateway/gateway.yaml
+```
+
+运行时明确拒绝旧顶层 `listen/quic/api` 以及 `users`、`nodes`、`obfs`、`masquerade`。
 
 需要以旧 YAML 原子替换数据库中的用户和授权时：
 

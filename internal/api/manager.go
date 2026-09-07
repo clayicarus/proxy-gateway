@@ -88,6 +88,17 @@ type liveTraffic struct {
 	Online  int32  `json:"online"`
 }
 
+func gatewayListenDisplay(cfg *config.Config) string {
+	if len(cfg.Inbounds) == 0 {
+		return cfg.Listen
+	}
+	values := make([]string, 0, len(cfg.Inbounds))
+	for _, inbound := range cfg.Inbounds {
+		values = append(values, inbound.Name+"="+inbound.Listen)
+	}
+	return strings.Join(values, ", ")
+}
+
 type liveStatus struct {
 	SampledAt   int64                  `json:"sampledAt"`
 	Total       liveTraffic            `json:"total"`
@@ -503,7 +514,7 @@ func (m *Manager) dashboard(w http.ResponseWriter, r *http.Request) {
 		MonthlyTotal:       monthlyTotal,
 		NodeEgressTotal:    nodeEgressTotal,
 		OnlineCount:        onlineCount,
-		GatewayListen:      m.cfg.Listen,
+		GatewayListen:      gatewayListenDisplay(m.cfg),
 		AdminListen:        adminListen,
 		SubscriptionListen: subscriptionListen,
 		DBPath:             m.cfg.DBPath,

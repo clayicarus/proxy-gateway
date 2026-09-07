@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -21,7 +22,7 @@ import (
 	"github.com/clayicarus/proxy-gateway/internal/auth"
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"github.com/clayicarus/proxy-gateway/internal/connection"
-	"github.com/clayicarus/proxy-gateway/internal/event"
+	hyInbound "github.com/clayicarus/proxy-gateway/internal/inbound/hysteria2"
 	"github.com/clayicarus/proxy-gateway/internal/router"
 	"github.com/clayicarus/proxy-gateway/internal/storage"
 	"github.com/clayicarus/proxy-gateway/internal/subtoken"
@@ -57,15 +58,14 @@ func runGateway(args []string) error {
 	zapCfg.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 	logger, err := zapCfg.Build()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to create logger: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("create logger: %w", err)
 	}
 	defer logger.Sync()
 
 	// Load configuration
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.LoadRuntime(*configPath)
 	if err != nil {
-		logger.Fatal("failed to load config", zap.Error(err))
+		return fmt.Errorf("load config: %w", err)
 	}
 	logger.Info("config loaded",
 		zap.String("listen", cfg.Listen),
@@ -74,77 +74,127 @@ func runGateway(args []string) error {
 	// Initialize SQLite store
 	store, err := storage.NewSQLiteStore(cfg.DBPath, logger)
 	if err != nil {
-		logger.Fatal("failed to open sqlite store", zap.Error(err))
+		return fmt.Errorf("open sqlite store: %w", err)
 	}
-	defer store.Close()
 	logger.Info("sqlite store opened", zap.String("path", cfg.DBPath))
 
 	// Load the restart-applied database snapshot. An empty database is valid;
 	// the local management Web creates the first users and nodes.
 	users, err := store.LoadRuntimeUsers()
 	if err != nil {
-		logger.Fatal("failed to load managed users", zap.Error(err))
+		_ = store.Close()
+		return fmt.Errorf("load managed users: %w", err)
 	}
 	nodes, err := store.LoadNodes()
 	if err != nil {
-		logger.Fatal("failed to load managed nodes", zap.Error(err))
+		_ = store.Close()
+		return fmt.Errorf("load managed nodes: %w", err)
 	}
 	location, _ := time.LoadLocation(cfg.Timezone)
 	logger.Info("runtime configuration loaded", zap.Int("users", len(users)), zap.Int("nodes", len(nodes)))
 
-	// Initialize components
+	// Initialize shared components.
 	authenticator := auth.NewAuthenticator(users, logger)
 	trafficLogger := traffic.NewTrafficLoggerWithLocation(users, store, logger, location)
 	routerEngine := router.NewRouter(users, logger)
 	outboundFactory := router.NewOutboundFactory(nodes, logger)
-	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := outboundFactory.Warmup(warmupCtx); err != nil {
-		logger.Warn("node warmup incomplete; startup will continue", zap.Error(err))
-	}
-	warmupCancel()
 	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
 	connectionTracker := connection.NewTracker()
-	eventLogger := event.NewEventLogger(routingOutbound, logger, connectionTracker)
 
-	// Start periodic traffic flush to SQLite
-	trafficLogger.StartPeriodicFlush(cfg.TrafficFlushInterval)
-
-	logger.Info("all components initialized")
-
-	// Start local management Web and, when configured, the separate public
-	// subscription listener. The old api.listen value is accepted as a legacy
-	// alias for admin.listen but no longer grants a JSON management API.
-	var httpServers []*http.Server
-	serviceErrCh := make(chan error, 3)
-	adminListen := cfg.Admin.Listen
-	if adminListen == "" {
-		adminListen = cfg.API.Listen
+	// Load TLS before acquiring listeners so certificate failure owns no bound
+	// sockets. All listeners and protocol servers are then constructed before
+	// any serve loop starts.
+	tlsCert, err := tls.LoadX509KeyPair(cfg.TLS.Cert, cfg.TLS.Key)
+	if err != nil {
+		_ = store.Close()
+		return fmt.Errorf("load TLS certificate: %w", err)
 	}
+	type httpService struct {
+		name     string
+		server   *http.Server
+		listener net.Listener
+	}
+	type inboundService struct {
+		name   string
+		server hyServer.Server
+	}
+	var httpServices []httpService
+	var inboundServices []inboundService
+	cleanupConstructed := func() {
+		for _, service := range httpServices {
+			_ = service.listener.Close()
+		}
+		for _, service := range inboundServices {
+			_ = service.server.Close()
+		}
+		outboundFactory.Close()
+		_ = store.Close()
+	}
+
+	adminListen := cfg.Admin.Listen
 	if adminListen != "" {
 		if !isLoopbackListen(adminListen) {
-			logger.Fatal("management web must listen on a loopback address", zap.String("listen", adminListen))
+			cleanupConstructed()
+			return fmt.Errorf("management web must listen on a loopback address: %s", adminListen)
 		}
 		manager, err := api.NewManager(cfg, store, trafficLogger, logger, connectionTracker)
 		if err != nil {
-			logger.Fatal("failed to create management web", zap.Error(err))
+			cleanupConstructed()
+			return fmt.Errorf("create management web: %w", err)
 		}
 		manager.SetNodeStatusProvider(outboundFactory)
 		httpServer := &http.Server{Addr: adminListen, Handler: manager.Handler(), ReadHeaderTimeout: 10 * time.Second}
 		listener, err := net.Listen("tcp", adminListen)
 		if err != nil {
-			logger.Fatal("management web failed to listen", zap.String("listen", adminListen), zap.Error(err))
+			cleanupConstructed()
+			return fmt.Errorf("management web listen %s: %w", adminListen, err)
 		}
-		httpServers = append(httpServers, httpServer)
-		go serveHTTP(logger, "management web", httpServer, listener, serviceErrCh)
+		httpServices = append(httpServices, httpService{name: "management web", server: httpServer, listener: listener})
 	}
 	if cfg.Sub != nil && cfg.Sub.Listen != "" {
 		httpServer := &http.Server{Addr: cfg.Sub.Listen, Handler: api.NewDatabaseSubscriptionHandler(cfg, store, users, nodes, logger).Handler(), ReadHeaderTimeout: 10 * time.Second}
 		listener, err := net.Listen("tcp", cfg.Sub.Listen)
 		if err != nil {
-			logger.Fatal("subscription service failed to listen", zap.String("listen", cfg.Sub.Listen), zap.Error(err))
+			cleanupConstructed()
+			return fmt.Errorf("subscription service listen %s: %w", cfg.Sub.Listen, err)
 		}
-		httpServers = append(httpServers, httpServer)
-		go serveHTTP(logger, "subscription service", httpServer, listener, serviceErrCh)
+		httpServices = append(httpServices, httpService{name: "subscription service", server: httpServer, listener: listener})
+	}
+	for _, inbound := range cfg.Inbounds {
+		udpAddr, err := net.ResolveUDPAddr("udp", inbound.Listen)
+		if err != nil {
+			cleanupConstructed()
+			return fmt.Errorf("resolve inbound %s listen: %w", inbound.Name, err)
+		}
+		udpConn, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			cleanupConstructed()
+			return fmt.Errorf("inbound %s listen: %w", inbound.Name, err)
+		}
+		adapter := hyInbound.New(inbound.Name, authenticator, routingOutbound, trafficLogger, connectionTracker, logger)
+		server, err := hyServer.NewServer(&hyServer.Config{
+			TLSConfig:  hyServer.TLSConfig{Certificates: []tls.Certificate{tlsCert}},
+			QUICConfig: buildInboundQUICConfig(inbound.QUIC), Conn: udpConn,
+			SessionAuthenticator: adapter, SessionOutbound: adapter,
+			SessionTrafficLogger: adapter, SessionEventLogger: adapter,
+		})
+		if err != nil {
+			_ = udpConn.Close()
+			cleanupConstructed()
+			return fmt.Errorf("construct inbound %s: %w", inbound.Name, err)
+		}
+		inboundServices = append(inboundServices, inboundService{name: inbound.Name, server: server})
+	}
+
+	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := outboundFactory.Warmup(warmupCtx); err != nil {
+		logger.Warn("node warmup incomplete; startup will continue", zap.Error(err))
+	}
+	warmupCancel()
+	trafficLogger.StartPeriodicFlush(cfg.TrafficFlushInterval)
+	serviceErrCh := make(chan error, len(httpServices)+len(inboundServices))
+	for _, service := range httpServices {
+		go serveHTTP(logger, service.name, service.server, service.listener, serviceErrCh)
 	}
 
 	// Only user lifecycle fields are hot-reloaded. Node definitions and route
@@ -159,51 +209,18 @@ func runGateway(args []string) error {
 
 	systemdStop := make(chan struct{})
 
-	// Create UDP listener for QUIC
-	udpAddr, err := net.ResolveUDPAddr("udp", cfg.Listen)
-	if err != nil {
-		logger.Fatal("failed to resolve listen address", zap.Error(err))
-	}
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		logger.Fatal("failed to listen UDP", zap.Error(err))
-	}
-
-	// Load TLS certificate
-	tlsCert, err := tls.LoadX509KeyPair(cfg.TLS.Cert, cfg.TLS.Key)
-	if err != nil {
-		logger.Fatal("failed to load TLS certificate", zap.Error(err))
-	}
-
-	// Create Hysteria2 server
-	hyServerInstance, err := hyServer.NewServer(&hyServer.Config{
-		TLSConfig: hyServer.TLSConfig{
-			Certificates: []tls.Certificate{tlsCert},
-		},
-		QUICConfig:    buildQUICConfig(cfg),
-		Conn:          udpConn,
-		Authenticator: authenticator,
-		Outbound:      routingOutbound,
-		TrafficLogger: trafficLogger,
-		EventLogger:   eventLogger,
-	})
-	if err != nil {
-		logger.Fatal("failed to create hysteria2 server", zap.Error(err))
-	}
-
-	logger.Info("proxy-gateway starting", zap.String("listen", cfg.Listen))
-
-	// Start serving in background
+	logger.Info("proxy-gateway starting", zap.Int("inbounds", len(inboundServices)))
 	var gatewayServing atomic.Bool
-	go func() {
-		gatewayServing.Store(true)
-		defer gatewayServing.Store(false)
-		err := hyServerInstance.Serve()
-		if err == nil {
-			err = fmt.Errorf("serve loop stopped without an error")
-		}
-		serviceErrCh <- fmt.Errorf("Gateway server stopped: %w", err)
-	}()
+	gatewayServing.Store(true)
+	for _, service := range inboundServices {
+		go func(service inboundService) {
+			err := service.server.Serve()
+			if err == nil {
+				err = fmt.Errorf("serve loop stopped without an error")
+			}
+			serviceErrCh <- fmt.Errorf("inbound %s stopped: %w", service.name, err)
+		}(service)
+	}
 
 	state, err := store.GetConfigState()
 	if err != nil {
@@ -247,21 +264,68 @@ func runGateway(args []string) error {
 	case <-ctx.Done():
 	}
 
-	// Graceful shutdown
+	// Graceful shutdown: 12s maximum for workers and a separately preserved
+	// finalization window within the overall 15s budget.
+	gatewayServing.Store(false)
+	trafficLogger.StopAdmission()
 	close(userRefreshStop)
 	close(systemdStop)
 	_ = systemd.Notify("STOPPING=1\nSTATUS=shutting down")
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	for _, server := range httpServers {
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			logger.Warn("HTTP server shutdown failed", zap.Error(err))
+	totalDeadline := time.Now().Add(15 * time.Second)
+	workerCtx, workerCancel := context.WithDeadline(context.Background(), time.Now().Add(12*time.Second))
+	var workers sync.WaitGroup
+	shutdownErrCh := make(chan error, len(inboundServices)+1)
+	addShutdownErr := func(err error) {
+		if err != nil {
+			shutdownErrCh <- err
 		}
 	}
-	shutdownCancel()
-	hyServerInstance.Close()
-	outboundFactory.Close()
-	background.Wait()
-	trafficLogger.Stop()
+	for _, service := range inboundServices {
+		_ = service.server.Close()
+		workers.Add(1)
+		go func(server hyServer.Server) { defer workers.Done(); addShutdownErr(server.Wait(workerCtx)) }(service.server)
+	}
+	for _, service := range httpServices {
+		workers.Add(1)
+		go func(server *http.Server) {
+			defer workers.Done()
+			if err := server.Shutdown(workerCtx); err != nil {
+				_ = server.Close()
+			}
+		}(service.server)
+	}
+	workers.Add(2)
+	go func() { defer workers.Done(); outboundFactory.Close() }()
+	go func() { defer workers.Done(); background.Wait() }()
+	workersDone := make(chan struct{})
+	go func() { workers.Wait(); close(workersDone) }()
+	select {
+	case <-workersDone:
+	case <-workerCtx.Done():
+		addShutdownErr(fmt.Errorf("worker shutdown: %w", workerCtx.Err()))
+		for _, service := range httpServices {
+			_ = service.server.Close()
+		}
+	}
+	workerCancel()
+	for {
+		select {
+		case err := <-shutdownErrCh:
+			serviceErr = errors.Join(serviceErr, err)
+		default:
+			goto shutdownErrorsDrained
+		}
+	}
+
+shutdownErrorsDrained:
+	finalCtx, finalCancel := context.WithDeadline(context.Background(), totalDeadline)
+	if err := trafficLogger.StopContext(finalCtx); err != nil {
+		serviceErr = errors.Join(serviceErr, fmt.Errorf("final traffic flush: %w", err))
+	}
+	finalCancel()
+	if err := store.Close(); err != nil {
+		serviceErr = errors.Join(serviceErr, fmt.Errorf("close sqlite: %w", err))
+	}
 	logger.Info("proxy-gateway stopped")
 	return serviceErr
 }
@@ -282,7 +346,7 @@ func runRecordExit(args []string) {
 	flags := flag.NewFlagSet("proxy-gateway record-exit", flag.ExitOnError)
 	configPath := flags.String("c", "configs/gateway.yaml", "path to config file")
 	_ = flags.Parse(args)
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.LoadRuntime(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config for process record: %v\n", err)
 		return
@@ -442,16 +506,16 @@ func runMigrate(args []string) {
 	logger.Info("legacy YAML migration completed", zap.Int("users", len(cfg.Users)), zap.Int("nodes", len(cfg.Nodes)))
 }
 
-func buildQUICConfig(cfg *config.Config) hyServer.QUICConfig {
+func buildInboundQUICConfig(input *config.QUICConfig) hyServer.QUICConfig {
 	qc := hyServer.QUICConfig{}
-	if cfg.QUIC != nil {
-		qc.InitialStreamReceiveWindow = cfg.QUIC.InitStreamReceiveWindow
-		qc.MaxStreamReceiveWindow = cfg.QUIC.MaxStreamReceiveWindow
-		qc.InitialConnectionReceiveWindow = cfg.QUIC.InitConnReceiveWindow
-		qc.MaxConnectionReceiveWindow = cfg.QUIC.MaxConnReceiveWindow
-		qc.MaxIdleTimeout = cfg.QUIC.MaxIdleTimeout
-		qc.MaxIncomingStreams = cfg.QUIC.MaxIncomingStreams
-		qc.DisablePathMTUDiscovery = cfg.QUIC.DisablePathMTUDiscovery
+	if input != nil {
+		qc.InitialStreamReceiveWindow = input.InitStreamReceiveWindow
+		qc.MaxStreamReceiveWindow = input.MaxStreamReceiveWindow
+		qc.InitialConnectionReceiveWindow = input.InitConnReceiveWindow
+		qc.MaxConnectionReceiveWindow = input.MaxConnReceiveWindow
+		qc.MaxIdleTimeout = input.MaxIdleTimeout
+		qc.MaxIncomingStreams = input.MaxIncomingStreams
+		qc.DisablePathMTUDiscovery = input.DisablePathMTUDiscovery
 	}
 	return qc
 }

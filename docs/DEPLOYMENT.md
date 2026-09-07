@@ -38,22 +38,20 @@ openssl req -new -x509 -key key.pem -out cert.pem -days 365 \
 创建 `/etc/proxy-gateway/gateway.yaml`：
 
 ```yaml
-listen: :8443
+inbounds:
+  - name: hy2-public
+    type: hysteria2
+    listen: :8443
+    # 可选的 QUIC 参数
+    # quic:
+    #   maxIdleTimeout: 30s
+    #   maxIncomingStreams: 1024
 
 tls:
   cert: /etc/proxy-gateway/cert.pem
   key: /etc/proxy-gateway/key.pem
 
-# 可选，客户端需配置同一密码
-# obfs:
-#   type: salamander
-#   salamander:
-#     password: change_me
-
-# 可选的 QUIC 参数
-# quic:
-#   maxIdleTimeout: 30s
-#   maxIncomingStreams: 1024
+# obfs 与 masquerade 未接入 Gateway 数据面；配置任一字段都会拒绝启动。
 
 admin:
   listen: "127.0.0.1:9090"
@@ -61,6 +59,7 @@ admin:
 sub:
   listen: "127.0.0.1:9091"
   publicURL: "https://sub.example.com/sub/"
+  inbound: hy2-public
   serverAddr: "gateway.example.com:8443"
   sni: "gateway.example.com"
   insecure: false
@@ -78,7 +77,7 @@ systemd:
 
 | 配置 | 协议 | 用途 |
 |---|---|---|
-| `listen: :8443` | UDP/QUIC | Hysteria2 客户端流量入口 |
+| `inbounds[].listen: :8443` | UDP/QUIC | 具名 Hysteria2 客户端流量入口 |
 | `admin.listen: 127.0.0.1:9090` | HTTP/TCP | 本地管理后台 |
 | `sub.listen: 127.0.0.1:9091` | HTTP/TCP | 订阅内容服务 |
 
@@ -224,7 +223,19 @@ sudo -u proxygateway /usr/local/bin/proxy-gateway migrate \
 systemctl start proxy-gateway.service
 ```
 
-旧 YAML 必须包含用户、节点，以及 `sub.secret` 或回退使用的 `api.secret`。迁移在一个事务中导入用户、节点、授权，并保存旧 HMAC token 的哈希。数据库已有管理用户或已迁移时会拒绝覆盖。
+旧 YAML 必须包含用户、节点，以及 `sub.secret` 或回退使用的 `api.secret`。该命令只迁移管理数据：在一个事务中导入用户、节点、授权，并保存旧 HMAC token 的哈希。数据库已有管理用户或已迁移时会拒绝覆盖。
+
+随后从不含管理数据和 secret 的旧运行参数生成唯一运行时 schema，输出路径必须不存在：
+
+```bash
+sudo -u proxygateway /usr/local/bin/migrate-inbounds \
+  --input /etc/proxy-gateway/legacy-runtime.yaml \
+  --output /etc/proxy-gateway/gateway.yaml
+sudo -u proxygateway /usr/local/bin/validate-inbounds \
+  --input /etc/proxy-gateway/gateway.yaml
+```
+
+新运行时只接受具名 `inbounds`；旧顶层 `listen/quic/api` 和管理字段会明确拒绝。`obfs` 与 `masquerade` 无数据面实现，迁移与运行时都拒绝。
 
 如果数据库用户表已错误，需要以旧 YAML 完整重建用户和授权：
 

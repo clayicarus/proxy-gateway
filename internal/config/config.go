@@ -10,10 +10,15 @@ import (
 
 // Config is the top-level gateway configuration.
 type Config struct {
-	Listen string    `yaml:"listen"`
-	TLS    TLSConfig `yaml:"tls"`
+	// Inbounds is populated by LoadRuntime. Listen and QUIC remain a
+	// compatibility projection of the first/subscription-bound inbound for the
+	// existing management and subscription read models.
+	Inbounds []Inbound `yaml:"-"`
+	Listen   string    `yaml:"listen"`
+	TLS      TLSConfig `yaml:"tls"`
 
-	// Obfuscation (optional, must match client)
+	// Deprecated: retained only to reject a configuration that the data plane
+	// never implemented.
 	Obfs *ObfsConfig `yaml:"obfs,omitempty"`
 
 	// QUIC tuning
@@ -156,7 +161,48 @@ type SubConfig struct {
 	// SNI override for the generated client config (optional).
 	SNI string `yaml:"sni,omitempty"`
 	// Insecure skips TLS verification in generated client config (for self-signed certs).
-	Insecure bool `yaml:"insecure,omitempty"`
+	Insecure bool   `yaml:"insecure,omitempty"`
+	Inbound  string `yaml:"inbound,omitempty"`
+}
+
+// LoadRuntime reads the only schema accepted by the gateway data plane.
+func LoadRuntime(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+	inbound, err := ParseInboundConfig(data)
+	if err != nil {
+		return nil, err
+	}
+	cfg := &Config{
+		Inbounds:             append([]Inbound(nil), inbound.Inbounds...),
+		TLS:                  inbound.TLS,
+		Admin:                inbound.Admin,
+		DBPath:               inbound.DBPath,
+		TrafficFlushInterval: inbound.TrafficFlushInterval,
+		Timezone:             inbound.Timezone,
+		Systemd:              inbound.Systemd,
+	}
+	if len(cfg.Inbounds) > 0 {
+		cfg.Listen = cfg.Inbounds[0].Listen
+		cfg.QUIC = cfg.Inbounds[0].QUIC
+	}
+	if inbound.Sub != nil {
+		cfg.Sub = &SubConfig{
+			Listen: inbound.Sub.Listen, PublicURL: inbound.Sub.PublicURL,
+			Inbound: inbound.Sub.Inbound, ServerAddr: inbound.Sub.ServerAddr,
+			SNI: inbound.Sub.SNI, Insecure: inbound.Sub.Insecure,
+		}
+		for i := range cfg.Inbounds {
+			if cfg.Inbounds[i].Name == inbound.Sub.Inbound {
+				cfg.Listen = cfg.Inbounds[i].Listen
+				cfg.QUIC = cfg.Inbounds[i].QUIC
+				break
+			}
+		}
+	}
+	return cfg, nil
 }
 
 // Load reads and parses the configuration file.
