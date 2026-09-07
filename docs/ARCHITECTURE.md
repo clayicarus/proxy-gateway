@@ -109,7 +109,7 @@ Hysteria2 将认证 ID、`tx` 和 `rx` 交给 TrafficLogger。Gateway 按 `usern
 
 停用、到期或超额后，Authenticator 拒绝新连接；TrafficLogger 在已有会话产生下一笔流量时、转发和计量该有效负载之前返回 false，使 Hysteria2 关闭整条客户端 QUIC 连接。完全空闲的会话不会被主动清理，可能继续出现在活跃连接中，直到客户端断开、再次产生流量、QUIC idle timeout 或 Gateway 重启；当前上游 server API 没有暴露按用户关闭空闲 QUIC 连接的句柄。密码重置只影响后续认证。
 
-`TraceStream`、`UntraceStream` 与 adapter 的 session/request 回调共同维护内存中的连接和目标快照，管理后台的 `/live` 每 2 秒读取该快照。连接明细不持久化。
+adapter 的 session/request 回调维护内存中的连接和目标快照，管理后台的 `/live` 每 2 秒读取该快照。连接明细不持久化。
 
 ## 管理与订阅
 

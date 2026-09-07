@@ -93,13 +93,11 @@ TrafficLogger 的关键方法包括：
 ```go
 LogTraffic(id string, tx, rx uint64) bool
 LogOnlineState(id string, online bool)
-TraceStream(stream HyStream, stats *StreamStats)
-UntraceStream(stream HyStream)
 ```
 
 `LogTraffic` 将 ID 拆成 username/node 并累计流量。返回 false 会让上游关闭整个客户端连接，用于停用、到期和月额度超限。用户下载限速只作用于 `rx`，但同一用户所有节点和连接共享限速状态。
 
-`TraceStream` 与 `UntraceStream` 不是空实现：它们提供实时 stream 计数和速度数据。adapter 的 session/request 回调另行记录客户端源地址、所选节点和 TCP/UDP 目标，供本地管理后台展示。
+adapter 的 session/request 回调记录客户端源地址、所选节点和 TCP/UDP 目标，供本地管理后台展示；共享账本不再实现 Hy2 stream hook。
 
 ## 热刷新边界
 
