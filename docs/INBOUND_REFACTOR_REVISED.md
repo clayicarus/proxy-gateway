@@ -2,7 +2,7 @@
 
 日期：2026-09-08
 
-状态：设计已确认，S0 实施中；离线配置工具及 S1 的 `obfs`/`masquerade` 单项修复已完成，本文是后续实现与验收契约。
+状态：S0–S2 已实施并完成对应回归；S3/S4 的可启动 Hy2 生产路径、多具名 inbound 运行时 schema 与有界停机已激活。S3 的旧公共类型删除、完全协议无关的共享内核与进程级生命周期覆盖仍未完成，本文仍是其验收契约。
 
 修订对象：[INBOUND_POLICY_REFACTOR.md](INBOUND_POLICY_REFACTOR.md)。
 
@@ -489,9 +489,14 @@ S0 的能力实验与迁移工具可以单独交付；独立共享缺陷修复�
 
 这些诊断曾使用 Go 1.24.13、现有本地依赖及 loopback 网络；临时代码未纳入仓库，不能由本文读者独立复查。S0/S1 必须先把相应场景转成仓库内的失败用例或有界 reproduction，再以修复后的正向断言作为发布证据；如果正式复现结果与上表不同，以提交的测试为准并同步修订本文。
 
-当前已开始 S0：仓库包含离线严格 validator 和旧 YAML 到新 YAML 的排他写入迁移工具及单元测试；旧运行时 `config.Load` 尚未切换。S1 中无效 `obfs`/`masquerade` 的明确拒绝已作为独立正确性修复实现，其他共享修复仍按清单推进。共享内核和 Hy2 补丁仍未实现，也未执行生产迁移或发布；未重新运行全量 race/fuzz/Linux 测试，不以以前的 CI 为本方案背书。
+当前实现状态如下：
 
-仍需 S0 给出技术证据的事项是：最小补丁的具体 API 与 commit、首片到请求绑定的状态机、UDP 兼容驱动器是否需要跨层凭证、可观察的 stream 关闭信号、所有上游 worker 的 Wait 覆盖，以及未打补丁两端的互通。它们是已经明确路线内的实现验证任务，不是尚未回答的产品范围问题。相应验证不成立时修订该接口，不降低当前 Hy2 回归要求，也不悄悄改 UDP 计量口径。
+- S0 固定了仓库内 Hy2 v2.8.1 fork，提供 session/request/transport、取消与 `Wait` 能力；严格 validator、排他写入迁移工具，以及上游 client/server 双向互通测试已加入。fork 全量测试和仓库全量测试均已执行。
+- S1 明确拒绝未接入数据面的 `obfs`/`masquerade`，并修复单个 UDP association 本地关闭误伤共享 node 的问题。
+- S2 接入稳定 session/request identity、显式 route ID、可取消 direct/node 出站与统一 TCP/UDP 账本；3000 字节 UDP echo 的兼容计量断言为 tx=3000、rx=6000。
+- S3/S4 已将生产 Gateway 切换到 session-aware Hy2 adapter 和唯一 `inbounds` schema；多个 listener 在全部构造成功后才启动，停机保留 12 秒 worker 与至少 3 秒最终刷盘/SQLite close 预算。
+
+尚未完成的工作是 S3 的结构收敛：`internal/event`、旧 `router.RoutingOutbound` 单槽兼容 API 和 Hy2 类型依赖仍保留给旧调用者与测试，尚未形成完全独立的协议无关 policy/session kernel。多 inbound bind 失败回收、停机预算耗尽、跨月 pending/flush 竞争等仍需要补进程级或可控并发测试；全量 race、fuzz 和目标 Linux CI 也尚未重新执行。未完成这些门槛前，不宣称核心重构或后续 Trojan 阶段已完成。
 
 ## 15. 后续 TODO
 
