@@ -8,13 +8,18 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/clayicarus/proxy-gateway/internal/config"
 )
 
 func TestRunGatewayContextReleasesEarlierInboundOnBindFailure(t *testing.T) {
@@ -58,6 +63,66 @@ func TestRunGatewayContextStartsAndStopsInbound(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Gateway did not stop within the worker shutdown budget")
+	}
+}
+
+func TestRunGatewayContextStartsMigratedInboundConfig(t *testing.T) {
+	certPath, keyPath := writeGatewayTestCertificate(t)
+	address := reserveUDPAddress(t)
+	dir := t.TempDir()
+	legacyPath := filepath.Join(dir, "legacy.yaml")
+	migratedPath := filepath.Join(dir, "gateway.yaml")
+	legacy := fmt.Sprintf("listen: %q\ntls:\n  cert: %q\n  key: %q\ndbPath: %q\ntimezone: UTC\n", address, certPath, keyPath, filepath.Join(dir, "gateway.db"))
+	if err := os.WriteFile(legacyPath, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.MigrateLegacyInboundsFile(legacyPath, migratedPath); err != nil {
+		t.Fatalf("migrate legacy inbound config: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- runGatewayContext(ctx, []string{"-c", migratedPath}) }()
+
+	waitForUDPAddressInUse(t, address)
+	cancel()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("Gateway shutdown for migrated config: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Gateway did not stop after starting migrated config")
+	}
+}
+
+func TestErrorCollectorAcceptsConcurrentFailuresWithoutBlocking(t *testing.T) {
+	var collector errorCollector
+	errs := []error{errors.New("close"), errors.New("wait"), errors.New("deadline")}
+	var workers sync.WaitGroup
+	workers.Add(len(errs))
+	for _, err := range errs {
+		go func(err error) {
+			defer workers.Done()
+			collector.Add(err)
+		}(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		workers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent shutdown error reporting blocked")
+	}
+	joined := collector.Err()
+	for _, err := range errs {
+		if !errors.Is(joined, err) {
+			t.Fatalf("joined error %v does not contain %v", joined, err)
+		}
 	}
 }
 

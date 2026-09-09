@@ -38,10 +38,7 @@ func (s *Service) TCPContext(ctx context.Context, id, reqAddr string) (net.Conn,
 		zap.String("id", id),
 		zap.String("reqAddr", reqAddr),
 	)
-	if contextual, ok := ob.(outbound.ContextualOutbound); ok {
-		return contextual.TCPContext(ctx, reqAddr)
-	}
-	return ob.TCP(reqAddr)
+	return ob.TCPContext(ctx, reqAddr)
 }
 
 func (s *Service) UDPContext(ctx context.Context, id, reqAddr string) (outbound.UDPConn, error) {
@@ -53,8 +50,5 @@ func (s *Service) UDPContext(ctx context.Context, id, reqAddr string) (outbound.
 		zap.String("id", id),
 		zap.String("reqAddr", reqAddr),
 	)
-	if contextual, ok := ob.(outbound.ContextualOutbound); ok {
-		return contextual.UDPContext(ctx, reqAddr)
-	}
-	return ob.UDP(reqAddr)
+	return ob.UDPContext(ctx, reqAddr)
 }

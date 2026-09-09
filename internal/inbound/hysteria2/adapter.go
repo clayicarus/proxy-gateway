@@ -4,45 +4,32 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"strconv"
 	"sync"
-	"sync/atomic"
 
 	hyServer "github.com/apernet/hysteria/core/v2/server"
-	"github.com/clayicarus/proxy-gateway/internal/auth"
-	"github.com/clayicarus/proxy-gateway/internal/connection"
-	"github.com/clayicarus/proxy-gateway/internal/router"
-	"github.com/clayicarus/proxy-gateway/internal/traffic"
-	"go.uber.org/zap"
+	"github.com/clayicarus/proxy-gateway/internal/policy"
 )
 
-var globalSessionID atomic.Uint64
-
-// Adapter is the only production bridge between Hy2 callbacks and Gateway
-// identity, policy, accounting, routing, and management state.
+// Adapter is the Hysteria2 protocol bridge. All gateway policy access goes
+// through Kernel; the adapter never receives a route ID or raw outbound.
 type Adapter struct {
 	inbound string
-	auth    *auth.Authenticator
-	router  *router.Service
-	traffic *traffic.TrafficLogger
-	tracker *connection.Tracker
-	logger  *zap.Logger
+	kernel  *policy.Kernel
 }
 
-func New(inbound string, authenticator *auth.Authenticator, routing *router.Service, accounting *traffic.TrafficLogger, tracker *connection.Tracker, logger *zap.Logger) *Adapter {
-	return &Adapter{inbound: inbound, auth: authenticator, router: routing, traffic: accounting, tracker: tracker, logger: logger}
+func New(inbound string, kernel *policy.Kernel) *Adapter {
+	return &Adapter{inbound: inbound, kernel: kernel}
 }
 
 type session struct {
-	id        string
-	routeID   string
+	core      *policy.Session
 	transport hyServer.Transport
 	ctx       context.Context
 	cancel    context.CancelCauseFunc
 	closeOnce sync.Once
 }
 
-func (s *session) ID() string { return s.id }
+func (s *session) ID() string { return s.core.ID() }
 
 func (s *session) Close(cause error) {
 	s.closeOnce.Do(func() {
@@ -57,13 +44,12 @@ func sessionFrom(value hyServer.Session) (*session, bool) {
 }
 
 func (a *Adapter) AuthenticateSession(_ context.Context, transport hyServer.Transport, proof string, tx uint64) (hyServer.Session, bool) {
-	ok, routeID := a.auth.Authenticate(transport.RemoteAddr(), proof, tx)
+	core, ok := a.kernel.Authenticate(a.inbound, transport.RemoteAddr(), proof, tx)
 	if !ok {
 		return nil, false
 	}
 	ctx, cancel := context.WithCancelCause(transport.Context())
-	id := a.inbound + "/" + strconv.FormatUint(globalSessionID.Add(1), 10)
-	return &session{id: id, routeID: routeID, transport: transport, ctx: ctx, cancel: cancel}, true
+	return &session{core: core, transport: transport, ctx: ctx, cancel: cancel}, true
 }
 
 func (a *Adapter) TCPContext(ctx context.Context, value hyServer.Session, request hyServer.RequestInfo) (net.Conn, error) {
@@ -71,7 +57,7 @@ func (a *Adapter) TCPContext(ctx context.Context, value hyServer.Session, reques
 	if !ok {
 		return nil, fmt.Errorf("invalid hysteria2 session")
 	}
-	return a.router.TCPContext(ctx, s.routeID, request.Target)
+	return a.kernel.OpenTCP(ctx, s.core, request.Target)
 }
 
 func (a *Adapter) UDPContext(ctx context.Context, value hyServer.Session, request hyServer.RequestInfo) (hyServer.UDPConn, error) {
@@ -79,7 +65,7 @@ func (a *Adapter) UDPContext(ctx context.Context, value hyServer.Session, reques
 	if !ok {
 		return nil, fmt.Errorf("invalid hysteria2 session")
 	}
-	return a.router.UDPContext(ctx, s.routeID, request.Target)
+	return a.kernel.OpenUDP(ctx, s.core, request.Target)
 }
 
 func (a *Adapter) LogTrafficContext(ctx context.Context, value hyServer.Session, _ hyServer.RequestInfo, tx, rx uint64) bool {
@@ -87,26 +73,24 @@ func (a *Adapter) LogTrafficContext(ctx context.Context, value hyServer.Session,
 	if !ok {
 		return false
 	}
-	return a.traffic.LogTrafficContext(ctx, s.routeID, tx, rx)
+	return a.kernel.Admit(ctx, s.core, tx, rx)
 }
 
 func (a *Adapter) LogOnlineStateSession(value hyServer.Session, online bool) {
 	if s, ok := sessionFrom(value); ok {
-		a.traffic.LogOnlineState(s.routeID, online)
+		a.kernel.Online(s.core, online)
 	}
 }
 
 func (a *Adapter) ConnectSession(transport hyServer.Transport, value hyServer.Session, tx uint64) {
 	if s, ok := sessionFrom(value); ok {
-		a.tracker.ConnectSession(s.id, a.inbound, transport.RemoteAddr(), s.routeID)
-		a.logger.Info("client connected", zap.String("session", s.id), zap.String("inbound", a.inbound), zap.String("user", s.routeID), zap.Uint64("tx", tx))
+		a.kernel.Connected(s.core, transport.RemoteAddr(), tx)
 	}
 }
 
 func (a *Adapter) DisconnectSession(_ hyServer.Transport, value hyServer.Session, err error) {
 	if s, ok := sessionFrom(value); ok {
-		a.tracker.DisconnectSession(s.id)
-		a.logger.Info("client disconnected", zap.String("session", s.id), zap.String("inbound", a.inbound), zap.Error(err))
+		a.kernel.Disconnected(s.core, err)
 	}
 }
 
@@ -128,13 +112,13 @@ func (a *Adapter) UDPErrorSession(value hyServer.Session, request hyServer.Reque
 
 func (a *Adapter) startRequest(value hyServer.Session, request hyServer.RequestInfo, protocol string) {
 	if s, ok := sessionFrom(value); ok {
-		a.tracker.StartRequest(s.id, request.ID, protocol, request.Target)
+		a.kernel.StartRequest(s.core, request.ID, protocol, request.Target)
 	}
 }
 
 func (a *Adapter) stopRequest(value hyServer.Session, request hyServer.RequestInfo) {
 	if s, ok := sessionFrom(value); ok {
-		a.tracker.StopRequest(s.id, request.ID)
+		a.kernel.StopRequest(s.core, request.ID)
 	}
 }
 

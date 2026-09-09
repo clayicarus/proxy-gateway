@@ -6,48 +6,28 @@
 
 | Hysteria2 接口 | 实现 | 责任 |
 |---|---|---|
-| `server.SessionAuthenticator` | `inbound/hysteria2.Adapter` | 认证并创建绑定 `username:node` 的私有 session |
-| `server.SessionOutbound` | `inbound/hysteria2.Adapter` | 将 session 的显式身份交给 `router.Service` |
+| `server.SessionAuthenticator` | `inbound/hysteria2.Adapter` | 认证并创建由 Policy Kernel 持有的私有 session |
+| `server.SessionOutbound` | `inbound/hysteria2.Adapter` | 将不透明 session 交给 Policy Kernel 开启授权出站 |
 | `server.SessionTrafficLogger` | `inbound/hysteria2.Adapter` | 在既有 TCP/UDP 计量边界调用共享账本 |
 | `server.SessionEventLogger` | `inbound/hysteria2.Adapter` | 按 session/request ID 更新活跃连接追踪 |
 
-只有 Hy2 adapter 实现上游接口，并在代码中有编译期断言；认证、路由、账本和追踪保持协议无关。
+只有 Hy2 adapter 实现上游接口，并在代码中有编译期断言；认证、出站选择、账本和追踪由协议无关的 Policy Kernel 统一持有。listener 生命周期由 `inbound.Manager` 管理。
 
 ## 启动装配
 
 运行配置先从 SQLite 加载，而不是从静态 YAML 用户和节点字段加载：
 
 ```go
-users, err := store.LoadRuntimeUsers()
-nodes, err := store.LoadNodes()
-
-authenticator := auth.NewAuthenticator(users, logger)
-trafficLogger := traffic.NewTrafficLoggerWithLocation(users, store, logger, location)
-routerEngine := router.NewRouter(users, logger)
-outboundFactory := outbound.NewOutboundFactory(nodes, logger)
+snapshot, err := store.LoadRuntimeSnapshot(context.Background())
+kernel := policy.New(snapshot.Users, snapshot.Nodes, store, logger, location)
 warmupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-_ = outboundFactory.Warmup(warmupCtx)
+_ = kernel.Warmup(warmupCtx)
 cancel()
-routingService := router.NewService(routerEngine, outboundFactory, logger)
-connectionTracker := connection.NewTracker()
-adapter := hysteria2.New("hy2-public", authenticator, routingService, trafficLogger, connectionTracker, logger)
+service, err := hysteria2.NewService(inbound, certificate, kernel)
+inboundManager.Add(service)
 ```
 
-然后把实现直接交给 Hysteria2 server：
-
-```go
-server, err := hyServer.NewServer(&hyServer.Config{
-    TLSConfig: hyServer.TLSConfig{
-        Certificates: []tls.Certificate{certificate},
-    },
-    QUICConfig:             buildInboundQUICConfig(inbound.QUIC),
-    Conn:                   udpConn,
-    SessionAuthenticator:   adapter,
-    SessionOutbound:        adapter,
-    SessionTrafficLogger:   adapter,
-    SessionEventLogger:     adapter,
-})
-```
+`cmd/gateway` 不再直接构造或调用 Hy2 server；`hysteria2.Service` 在内部完成 UDP bind、QUIC 配置和 server 装配，Manager 负责 `Start`、`Close` 与有界 `Wait`。
 
 TLS 证书由 `tls.LoadX509KeyPair` 从 YAML 指定的 `tls.cert` 与 `tls.key` 文件加载。
 
@@ -65,18 +45,18 @@ alice:node_tokyo:a-password-that-may:contain-colons
 - 密码匹配。
 - 用户启动快照授权了所选节点。
 
-返回的 ID 是 `alice:node_tokyo`。adapter 将其保存在私有 session，并将其显式传给 TrafficLogger 和 router.Service；不应退化为仅用户名。
+返回的内部 route ID 是 `alice:node_tokyo`。adapter 只持有 Kernel 创建的不透明 session，不能自行构造 route ID、选择 outbound 或向任意用户记账。
 
 ## Session 请求绑定
 
 认证成功后 fork 为该 QUIC transport 建立私有 session。TCP/UDP 回调均携带 session、稳定 request ID 和目标地址：
 
 ```text
-TCPContext(session, request ID, target) -> router.Service.TCPContext(id, target)
-UDPContext(session, request ID, target) -> router.Service.UDPContext(id, target)
+TCPContext(session, request ID, target) -> PolicyKernel.OpenTCP(session, target)
+UDPContext(session, request ID, target) -> PolicyKernel.OpenUDP(session, target)
 ```
 
-adapter 会拒绝未知 session；router.Service 会拒绝 ID 缺少节点、未授权节点、未知节点和拨号失败。不能在这些错误上隐式回退到 `direct` 或另一个节点，否则会绕过客户端选择和用户授权。请求身份不依赖 callback 的相对时序，因此相同目标的并发请求可以独立路由。
+adapter 会拒绝未知 session；Kernel 会拒绝跨 Kernel 的 session、缺少节点、未授权节点、未知节点和拨号失败。不能在这些错误上隐式回退到 `direct` 或另一个节点，否则会绕过客户端选择和用户授权。请求身份不依赖 callback 的相对时序，因此相同目标的并发请求可以独立路由。
 
 ## 出站适配
 

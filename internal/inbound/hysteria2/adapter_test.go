@@ -5,14 +5,11 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 
 	hyServer "github.com/apernet/hysteria/core/v2/server"
-	"github.com/clayicarus/proxy-gateway/internal/auth"
 	"github.com/clayicarus/proxy-gateway/internal/config"
-	"github.com/clayicarus/proxy-gateway/internal/connection"
-	"github.com/clayicarus/proxy-gateway/internal/outbound"
-	"github.com/clayicarus/proxy-gateway/internal/router"
-	"github.com/clayicarus/proxy-gateway/internal/traffic"
+	"github.com/clayicarus/proxy-gateway/internal/policy"
 	"go.uber.org/zap"
 )
 
@@ -35,9 +32,10 @@ func (t *testTransport) Close(err error) error {
 func TestAdapterBindsIdentityToStableSessions(t *testing.T) {
 	logger := zap.NewNop()
 	users := map[string]config.UserConfig{"alice": {Password: "secret", Routes: []string{"direct"}}}
-	tracker := connection.NewTracker()
-	accounting := traffic.NewTrafficLogger(users, nil, logger)
-	adapter := New("public", auth.NewAuthenticator(users, logger), router.NewService(router.NewRouter(users, logger), outbound.NewOutboundFactory(nil, logger), logger), accounting, tracker, logger)
+	kernel := policy.New(users, nil, nil, logger, time.UTC)
+	tracker := kernel.Tracker()
+	accounting := kernel.Traffic()
+	adapter := New("public", kernel)
 	transport := &testTransport{ctx: context.Background(), addr: &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443}, closed: make(chan error, 1)}
 
 	first, ok := adapter.AuthenticateSession(context.Background(), transport, "alice:direct:secret", 0)
@@ -73,7 +71,7 @@ func TestSessionCloseTargetsOnlyBoundTransport(t *testing.T) {
 	cause := errors.New("quota")
 	transport := &testTransport{ctx: context.Background(), addr: &net.UDPAddr{}, closed: make(chan error, 2)}
 	ctx, cancel := context.WithCancelCause(context.Background())
-	s := &session{id: "in/1", routeID: "alice:direct", transport: transport, ctx: ctx, cancel: cancel}
+	s := &session{transport: transport, ctx: ctx, cancel: cancel}
 	s.Close(cause)
 	s.Close(errors.New("second"))
 	if !errors.Is(context.Cause(ctx), cause) {

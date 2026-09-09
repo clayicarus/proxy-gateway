@@ -114,7 +114,7 @@ tls:
 旧部署先保留原 `users`、`nodes` 和 secret，执行：
 
 ```bash
-proxy-gateway migrate -c /etc/proxy-gateway/legacy-gateway.yaml
+migrate -c /etc/proxy-gateway/legacy-gateway.yaml
 ```
 
 旧订阅 token 使用 YAML 的 `sub.secret`，缺省时使用 `api.secret`。迁移会将旧 HMAC token 的哈希写入数据库，使已发布链接继续可用。数据库迁移完成后，再将不含管理数据和 secret 的旧运行参数转换为唯一运行时 schema：
@@ -129,7 +129,7 @@ scripts/validate-inbounds --input /etc/proxy-gateway/gateway.yaml
 需要以旧 YAML 原子替换数据库中的用户和授权时：
 
 ```bash
-proxy-gateway migrate --replace-users -c /etc/proxy-gateway/legacy-gateway.yaml
+migrate --replace-users -c /etc/proxy-gateway/legacy-gateway.yaml
 ```
 
 该命令保留节点、流量、重启和进程历史，但会删除 YAML 中不存在的管理用户。详见 [部署指南](docs/DEPLOYMENT.md)。

@@ -49,5 +49,5 @@ sub:
   insecure: false
 
 # 用户和节点均由 SQLite 管理。如需导入旧 YAML，请执行：
-# proxy-gateway migrate -c /etc/proxy-gateway/legacy-gateway.yaml
+# migrate -c /etc/proxy-gateway/legacy-gateway.yaml
 # 迁移时使用 sub.secret（缺省时 api.secret）计算旧订阅链接。

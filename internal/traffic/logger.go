@@ -44,8 +44,7 @@ type StatsSnapshot struct {
 // The id passed to LogTraffic is "username:node_name" as returned by Authenticator.
 type TrafficLogger struct {
 	stats  sync.Map // map[string]*UserNodeStats (id "user:node" -> stats)
-	users  map[string]config.UserConfig
-	mu     sync.RWMutex
+	auth   *auth.Authenticator
 	store  *storage.SQLiteStore
 	logger *zap.Logger
 	now    func() time.Time
@@ -90,11 +89,18 @@ func NewTrafficLogger(users map[string]config.UserConfig, store *storage.SQLiteS
 // NewTrafficLoggerWithLocation creates a logger whose natural-month usage is
 // evaluated in location. All persisted timestamps remain UTC.
 func NewTrafficLoggerWithLocation(users map[string]config.UserConfig, store *storage.SQLiteStore, logger *zap.Logger, location *time.Location) *TrafficLogger {
+	return NewTrafficLoggerWithAuthenticator(auth.NewAuthenticator(users, logger), store, logger, location)
+}
+
+// NewTrafficLoggerWithAuthenticator shares its policy source with
+// authentication, so a user refresh is published consistently to both paths.
+func NewTrafficLoggerWithAuthenticator(authenticator *auth.Authenticator, store *storage.SQLiteStore, logger *zap.Logger, location *time.Location) *TrafficLogger {
 	if location == nil {
 		location = time.UTC
 	}
+	users := authenticator.Snapshot()
 	tl := &TrafficLogger{
-		users:        copyUsers(users),
+		auth:         authenticator,
 		store:        store,
 		logger:       logger,
 		now:          time.Now,
@@ -127,15 +133,6 @@ func NewTrafficLoggerWithLocation(users map[string]config.UserConfig, store *sto
 		}
 	}
 	return tl
-}
-
-func copyUsers(users map[string]config.UserConfig) map[string]config.UserConfig {
-	result := make(map[string]config.UserConfig, len(users))
-	for name, user := range users {
-		user.Routes = append([]string(nil), user.Routes...)
-		result[name] = user
-	}
-	return result
 }
 
 func (tl *TrafficLogger) monthBounds(now time.Time) (key string, start, end time.Time) {
@@ -303,8 +300,7 @@ func (tl *TrafficLogger) LogTrafficContext(ctx context.Context, id string, tx, r
 		return false
 	}
 	username, _ := auth.ParseID(id)
-	tl.mu.RLock()
-	user, exists := tl.users[username]
+	user, exists := tl.auth.User(username)
 	reason := ""
 	switch {
 	case !exists:
@@ -314,7 +310,6 @@ func (tl *TrafficLogger) LogTrafficContext(ctx context.Context, id string, tx, r
 	case user.ExpiresAt != nil && !user.ExpiresAt.After(tl.now()):
 		reason = "expired"
 	}
-	tl.mu.RUnlock()
 	if reason != "" {
 		tl.logger.Warn("inactive user traffic, disconnecting",
 			zap.String("id", id),
@@ -362,9 +357,7 @@ func (tl *TrafficLogger) LogTrafficContext(ctx context.Context, id string, tx, r
 	// concurrent streams observe a single shared accounting value.
 	tl.monthlyUsage[username] += tx + rx
 	total := tl.monthlyUsage[username]
-	tl.mu.RLock()
-	maxBytes := tl.users[username].MaxBytes
-	tl.mu.RUnlock()
+	maxBytes := user.MaxBytes
 	tl.usageMu.Unlock()
 	if maxBytes > 0 && total > maxBytes {
 		tl.logger.Warn("user quota exceeded, disconnecting",
@@ -384,9 +377,11 @@ func (tl *TrafficLogger) limitDownload(username string, bytes uint64) {
 
 func (tl *TrafficLogger) limitDownloadContext(ctx context.Context, username string, bytes uint64) error {
 	for {
-		tl.mu.RLock()
-		rate := tl.users[username].SpeedLimit
-		tl.mu.RUnlock()
+		user, exists := tl.auth.User(username)
+		if !exists || user.Disabled || (user.ExpiresAt != nil && !user.ExpiresAt.After(tl.now())) {
+			return context.Canceled
+		}
+		rate := user.SpeedLimit
 		if rate == 0 {
 			return nil
 		}
@@ -456,16 +451,21 @@ func (tl *TrafficLogger) wakeLimiters() {
 // snapshot. It is used for password, expiry, deletion, quota and speed-limit
 // changes that must affect new and existing connections immediately.
 func (tl *TrafficLogger) UpdateUsers(users map[string]config.UserConfig) {
-	tl.mu.Lock()
+	previous := tl.auth.Snapshot()
+	tl.auth.UpdateUsers(users)
+	tl.NotifyUsersUpdated(previous, users)
+}
+
+// NotifyUsersUpdated wakes reservations affected by a policy snapshot that was
+// already atomically published by the shared authenticator.
+func (tl *TrafficLogger) NotifyUsersUpdated(previous, users map[string]config.UserConfig) {
 	changedRate := false
-	for name, old := range tl.users {
+	for name, old := range previous {
 		if current, ok := users[name]; !ok || current.SpeedLimit != old.SpeedLimit {
 			changedRate = true
 			break
 		}
 	}
-	tl.users = copyUsers(users)
-	tl.mu.Unlock()
 	if changedRate {
 		tl.wakeLimiters()
 	}
@@ -563,8 +563,6 @@ func (tl *TrafficLogger) getOrCreate(id string) *UserNodeStats {
 }
 
 func (tl *TrafficLogger) userLimits(username string) (maxBytes, speedLimit uint64) {
-	tl.mu.RLock()
-	user := tl.users[username]
-	tl.mu.RUnlock()
+	user, _ := tl.auth.User(username)
 	return user.MaxBytes, user.SpeedLimit
 }

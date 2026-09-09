@@ -19,13 +19,9 @@ import (
 
 	hyClient "github.com/apernet/hysteria/core/v2/client"
 	hyServer "github.com/apernet/hysteria/core/v2/server"
-	"github.com/clayicarus/proxy-gateway/internal/auth"
 	"github.com/clayicarus/proxy-gateway/internal/config"
-	"github.com/clayicarus/proxy-gateway/internal/connection"
 	hyInbound "github.com/clayicarus/proxy-gateway/internal/inbound/hysteria2"
-	"github.com/clayicarus/proxy-gateway/internal/outbound"
-	"github.com/clayicarus/proxy-gateway/internal/router"
-	"github.com/clayicarus/proxy-gateway/internal/traffic"
+	"github.com/clayicarus/proxy-gateway/internal/policy"
 	"go.uber.org/zap"
 )
 
@@ -241,13 +237,9 @@ func TestHy2E2E_ClientServerConnect(t *testing.T) {
 	}
 	nodes := map[string]config.NodeConfig{}
 
-	authenticator := auth.NewAuthenticator(users, logger)
-	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
-	routerEngine := router.NewRouter(users, logger)
-	outboundFactory := outbound.NewOutboundFactory(nodes, logger)
-	routingService := router.NewService(routerEngine, outboundFactory, logger)
-	tracker := connection.NewTracker()
-	adapter := hyInbound.New("hy2-e2e", authenticator, routingService, trafficLogger, tracker, logger)
+	kernel := policy.New(users, nodes, nil, logger, time.UTC)
+	trafficLogger := kernel.Traffic()
+	adapter := hyInbound.New("hy2-e2e", kernel)
 
 	// --- 4. Start Hysteria2 server ---
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
@@ -477,12 +469,8 @@ func TestHy2E2E_UnknownUser(t *testing.T) {
 	}
 	nodes := map[string]config.NodeConfig{}
 
-	authenticator := auth.NewAuthenticator(users, logger)
-	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
-	routerEngine := router.NewRouter(users, logger)
-	outboundFactory := outbound.NewOutboundFactory(nodes, logger)
-	routingService := router.NewService(routerEngine, outboundFactory, logger)
-	adapter := hyInbound.New("unknown-user", authenticator, routingService, trafficLogger, connection.NewTracker(), logger)
+	kernel := policy.New(users, nodes, nil, logger, time.UTC)
+	adapter := hyInbound.New("unknown-user", kernel)
 
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
@@ -563,10 +551,8 @@ func TestHy2E2E_ExpiredUserDisconnectsExistingConnection(t *testing.T) {
 	users := map[string]config.UserConfig{
 		"alice": {Password: "pass123", Routes: []string{"direct"}, ExpiresAt: &future},
 	}
-	authenticator := auth.NewAuthenticator(users, logger)
-	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
-	routingService := router.NewService(router.NewRouter(users, logger), outbound.NewOutboundFactory(nil, logger), logger)
-	adapter := hyInbound.New("expiry", authenticator, routingService, trafficLogger, connection.NewTracker(), logger)
+	kernel := policy.New(users, nil, nil, logger, time.UTC)
+	adapter := hyInbound.New("expiry", kernel)
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
 		t.Fatal(err)
@@ -619,8 +605,7 @@ func TestHy2E2E_ExpiredUserDisconnectsExistingConnection(t *testing.T) {
 
 	past := time.Now().UTC().Add(-time.Hour)
 	users["alice"] = config.UserConfig{Password: "pass123", Routes: []string{"direct"}, ExpiresAt: &past}
-	authenticator.UpdateUsers(users)
-	trafficLogger.UpdateUsers(users)
+	kernel.UpdateUsers(users)
 	_, _ = conn.Write([]byte("after-expiry"))
 	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
 		t.Fatal(err)

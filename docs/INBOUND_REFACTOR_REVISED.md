@@ -414,7 +414,7 @@ scripts/validate-inbounds --input gateway-new.yaml
 
 ### 11.3 与旧命令、数据库和回滚的关系
 
-配置转换与管理数据导入是不同工具。`proxy-gateway migrate`、`migrate --replace-users` 保留独立 legacy loader，不复用已拒绝旧字段的新运行时 Load。保留旧 token 派生规则及已有节点/流量保护测试。`record-exit` 使用与对应运行版本一致的配置读取入口并继续可用。
+配置转换与管理数据导入是不同工具。独立 `migrate` 可执行程序及其 `migrate --replace-users` 模式保留 legacy loader，不复用已拒绝旧字段的新运行时 Load。保留旧 token 派生规则及已有节点/流量保护测试。`proxy-gateway record-exit` 使用与对应运行版本一致的配置读取入口并继续可用。
 
 此重构不改 `managed_nodes.config_json` 的出站含义，不新增持久化 session 表，不重建/清空/重新导入现有 SQLite。用 master 与当前参考提交创建的数据库夹具分别验证新版本可加载；正常进程记录和流量写入与迁移脚本的零数据库副作用分别断言。
 

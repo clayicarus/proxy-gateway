@@ -83,12 +83,12 @@ Clash.Meta 订阅通过 `yaml.v3` 从强类型结构编码，节点显示名、�
 迁移是一次性显式命令：
 
 ```text
-proxy-gateway migrate -c legacy-gateway.yaml
+migrate -c legacy-gateway.yaml
 ```
 
 命令在单一事务中校验并导入旧 YAML 用户、节点和授权，丢弃服务端 fallback，计算旧订阅 token，并设置迁移标记。目标数据库已有管理数据时命令失败，不覆盖运行配置。迁移后正常 YAML 删除 `users` 与 `nodes`。
 
-恢复错误的管理用户配置时可显式执行 `migrate --replace-users -c legacy-gateway.yaml`。该事务只清空并重建 `managed_users` 与 `user_nodes`，保留节点和全部运行、流量历史；YAML 引用的非 `direct` 节点必须已存在于 `managed_nodes`。普通 `migrate` 仍拒绝覆盖，防止误操作。
+恢复错误的管理用户配置时可显式执行 `migrate --replace-users -c legacy-gateway.yaml`。该事务只清空并重建 `managed_users` 与 `user_nodes`，保留节点和全部运行、流量历史；YAML 引用的非 `direct` 节点必须已存在且处于启用状态。普通 `migrate` 仍拒绝覆盖，防止误操作。
 
 ## systemd、重启与 watchdog
 

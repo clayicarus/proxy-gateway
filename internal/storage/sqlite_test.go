@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"testing"
@@ -334,6 +335,136 @@ func TestSQLiteStore_ReplaceLegacyUsersPreservesNodesAndTraffic(t *testing.T) {
 	users, err = store.ListUsers()
 	if err != nil || len(users) != 1 || users[0].Username != "bob" {
 		t.Fatalf("failed replacement was not rolled back: %#v err=%v", users, err)
+	}
+}
+
+func TestSQLiteStore_ReplaceLegacyUsersRejectsDisabledNodeWithoutChanges(t *testing.T) {
+	store, err := NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	initial := &config.Config{
+		Users: map[string]config.UserConfig{"alice": {Password: "alice-password", Routes: []string{"node1"}}},
+		Nodes: map[string]config.NodeConfig{"node1": {Type: "hysteria2", Hysteria2: &config.Hysteria2OutboundConfig{Addr: "node.example:443", Auth: "secret"}}},
+	}
+	if err := store.MigrateLegacy(initial, func(username string) string { return "old-" + username }); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateNode("node1", initial.Nodes["node1"], false); err != nil {
+		t.Fatal(err)
+	}
+	replacement := &config.Config{Users: map[string]config.UserConfig{
+		"bob": {Password: "bob-password", Routes: []string{"node1"}},
+	}}
+	if err := store.ReplaceLegacyUsers(replacement, func(username string) string { return "new-" + username }); err == nil {
+		t.Fatal("expected disabled managed node to reject replacement")
+	}
+	users, err := store.ListUsers()
+	if err != nil || len(users) != 1 || users[0].Username != "alice" {
+		t.Fatalf("failed replacement changed users: %#v err=%v", users, err)
+	}
+}
+
+func TestSQLiteStore_LoadRuntimeSnapshotUsesEnabledNodes(t *testing.T) {
+	store, err := NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.CreateUser(ManagedUserInput{Username: "alice", Password: "secret", Routes: []string{"direct"}}, "token"); err != nil {
+		t.Fatal(err)
+	}
+	enabled := config.NodeConfig{Type: "hysteria2", Hysteria2: &config.Hysteria2OutboundConfig{Addr: "enabled.example:443", Auth: "secret"}}
+	disabled := config.NodeConfig{Type: "hysteria2", Hysteria2: &config.Hysteria2OutboundConfig{Addr: "disabled.example:443", Auth: "secret"}}
+	if err := store.SaveNode("enabled", enabled, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveNode("disabled", disabled, false); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.LoadRuntimeSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user := snapshot.Users["alice"]; user.Password != "secret" || len(user.Routes) != 1 || user.Routes[0] != "direct" {
+		t.Fatalf("unexpected snapshot user: %#v", user)
+	}
+	if len(snapshot.Nodes) != 1 || snapshot.Nodes["enabled"].Hysteria2 == nil {
+		t.Fatalf("snapshot nodes = %#v", snapshot.Nodes)
+	}
+	state, err := store.GetConfigState()
+	if err != nil || snapshot.Revision != state.Revision {
+		t.Fatalf("snapshot revision = %d, state=%#v err=%v", snapshot.Revision, state, err)
+	}
+}
+
+func TestSQLiteStore_LoadRuntimeSnapshotFromPreInboundRefactorDatabase(t *testing.T) {
+	dbPath := t.TempDir() + "/legacy-managed.db"
+	legacy, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`
+		CREATE TABLE traffic_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, node_id TEXT NOT NULL DEFAULT '', tx_bytes INTEGER NOT NULL DEFAULT 0, rx_bytes INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+		CREATE TABLE traffic_summary (user_id TEXT NOT NULL, node_id TEXT NOT NULL DEFAULT '', tx_total INTEGER NOT NULL DEFAULT 0, rx_total INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, PRIMARY KEY (user_id, node_id));
+		CREATE TABLE managed_users (username TEXT PRIMARY KEY, password TEXT NOT NULL, deleted_at INTEGER, expires_at INTEGER, monthly_bytes INTEGER NOT NULL DEFAULT 0, download_speed INTEGER NOT NULL DEFAULT 0, token_hash BLOB NOT NULL UNIQUE, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+		CREATE TABLE managed_nodes (name TEXT PRIMARY KEY, config_json TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+		CREATE TABLE user_nodes (username TEXT NOT NULL REFERENCES managed_users(username), node_name TEXT NOT NULL, PRIMARY KEY (username, node_name));
+		CREATE TABLE config_state (id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL DEFAULT 0, active_revision INTEGER NOT NULL DEFAULT 0);
+		CREATE TABLE management_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);
+		INSERT INTO managed_users (username, password, monthly_bytes, download_speed, token_hash, created_at, updated_at) VALUES ('alice', 'legacy-password', 4096, 512, zeroblob(32), 1700000000, 1700000000);
+		INSERT INTO managed_nodes (name, config_json, enabled, created_at, updated_at) VALUES ('node1', '{"type":"hysteria2","hysteria2":{"addr":"node.example:443","auth":"node-secret"}}', 1, 1700000000, 1700000000);
+		INSERT INTO user_nodes (username, node_name) VALUES ('alice', 'direct'), ('alice', 'node1');
+		INSERT INTO config_state (id, revision, active_revision) VALUES (1, 17, 16);
+		INSERT INTO traffic_summary (user_id, node_id, tx_total, rx_total, updated_at) VALUES ('alice', 'node1', 100, 200, 1700000000);
+	`)
+	if err != nil {
+		_ = legacy.Close()
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`UPDATE managed_users SET token_hash = ? WHERE username = 'alice'`, tokenHash("legacy-token")); err != nil {
+		_ = legacy.Close()
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewSQLiteStore(dbPath, zap.NewNop())
+	if err != nil {
+		t.Fatalf("open pre-inbound-refactor database: %v", err)
+	}
+	defer store.Close()
+	snapshot, err := store.LoadRuntimeSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("load runtime snapshot: %v", err)
+	}
+	user, ok := snapshot.Users["alice"]
+	if !ok || user.Password != "legacy-password" || user.MaxBytes != 4096 || user.SpeedLimit != 512 || len(user.Routes) != 2 || user.Routes[0] != "direct" || user.Routes[1] != "node1" {
+		t.Fatalf("legacy user snapshot = %#v", user)
+	}
+	if node := snapshot.Nodes["node1"]; len(snapshot.Nodes) != 1 || node.Hysteria2 == nil || node.Hysteria2.Addr != "node.example:443" {
+		t.Fatalf("legacy node snapshot = %#v", snapshot.Nodes)
+	}
+	if snapshot.Revision != 17 {
+		t.Fatalf("legacy revision = %d, want 17", snapshot.Revision)
+	}
+	state, err := store.GetConfigState()
+	if err != nil || state.Revision != 17 || state.ActiveRevision != 16 {
+		t.Fatalf("legacy config state = %#v, err=%v", state, err)
+	}
+	managed, err := store.ListUsers()
+	if err != nil || len(managed) != 1 || managed[0].Username != "alice" || len(managed[0].Routes) != 2 {
+		t.Fatalf("legacy management read model = %#v, err=%v", managed, err)
+	}
+	byToken, err := store.FindUserByToken("legacy-token")
+	if err != nil || byToken == nil || byToken.Username != "alice" || byToken.Password != "legacy-password" {
+		t.Fatalf("legacy subscription token lookup = %#v, err=%v", byToken, err)
+	}
+	tx, rx, err := store.GetSummary("alice", "node1")
+	if err != nil || tx != 100 || rx != 200 {
+		t.Fatalf("legacy traffic summary = %d/%d, err=%v", tx, rx, err)
 	}
 }
 

@@ -265,31 +265,16 @@ func (e *nodeEntry) currentClient() (connectedOutbound, error) {
 	return client, nil
 }
 
-func (e *nodeEntry) TCP(reqAddr string) (net.Conn, error) {
-	return e.TCPContext(context.Background(), reqAddr)
-}
-
 func (e *nodeEntry) TCPContext(ctx context.Context, reqAddr string) (net.Conn, error) {
 	client, err := e.currentClient()
 	if err != nil {
 		return nil, err
 	}
-	var conn net.Conn
-	if contextual, ok := client.(interface {
-		TCPContext(context.Context, string) (net.Conn, error)
-	}); ok {
-		conn, err = contextual.TCPContext(ctx, reqAddr)
-	} else {
-		conn, err = client.TCP(reqAddr)
-	}
+	conn, err := client.TCPContext(ctx, reqAddr)
 	if ctx.Err() == nil && isClosedConnection(err) {
 		e.markUnavailable(client, err)
 	}
 	return conn, err
-}
-
-func (e *nodeEntry) UDP(reqAddr string) (UDPConn, error) {
-	return e.UDPContext(context.Background(), reqAddr)
 }
 
 func (e *nodeEntry) UDPContext(ctx context.Context, reqAddr string) (UDPConn, error) {
@@ -297,14 +282,7 @@ func (e *nodeEntry) UDPContext(ctx context.Context, reqAddr string) (UDPConn, er
 	if err != nil {
 		return nil, err
 	}
-	var conn UDPConn
-	if contextual, ok := client.(interface {
-		UDPContext(context.Context, string) (UDPConn, error)
-	}); ok {
-		conn, err = contextual.UDPContext(ctx, reqAddr)
-	} else {
-		conn, err = client.UDP(reqAddr)
-	}
+	conn, err := client.UDPContext(ctx, reqAddr)
 	if err != nil {
 		if isClosedConnection(err) {
 			e.markUnavailable(client, err)

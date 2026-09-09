@@ -43,6 +43,15 @@ type ConfigState struct {
 	ActiveRevision int64
 }
 
+// RuntimeSnapshot is the restart-applied topology and the revision it was read
+// from. All fields are read in one SQLite transaction so the process never
+// labels a mixed users/nodes view as a single active revision.
+type RuntimeSnapshot struct {
+	Users    map[string]config.UserConfig
+	Nodes    map[string]config.NodeConfig
+	Revision int64
+}
+
 // UserMonthlyUsage is the user-level tx/rx total within a natural month.
 type UserMonthlyUsage struct {
 	Username string
@@ -319,11 +328,11 @@ func (s *SQLiteStore) ReplaceLegacyUsers(cfg *config.Config, legacyToken func(st
 				continue
 			}
 			var count int
-			if err := tx.QueryRow(`SELECT COUNT(*) FROM managed_nodes WHERE name = ?`, route).Scan(&count); err != nil {
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM managed_nodes WHERE name = ? AND enabled = 1`, route).Scan(&count); err != nil {
 				return err
 			}
 			if count == 0 {
-				return fmt.Errorf("cannot replace users: user %q references node %q missing from managed nodes", username, route)
+				return fmt.Errorf("cannot replace users: user %q references missing or disabled node %q", username, route)
 			}
 		}
 	}
@@ -417,8 +426,8 @@ func (s *SQLiteStore) LoadRuntimeUsers() (map[string]config.UserConfig, error) {
 	return users, routeRows.Err()
 }
 
-// LoadNodes loads all enabled and disabled nodes. The caller decides which
-// snapshot is active; node changes only apply after Gateway restart.
+// LoadNodes loads enabled nodes for the startup snapshot. Node changes only
+// apply after Gateway restart.
 func (s *SQLiteStore) LoadNodes() (map[string]config.NodeConfig, error) {
 	rows, err := s.db.Query(`SELECT name, config_json FROM managed_nodes WHERE enabled = 1 ORDER BY name`)
 	if err != nil {

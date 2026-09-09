@@ -16,12 +16,6 @@ type UDPConn interface {
 
 // Outbound is the protocol-neutral outbound contract.
 type Outbound interface {
-	TCP(string) (net.Conn, error)
-	UDP(string) (UDPConn, error)
-}
-
-// ContextualOutbound supports cancellation while opening a request.
-type ContextualOutbound interface {
 	TCPContext(context.Context, string) (net.Conn, error)
 	UDPContext(context.Context, string) (UDPConn, error)
 }

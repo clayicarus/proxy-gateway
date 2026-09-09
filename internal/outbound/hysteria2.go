@@ -24,10 +24,6 @@ type Hysteria2Outbound struct {
 	closed bool
 }
 
-func newHysteria2Outbound(cfg *config.Hysteria2OutboundConfig, serverAddr *net.UDPAddr, sni string, logger *zap.Logger) (*Hysteria2Outbound, error) {
-	return newHysteria2OutboundContext(context.Background(), cfg, serverAddr, sni, logger)
-}
-
 func newHysteria2OutboundContext(ctx context.Context, cfg *config.Hysteria2OutboundConfig, serverAddr *net.UDPAddr, sni string, logger *zap.Logger) (*Hysteria2Outbound, error) {
 	client, info, err := hyClient.NewClientContext(ctx, &hyClient.Config{
 		ServerAddr: serverAddr,
@@ -50,13 +46,8 @@ func newHysteria2OutboundContext(ctx context.Context, cfg *config.Hysteria2Outbo
 	return &Hysteria2Outbound{cfg: cfg, client: client, logger: logger}, nil
 }
 
-// TCP implements server.Outbound.
-// Opens a new QUIC stream on the existing connection to the remote node
-// and sends a TCP proxy request.
-func (h *Hysteria2Outbound) TCP(reqAddr string) (net.Conn, error) {
-	return h.TCPContext(context.Background(), reqAddr)
-}
-
+// TCPContext opens a new QUIC stream on the existing connection to the remote
+// node and sends a TCP proxy request.
 func (h *Hysteria2Outbound) TCPContext(ctx context.Context, reqAddr string) (net.Conn, error) {
 	h.logger.Debug("hy2 outbound TCP",
 		zap.String("remote", h.cfg.Addr),
@@ -65,14 +56,12 @@ func (h *Hysteria2Outbound) TCPContext(ctx context.Context, reqAddr string) (net
 	return h.client.TCPContext(ctx, reqAddr)
 }
 
-// UDP implements server.Outbound.
-// Creates a new UDP session on the existing QUIC connection and wraps
-// the HyUDPConn into a server.UDPConn compatible interface.
-func (h *Hysteria2Outbound) UDP(reqAddr string) (UDPConn, error) {
-	return h.UDPContext(context.Background(), reqAddr)
-}
-
-func (h *Hysteria2Outbound) UDPContext(_ context.Context, reqAddr string) (UDPConn, error) {
+// UDPContext creates a new UDP session on the existing QUIC connection and
+// wraps the HyUDPConn into the protocol-neutral UDP association interface.
+func (h *Hysteria2Outbound) UDPContext(ctx context.Context, reqAddr string) (UDPConn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	h.logger.Debug("hy2 outbound UDP",
 		zap.String("remote", h.cfg.Addr),
 		zap.String("reqAddr", reqAddr),

@@ -218,7 +218,7 @@ server {
 
 ```bash
 systemctl stop proxy-gateway.service
-sudo -u proxygateway /usr/local/bin/proxy-gateway migrate \
+sudo -u proxygateway /usr/local/bin/migrate \
   -c /etc/proxy-gateway/legacy-gateway.yaml
 systemctl start proxy-gateway.service
 ```
@@ -242,7 +242,7 @@ sudo -u proxygateway /usr/local/bin/validate-inbounds \
 ```bash
 systemctl stop proxy-gateway.service
 cp /var/lib/proxy-gateway/traffic.db /var/lib/proxy-gateway/traffic.db.backup
-sudo -u proxygateway /usr/local/bin/proxy-gateway migrate --replace-users \
+sudo -u proxygateway /usr/local/bin/migrate --replace-users \
   -c /etc/proxy-gateway/legacy-gateway.yaml
 systemctl start proxy-gateway.service
 ```

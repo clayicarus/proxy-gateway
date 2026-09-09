@@ -15,20 +15,12 @@ type DirectOutbound struct {
 
 var directDialer = net.Dialer{Timeout: 10 * time.Second}
 
-func (d *DirectOutbound) TCP(reqAddr string) (net.Conn, error) {
-	return d.TCPContext(context.Background(), reqAddr)
-}
-
 func (d *DirectOutbound) TCPContext(ctx context.Context, reqAddr string) (net.Conn, error) {
 	conn, err := directDialer.DialContext(ctx, "tcp", reqAddr)
 	if err != nil {
 		return nil, err
 	}
 	return conn, nil
-}
-
-func (d *DirectOutbound) UDP(reqAddr string) (UDPConn, error) {
-	return d.UDPContext(context.Background(), reqAddr)
 }
 
 func (d *DirectOutbound) UDPContext(ctx context.Context, _ string) (UDPConn, error) {

@@ -122,7 +122,7 @@ func TestDirectOutbound_TCP(t *testing.T) {
 		}
 	}()
 
-	conn, err := d.TCP(ln.Addr().String())
+	conn, err := d.TCPContext(context.Background(), ln.Addr().String())
 	if err != nil {
 		t.Fatalf("direct TCP failed: %v", err)
 	}
@@ -143,8 +143,10 @@ type fakeConnectedOutbound struct {
 	closed atomic.Bool
 }
 
-func (f *fakeConnectedOutbound) TCP(string) (net.Conn, error) { return nil, f.tcpErr }
-func (f *fakeConnectedOutbound) UDP(string) (UDPConn, error) {
+func (f *fakeConnectedOutbound) TCPContext(context.Context, string) (net.Conn, error) {
+	return nil, f.tcpErr
+}
+func (f *fakeConnectedOutbound) UDPContext(context.Context, string) (UDPConn, error) {
 	return nil, f.tcpErr
 }
 func (f *fakeConnectedOutbound) Close() error {
@@ -205,7 +207,7 @@ func TestOutboundFactory_NodeFailureIsIsolatedAndFailsFast(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := time.Now()
-	if _, err := bad.TCP("example.com:443"); err == nil || !strings.Contains(err.Error(), "unavailable") {
+	if _, err := bad.TCPContext(context.Background(), "example.com:443"); err == nil || !strings.Contains(err.Error(), "unavailable") {
 		t.Fatalf("bad node did not fail fast: %v", err)
 	}
 	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
@@ -233,7 +235,7 @@ func TestOutboundFactory_ClosedConnectionReconnectsInBackground(t *testing.T) {
 		t.Fatal(err)
 	}
 	node, _ := factory.Get("node")
-	if _, err := node.TCP("example.com:443"); !isClosedConnection(err) {
+	if _, err := node.TCPContext(context.Background(), "example.com:443"); !isClosedConnection(err) {
 		t.Fatalf("expected closed connection error, got %v", err)
 	}
 	waitFor(t, func() bool {
@@ -384,7 +386,7 @@ func TestDirectOutbound_UDP(t *testing.T) {
 		pc.WriteTo(buf[:n], addr)
 	}()
 
-	udpConn, err := d.UDP(targetAddr)
+	udpConn, err := d.UDPContext(context.Background(), targetAddr)
 	if err != nil {
 		t.Fatalf("direct UDP failed: %v", err)
 	}
