@@ -61,8 +61,22 @@ func (k *Kernel) Authenticate(inbound string, addr net.Addr, proof string, tx ui
 	if !ok {
 		return nil, false
 	}
+	return k.newSession(inbound, routeID), true
+}
+
+// AuthenticateTrojan validates a Trojan SHA-224 credential and returns the
+// same opaque capability used by every other inbound adapter.
+func (k *Kernel) AuthenticateTrojan(inbound string, addr net.Addr, credential string) (*Session, bool) {
+	ok, routeID := k.auth.AuthenticateTrojan(addr, credential)
+	if !ok {
+		return nil, false
+	}
+	return k.newSession(inbound, routeID), true
+}
+
+func (k *Kernel) newSession(inbound, routeID string) *Session {
 	sequence := k.nextSession.Add(1)
-	return &Session{owner: k, id: fmt.Sprintf("%s/%d", inbound, sequence), routeID: routeID, inbound: inbound}, true
+	return &Session{owner: k, id: fmt.Sprintf("%s/%d", inbound, sequence), routeID: routeID, inbound: inbound}
 }
 
 func (k *Kernel) OpenTCP(ctx context.Context, session *Session, target string) (net.Conn, error) {

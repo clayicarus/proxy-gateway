@@ -104,7 +104,7 @@ func TestParseInboundConfigRejectsInvalidDocuments(t *testing.T) {
 		{name: "legacy listen", yaml: validInboundYAML + "listen: :443\n", wantErr: "field listen not found"},
 		{name: "duplicate key", yaml: strings.Replace(validInboundYAML, "  cert: ./cert.pem", "  cert: ./cert.pem\n  cert: other.pem", 1), wantErr: "duplicate key \"cert\""},
 		{name: "multiple documents", yaml: validInboundYAML + "---\n{}\n", wantErr: "multiple YAML documents"},
-		{name: "unknown inbound type", yaml: strings.Replace(validInboundYAML, "type: hysteria2", "type: trojan", 1), wantErr: "unsupported value \"trojan\""},
+		{name: "unknown inbound type", yaml: strings.Replace(validInboundYAML, "type: hysteria2", "type: unknown", 1), wantErr: "unsupported value \"unknown\""},
 		{name: "cross-type field", yaml: strings.Replace(validInboundYAML, "    listen: \":8443\"", "    listen: \":8443\"\n    handshakeTimeout: 10s", 1), wantErr: "field handshakeTimeout not found"},
 		{name: "empty name", yaml: strings.Replace(validInboundYAML, "name: hy2-public", "name: \"\"", 1), wantErr: "name must be non-empty"},
 		{name: "missing listen", yaml: strings.Replace(validInboundYAML, "    listen: \":8443\"\n", "", 1), wantErr: "listen must be configured"},
@@ -127,6 +127,91 @@ func TestParseInboundConfigRejectsInvalidDocuments(t *testing.T) {
 				t.Fatalf("error = %v, want substring %q", err, test.wantErr)
 			}
 		})
+	}
+}
+
+func TestParseInboundConfigTrojan(t *testing.T) {
+	cfg, err := ParseInboundConfig([]byte(`
+inbounds:
+  - name: hy2
+    type: hysteria2
+    listen: ":443"
+  - name: trojan
+    type: trojan
+    listen: ":443"
+    trojan:
+      handshakeTimeout: 10s
+      maxPendingConnections: 128
+tls:
+  cert: cert.pem
+  key: key.pem
+`))
+	if err != nil {
+		t.Fatalf("ParseInboundConfig failed: %v", err)
+	}
+	if len(cfg.Inbounds) != 2 || cfg.Inbounds[1].Trojan == nil || cfg.Inbounds[1].Trojan.MaxPendingConnections != 128 {
+		t.Fatalf("Trojan inbound was not preserved: %#v", cfg.Inbounds)
+	}
+}
+
+func TestParseInboundConfigTrojanUDPIdleTimeout(t *testing.T) {
+	template := `
+inbounds:
+  - name: trojan
+    type: trojan
+    listen: ":443"
+    trojan:
+      udpIdleTimeout: %s
+tls:
+  cert: cert.pem
+  key: key.pem
+`
+	cfg, err := ParseInboundConfig([]byte(fmt.Sprintf(template, "90s")))
+	if err != nil {
+		t.Fatalf("ParseInboundConfig failed: %v", err)
+	}
+	if cfg.Inbounds[0].Trojan == nil || cfg.Inbounds[0].Trojan.UDPIdleTimeout != 90*time.Second {
+		t.Fatalf("udpIdleTimeout was not preserved: %#v", cfg.Inbounds[0].Trojan)
+	}
+	for _, value := range []string{"-1s", "1s", "45m"} {
+		if _, err := ParseInboundConfig([]byte(fmt.Sprintf(template, value))); err == nil {
+			t.Fatalf("udpIdleTimeout %q was accepted", value)
+		}
+	}
+}
+
+func TestParseInboundConfigRejectsTrojanOptionsOnHysteria2(t *testing.T) {
+	_, err := ParseInboundConfig([]byte(`
+inbounds:
+  - name: hy2
+    type: hysteria2
+    listen: ":443"
+    trojan:
+      udpIdleTimeout: 30s
+tls:
+  cert: cert.pem
+  key: key.pem
+`))
+	if err == nil || !strings.Contains(err.Error(), "only valid for a trojan inbound") {
+		t.Fatalf("cross-type option error = %v", err)
+	}
+}
+
+func TestParseInboundConfigRejectsTrojanTCPConflict(t *testing.T) {
+	_, err := ParseInboundConfig([]byte(`
+inbounds:
+  - name: trojan-one
+    type: trojan
+    listen: "127.0.0.1:443"
+  - name: trojan-two
+    type: trojan
+    listen: "127.0.0.1:443"
+tls:
+  cert: cert.pem
+  key: key.pem
+`))
+	if err == nil || !strings.Contains(err.Error(), "conflicts") {
+		t.Fatalf("Trojan TCP conflict error = %v", err)
 	}
 }
 

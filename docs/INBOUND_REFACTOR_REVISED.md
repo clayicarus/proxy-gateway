@@ -2,7 +2,7 @@
 
 日期：2026-09-08
 
-状态：S0–S4 已实施并完成常规与 race 回归；Hy2 生产路径使用 session adapter，运行时启用多具名 inbound schema 和有界停机。本文保留后续 Trojan 与更细粒度并发/生产 CI 验收契约。
+状态：S0–S4 已实施并完成常规与 race 回归；Hy2 生产路径使用 session adapter，运行时启用多具名 inbound schema 和有界停机。S5 的 Trojan TCP 与其后的 Trojan UDP ASSOCIATE 已按同一策略内核接入。本文保留更细粒度并发/生产 CI 验收契约。
 
 修订对象：[INBOUND_POLICY_REFACTOR.md](INBOUND_POLICY_REFACTOR.md)。
 
@@ -430,6 +430,7 @@ scripts/validate-inbounds --input gateway-new.yaml
 | S3：Hy2 adapter、出站边界与生命周期收敛 | 将 S2 已切换的生产实现收敛到入站/出站适配层，删除旧 event/router 公共类型和临时兼容代码；接通取消、错误隔离与完整 Wait，不再次切换身份或计量机制。 | Hy2 direct/远端节点的 TCP/UDP、请求隔离、事件账务对照和故障/停机测试通过；S3 相对 S2 不改变请求身份和计量语义。 |
 | S4：运行时配置切换 | 同一 PR 启用唯一 inbounds 列表、多个实例、Manager、订阅绑定及全部 CLI 兼容入口。 | 新脚本输出可真实启动；旧 schema 明确拒绝；旧数据库可加载；该版本每个必需 listener 均可用或整体失败回收。 |
 | S5：Trojan TCP 迁入 | 复用既有有界 parser、SHA-224 proof、TLS/首包限制、TCP relay 和两跳测试，经共享内核接入。 | Trojan TCP 自身及与 Hy2 共享额度/限速测试通过；Hy2 矩阵继续通过；不夹带 UDP/mux/fallback。 |
+| S6：Trojan UDP ASSOCIATE | 在同一 adapter 内增加 datagram 分帧、association 生命周期、逐包准入与空闲回收，出站仍由 `Kernel.OpenUDP` 选择。 | Trojan UDP 与 Hy2 共用账本，逐包准入且拒绝时不转发；direct 与远端 node 两跳 UDP 测试通过；分帧 parser 有界并有 fuzz；不夹带 mux/fallback/订阅。 |
 
 S0 的能力实验与迁移工具可以单独交付；独立共享缺陷修复也可推进。S2 是身份、计量和请求所有权的唯一生产切换点，S3 只收敛包边界、出站错误和生命周期；二者的关键接口都以前置能力验证为依据。S3 继续运行旧配置，S4 再一次性切换解析与组装。每个部署 PR 都必须有完整可启动路径，不以“后续 PR 会补上”解释中间版本缺功能。
 
@@ -496,7 +497,10 @@ S0 的能力实验与迁移工具可以单独交付；独立共享缺陷修复�
 - S2 接入稳定 session/request identity、显式 route ID、可取消 direct/node 出站与统一 TCP/UDP 账本；3000 字节 UDP echo 的兼容计量断言为 tx=3000、rx=6000。
 - S3/S4 已将生产 Gateway 切换到 session-aware Hy2 adapter 和唯一 `inbounds` schema；多个 listener 在全部构造成功后才启动，停机保留 12 秒 worker 与至少 3 秒最终刷盘/SQLite close 预算。`internal/event` 和旧 `router.RoutingOutbound` 单槽 API 已删除；`internal/router` 只保留协议无关的显式策略路由，Direct/Hy2 node client、重试和连接资源管理收敛到 `internal/outbound`。Gateway 生命周期测试覆盖了后续 inbound bind 失败时释放已取得 listener，以及正常运行在取消后的收敛。
 
-仍需扩展的验证包括 worker 预算耗尽、跨月 pending/flush 竞争、完整 fuzz 和目标 Linux CI。它们不改变已激活的请求身份、路由或计量语义；Trojan 阶段仍按独立范围和验收执行。
+- S5 迁入 Trojan TCP CONNECT：TLS 入站、有界首包 parser、SHA-224 凭据索引与经 `Kernel` 的显式节点选择、计量 relay。
+- S6 增加 Trojan UDP ASSOCIATE：association 内每个 datagram 独立分帧并在写出前准入，上行按 payload 计 `tx`、下行计 `rx`，分帧头不计入；策略拒绝关闭整条 association，单包发送失败只丢包；`udpIdleTimeout` 回收空闲 association，`Close`/`Wait` 覆盖双向 relay、出站 flow 和空闲看门狗。direct 与远端 Hy2 node 的 UDP 两跳、多目标 datagram 和分帧 parser fuzz 均有测试。
+
+仍需扩展的验证包括 worker 预算耗尽、跨月 pending/flush 竞争、Trojan 的到期/超额/限速与 SQLite flush 断言、协议压测和目标 Linux CI。它们不改变已激活的请求身份、路由或计量语义。
 
 ## 15. 后续 TODO
 

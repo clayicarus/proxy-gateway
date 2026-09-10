@@ -9,6 +9,7 @@ import (
 )
 
 const migratedHysteria2InboundName = "hy2-public"
+const migratedTrojanInboundName = "trojan-public"
 
 // MigrationResult contains validated YAML and non-sensitive diagnostics.
 type MigrationResult struct {
@@ -68,9 +69,6 @@ func MigrateLegacyInbounds(data []byte) (*MigrationResult, error) {
 	if legacy.API.Secret != "" || (legacy.Sub != nil && legacy.Sub.Secret != "") {
 		return nil, fmt.Errorf("legacy subscription secret contains management data; migrate management data first")
 	}
-	if legacy.Trojan != nil && legacy.Trojan.Listen != "" {
-		return nil, fmt.Errorf("trojan.listen is enabled but this target supports only hysteria2 inbounds")
-	}
 	if legacy.Sub != nil && legacy.Sub.ServerAddr == "" {
 		return nil, fmt.Errorf("sub.serverAddr must be configured; migration will not infer it from listen")
 	}
@@ -95,6 +93,16 @@ func MigrateLegacyInbounds(data []byte) (*MigrationResult, error) {
 	}
 
 	result := &MigrationResult{}
+	if legacy.Trojan != nil && legacy.Trojan.Listen != "" {
+		output.Inbounds = append(output.Inbounds, Inbound{
+			Name:   migratedTrojanInboundName,
+			Type:   TrojanInboundType,
+			Listen: legacy.Trojan.Listen,
+		})
+		if legacy.Trojan.ServerAddr != "" || legacy.Trojan.SNI != "" || legacy.Trojan.Insecure {
+			result.Diagnostics = append(result.Diagnostics, "legacy Trojan subscription metadata was not migrated because Trojan subscription generation is unavailable")
+		}
+	}
 	if output.Admin.Listen == "" {
 		output.Admin.Listen = legacy.API.Listen
 	} else if legacy.API.Listen != "" && legacy.API.Listen != output.Admin.Listen {

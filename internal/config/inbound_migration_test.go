@@ -104,7 +104,6 @@ func TestMigrateLegacyInboundsRejectsUnsafeInputs(t *testing.T) {
 		{name: "sub address", fragment: "sub:\n  listen: 127.0.0.1:9091\n", want: "sub.serverAddr must be configured"},
 		{name: "obfs", fragment: "obfs: {}\n", want: "field obfs is unsupported"},
 		{name: "masquerade", fragment: "masquerade: null\n", want: "field masquerade is unsupported"},
-		{name: "enabled trojan", fragment: "trojan:\n  listen: :443\n", want: "trojan.listen is enabled"},
 		{name: "unknown field", fragment: "fallback: direct\n", want: "field fallback not found"},
 		{name: "duplicate key", fragment: "listen: :443\nlisten: :8443\n", want: "duplicate key"},
 		{name: "multiple docs", fragment: "listen: :443\n---\nlisten: :8443\n", want: "multiple YAML documents"},
@@ -117,6 +116,31 @@ func TestMigrateLegacyInboundsRejectsUnsafeInputs(t *testing.T) {
 				t.Fatalf("error = %v, want substring %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestMigrateLegacyInboundsMigratesEnabledTrojan(t *testing.T) {
+	result, err := MigrateLegacyInbounds([]byte(`
+listen: :443
+trojan:
+  listen: :443
+  serverAddr: gateway.example.com:443
+tls:
+  cert: cert.pem
+  key: key.pem
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := ParseInboundConfig(result.YAML)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Inbounds) != 2 || cfg.Inbounds[1].Type != TrojanInboundType || cfg.Inbounds[1].Listen != ":443" {
+		t.Fatalf("Trojan inbound was not migrated: %#v", cfg.Inbounds)
+	}
+	if len(result.Diagnostics) != 1 {
+		t.Fatalf("diagnostics = %#v, want Trojan subscription warning", result.Diagnostics)
 	}
 }
 

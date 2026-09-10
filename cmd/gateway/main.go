@@ -20,6 +20,7 @@ import (
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"github.com/clayicarus/proxy-gateway/internal/inbound"
 	hyInbound "github.com/clayicarus/proxy-gateway/internal/inbound/hysteria2"
+	trojanInbound "github.com/clayicarus/proxy-gateway/internal/inbound/trojan"
 	"github.com/clayicarus/proxy-gateway/internal/policy"
 	"github.com/clayicarus/proxy-gateway/internal/storage"
 	"github.com/clayicarus/proxy-gateway/internal/systemd"
@@ -33,6 +34,7 @@ func main() {
 		return
 	}
 	if err := runGateway(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, "hy2-gateway:", err)
 		os.Exit(1)
 	}
 }
@@ -141,7 +143,15 @@ func runGatewayContext(runCtx context.Context, args []string) error {
 		httpServices = append(httpServices, httpService{name: "subscription service", server: httpServer, listener: listener})
 	}
 	for _, configuredInbound := range cfg.Inbounds {
-		service, err := hyInbound.NewService(configuredInbound, tlsCert, kernel)
+		var service inbound.Service
+		switch configuredInbound.Type {
+		case config.Hysteria2InboundType:
+			service, err = hyInbound.NewService(configuredInbound, tlsCert, kernel)
+		case config.TrojanInboundType:
+			service, err = trojanInbound.NewService(configuredInbound, tlsCert, kernel, logger)
+		default:
+			err = fmt.Errorf("unsupported inbound type %q", configuredInbound.Type)
+		}
 		if err != nil {
 			cleanupConstructed()
 			return err

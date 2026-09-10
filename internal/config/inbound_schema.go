@@ -12,7 +12,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const Hysteria2InboundType = "hysteria2"
+const (
+	Hysteria2InboundType = "hysteria2"
+	TrojanInboundType    = "trojan"
+)
 
 // InboundConfig is the strict configuration schema that will become the
 // runtime schema in S4. ParseInboundConfig can be used offline before then.
@@ -27,13 +30,22 @@ type InboundConfig struct {
 	Systemd              *SystemdConfig    `yaml:"systemd,omitempty"`
 }
 
-// Inbound is a named protocol listener. S0 accepts only Hysteria2; future
-// protocol-specific fields must be added together with their adapter.
+// Inbound is a named protocol listener.
 type Inbound struct {
-	Name   string      `yaml:"name"`
-	Type   string      `yaml:"type"`
-	Listen string      `yaml:"listen"`
-	QUIC   *QUICConfig `yaml:"quic,omitempty"`
+	Name   string               `yaml:"name"`
+	Type   string               `yaml:"type"`
+	Listen string               `yaml:"listen"`
+	QUIC   *QUICConfig          `yaml:"quic,omitempty"`
+	Trojan *TrojanInboundConfig `yaml:"trojan,omitempty"`
+}
+
+// TrojanInboundConfig controls resource limits for a Trojan TCP/TLS inbound.
+type TrojanInboundConfig struct {
+	HandshakeTimeout      time.Duration `yaml:"handshakeTimeout,omitempty"`
+	MaxPendingConnections int           `yaml:"maxPendingConnections,omitempty"`
+	// UDPIdleTimeout reclaims a UDP association that saw no datagram in either
+	// direction. It is not a TCP CONNECT idle timeout.
+	UDPIdleTimeout time.Duration `yaml:"udpIdleTimeout,omitempty"`
 }
 
 // InboundSubConfig is the subscription schema after it is bound to a named
@@ -67,6 +79,7 @@ func (c *InboundConfig) validate() error {
 
 	names := make(map[string]inboundIdentity, len(c.Inbounds))
 	udpListeners := make([]namedListener, 0, len(c.Inbounds))
+	tcpListeners := make([]namedListener, 0, len(c.Inbounds)+2)
 	for i := range c.Inbounds {
 		inbound := &c.Inbounds[i]
 		path := fmt.Sprintf("inbounds[%d]", i)
@@ -77,23 +90,43 @@ func (c *InboundConfig) validate() error {
 			return fmt.Errorf("%s.name duplicates %s.name", path, previous.path)
 		}
 		names[inbound.Name] = inboundIdentity{path: path, inboundType: inbound.Type}
-		if inbound.Type != Hysteria2InboundType {
+		if inbound.Type != Hysteria2InboundType && inbound.Type != TrojanInboundType {
 			return fmt.Errorf("%s.type has unsupported value %q", path, inbound.Type)
 		}
 		listener, err := parseListener(path+".listen", inbound.Listen)
 		if err != nil {
 			return err
 		}
-		for _, existing := range udpListeners {
-			if listenersDefinitelyConflict(existing.listener, listener) {
-				return fmt.Errorf("%s.listen conflicts with %s.listen", path, existing.name)
+		if inbound.Type == Hysteria2InboundType {
+			if inbound.Trojan != nil {
+				return fmt.Errorf("%s.trojan is only valid for a trojan inbound", path)
 			}
-		}
-		udpListeners = append(udpListeners, namedListener{name: path, listener: listener})
-		if inbound.QUIC != nil {
-			if err := validateInboundQUIC(path+".quic", inbound.QUIC); err != nil {
-				return err
+			for _, existing := range udpListeners {
+				if listenersDefinitelyConflict(existing.listener, listener) {
+					return fmt.Errorf("%s.listen conflicts with %s.listen", path, existing.name)
+				}
 			}
+			udpListeners = append(udpListeners, namedListener{name: path, listener: listener})
+			if inbound.QUIC != nil {
+				if err := validateInboundQUIC(path+".quic", inbound.QUIC); err != nil {
+					return err
+				}
+			}
+		} else {
+			if inbound.QUIC != nil {
+				return fmt.Errorf("%s.quic is only valid for a hysteria2 inbound", path)
+			}
+			if inbound.Trojan != nil {
+				if err := validateTrojanInbound(path+".trojan", inbound.Trojan); err != nil {
+					return err
+				}
+			}
+			for _, existing := range tcpListeners {
+				if listenersDefinitelyConflict(existing.listener, listener) {
+					return fmt.Errorf("%s.listen conflicts with %s.listen", path, existing.name)
+				}
+			}
+			tcpListeners = append(tcpListeners, namedListener{name: path, listener: listener})
 		}
 	}
 
@@ -119,7 +152,6 @@ func (c *InboundConfig) validate() error {
 		c.Systemd.Unit = "proxy-gateway.service"
 	}
 
-	var tcpListeners []namedListener
 	if c.Admin.Listen != "" {
 		listener, err := parseListener("admin.listen", c.Admin.Listen)
 		if err != nil {
@@ -161,7 +193,27 @@ func (c *InboundConfig) validate() error {
 					return fmt.Errorf("sub.listen conflicts with %s.listen", existing.name)
 				}
 			}
+			tcpListeners = append(tcpListeners, namedListener{name: "sub", listener: listener})
 		}
+	}
+	return nil
+}
+
+func validateTrojanInbound(path string, trojan *TrojanInboundConfig) error {
+	if trojan.HandshakeTimeout < 0 {
+		return fmt.Errorf("%s.handshakeTimeout must not be negative", path)
+	}
+	if trojan.HandshakeTimeout != 0 && (trojan.HandshakeTimeout < time.Second || trojan.HandshakeTimeout > 2*time.Minute) {
+		return fmt.Errorf("%s.handshakeTimeout must be between 1s and 2m when configured", path)
+	}
+	if trojan.MaxPendingConnections < 0 || trojan.MaxPendingConnections > 65535 {
+		return fmt.Errorf("%s.maxPendingConnections must be between 1 and 65535 when configured", path)
+	}
+	if trojan.UDPIdleTimeout < 0 {
+		return fmt.Errorf("%s.udpIdleTimeout must not be negative", path)
+	}
+	if trojan.UDPIdleTimeout != 0 && (trojan.UDPIdleTimeout < 5*time.Second || trojan.UDPIdleTimeout > 30*time.Minute) {
+		return fmt.Errorf("%s.udpIdleTimeout must be between 5s and 30m when configured", path)
 	}
 	return nil
 }

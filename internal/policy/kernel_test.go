@@ -1,6 +1,9 @@
 package policy
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net"
 	"testing"
 	"time"
@@ -32,6 +35,19 @@ func TestKernelUpdateUsersPreservesStartupRoutesAndDisablesRemovedUsers(t *testi
 	kernel.UpdateUsers(map[string]config.UserConfig{})
 	if _, ok := kernel.Authenticate("public", addr, "alice:direct:after", 0); ok {
 		t.Fatal("removed user remained authenticated")
+	}
+}
+
+func TestKernelAuthenticatesTrojanAsPrivateSession(t *testing.T) {
+	users := map[string]config.UserConfig{"alice": {Password: "secret", Routes: []string{"direct"}}}
+	kernel := New(users, nil, nil, zap.NewNop(), time.UTC)
+	sum := sha256.Sum224([]byte("alice:direct:secret"))
+	session, ok := kernel.AuthenticateTrojan("trojan-public", &net.TCPAddr{}, hex.EncodeToString(sum[:]))
+	if !ok || session == nil || session.ID() == "" {
+		t.Fatalf("Trojan authentication did not create a session: %v %#v", ok, session)
+	}
+	if !kernel.Admit(context.Background(), session, 1, 1) {
+		t.Fatal("kernel rejected its own Trojan session")
 	}
 }
 

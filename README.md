@@ -1,6 +1,6 @@
 # Proxy Gateway
 
-基于 Hysteria2 的多用户网关。客户端显式选择获授权的出站节点，Gateway 负责认证、路由、流量计量、配额和下载限速，并通过 SQLite 和本地 Web 后台管理运行配置。
+支持 Hysteria2 与 Trojan 入站的多用户网关。客户端显式选择获授权的出站节点，Gateway 负责认证、路由、流量计量、配额和下载限速，并通过 SQLite 和本地 Web 后台管理运行配置。
 
 项目固定使用基于 Hysteria2 core v2.8.1 的仓库内最小补丁；补丁只增加请求身份、取消和完整生命周期能力，不修改 wire protocol。
 
@@ -14,6 +14,7 @@
 - 独立的公开订阅 HTTP 服务，生成 Clash.Meta 配置
 - systemd 重启调度、watchdog、优雅停机和进程退出原因记录
 - 内建 Direct 和远端 Hysteria2 出站
+- Trojan 入站，支持 TCP CONNECT 与 UDP ASSOCIATE，使用每个用户、节点独立的派生凭据
 
 服务端没有隐式 fallback。节点缺失、上下文错配或拨号失败都会直接返回错误；`direct` 也必须由客户端明确选择并获用户授权。
 
@@ -23,6 +24,7 @@ Gateway 启动时并发预连接所有启用的 Hysteria2 节点，最多同时�
 
 ```text
 hy2 客户端 --QUIC/UDP--> Gateway --direct/hy2--> Node 或目标
+trojan 客户端 --TLS/TCP--> Gateway --direct/hy2--> Node 或目标
                               |--HTTP/TCP--> 本地管理后台
                               `--HTTP/TCP--> 公开订阅服务
 ```
@@ -49,6 +51,13 @@ inbounds:
   - name: hy2-public
     type: hysteria2
     listen: :8443
+  - name: trojan-public
+    type: trojan
+    listen: :8443
+    trojan:
+      handshakeTimeout: 10s
+      maxPendingConnections: 256
+      udpIdleTimeout: 60s
 
 tls:
   cert: /etc/proxy-gateway/cert.pem
@@ -73,7 +82,7 @@ systemd:
   watchdog: true
 ```
 
-必须提供 `tls.cert` 与 `tls.key` 证书文件。`inbounds` 是具名 Hysteria2 UDP 入口列表，`sub.inbound` 明确选择订阅对应的入口；`admin.listen` 和 `sub.listen` 是两个独立的 HTTP/TCP 端口。`sub.publicURL` 是用户获取订阅的 URL 前缀，`sub.serverAddr` 则是订阅内容中客户端连接 Gateway 的地址。
+必须提供 `tls.cert` 与 `tls.key` 证书文件。`inbounds` 可配置具名的 Hysteria2 UDP 或 Trojan TCP 入口；两者可以共用数值端口。`sub.inbound` 目前只支持选择 Hysteria2 入口；`admin.listen` 和 `sub.listen` 是两个独立的 HTTP/TCP 端口。`sub.publicURL` 是用户获取订阅的 URL 前缀，`sub.serverAddr` 则是订阅内容中客户端连接 Gateway 的地址。
 
 用户和节点不写在正常运行 YAML 中。首次启动后通过管理后台创建。
 
@@ -108,6 +117,18 @@ tls:
 ```
 
 推荐直接使用后台生成的订阅 URL。订阅中的多个代理条目对应用户获授权的节点，客户端负责选择和故障切换。
+
+### Trojan 客户端连接
+
+Trojan 支持 TCP CONNECT 和 UDP ASSOCIATE，不支持 BIND、mux 或 HTTPS fallback。UDP 数据报走同一条 TCP/TLS 连接，不额外监听 UDP 端口；每条 association 使用与 TCP 相同的节点授权、配额和限速。每个用户和获授权节点使用一个独立 password：
+
+```text
+username:node:password
+```
+
+客户端应将这个原始值作为 Trojan password；协议在 TLS 内发送其 SHA-224。服务端不会持久化或写入日志。一个用户有多个节点时，配置多个 Trojan 代理条目来显式选择节点。Trojan 订阅生成尚未实现。
+
+`trojan.udpIdleTimeout` 只回收双向都没有数据报的 UDP association，默认 60s。
 
 ## 旧 YAML 迁移
 

@@ -1,6 +1,6 @@
 # Proxy Gateway 示例配置
 
-# 具名入站。可以配置多个 Hysteria2 UDP listener；任一 bind 失败时整体启动失败。
+# 具名入站。Hysteria2 使用 UDP，Trojan 使用 TCP；两者可共用数值端口。
 inbounds:
   - name: hy2-public
     type: hysteria2
@@ -9,6 +9,14 @@ inbounds:
     # quic:
     #   maxIdleTimeout: 30s
     #   maxIncomingStreams: 1024
+  # - name: trojan-public
+  #   type: trojan
+  #   listen: :8443
+  #   trojan:
+  #     handshakeTimeout: 10s
+  #     maxPendingConnections: 256
+  #     # 只回收双向都没有数据报的 UDP association
+  #     udpIdleTimeout: 60s
 
 # TLS 证书文件
 tls:

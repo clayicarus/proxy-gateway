@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net"
 	"sort"
 	"strings"
@@ -26,6 +28,7 @@ type userEntry struct {
 // as the client ID, which is then used by the router and traffic logger.
 type Authenticator struct {
 	users  map[string]*userEntry // username -> entry
+	trojan map[string]string     // SHA-224 credential -> username:node
 	mu     sync.RWMutex
 	logger *zap.Logger
 }
@@ -34,6 +37,7 @@ type Authenticator struct {
 func NewAuthenticator(users map[string]config.UserConfig, logger *zap.Logger) *Authenticator {
 	return &Authenticator{
 		users:  buildUserEntries(users),
+		trojan: buildTrojanCredentials(users),
 		logger: logger,
 	}
 }
@@ -107,7 +111,30 @@ func (a *Authenticator) Authenticate(addr net.Addr, auth string, tx uint64) (boo
 func (a *Authenticator) UpdateUsers(users map[string]config.UserConfig) {
 	a.mu.Lock()
 	a.users = buildUserEntries(users)
+	a.trojan = buildTrojanCredentials(users)
 	a.mu.Unlock()
+}
+
+// AuthenticateTrojan resolves Trojan's fixed SHA-224 credential to an
+// authorized route. The raw Trojan password is never retained or logged.
+func (a *Authenticator) AuthenticateTrojan(addr net.Addr, credential string) (bool, string) {
+	if !validTrojanCredential(credential) {
+		return false, ""
+	}
+	a.mu.RLock()
+	id, ok := a.trojan[credential]
+	if !ok {
+		a.mu.RUnlock()
+		return false, ""
+	}
+	username, _ := ParseID(id)
+	entry := a.users[username]
+	active := entry != nil && !entry.disabled && (entry.expires == nil || entry.expires.After(time.Now()))
+	a.mu.RUnlock()
+	if !active {
+		return false, ""
+	}
+	return true, id
 }
 
 // User returns the currently published policy for one user. Callers that make
@@ -153,6 +180,30 @@ func buildUserEntries(users map[string]config.UserConfig) map[string]*userEntry 
 		}
 	}
 	return m
+}
+
+func buildTrojanCredentials(users map[string]config.UserConfig) map[string]string {
+	credentials := make(map[string]string)
+	for username, user := range users {
+		for _, node := range user.Routes {
+			raw := username + ":" + node + ":" + user.Password
+			sum := sha256.Sum224([]byte(raw))
+			credentials[hex.EncodeToString(sum[:])] = username + ":" + node
+		}
+	}
+	return credentials
+}
+
+func validTrojanCredential(value string) bool {
+	if len(value) != sha256.Size224*2 {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if (value[i] < '0' || value[i] > '9') && (value[i] < 'a' || value[i] > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func userConfig(entry *userEntry) config.UserConfig {
