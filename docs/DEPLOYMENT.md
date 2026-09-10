@@ -51,7 +51,8 @@ tls:
   cert: /etc/proxy-gateway/cert.pem
   key: /etc/proxy-gateway/key.pem
 
-# obfs 与 masquerade 未接入 Gateway 数据面；配置任一字段都会拒绝启动。
+# obfs 未接入 Gateway 数据面；配置该字段会拒绝启动。
+# masquerade 是 Hysteria2 入站的可选字段，见下文"入站伪装"。
 
 admin:
   listen: "127.0.0.1:9090"
@@ -84,6 +85,30 @@ systemd:
 `sub.publicURL` 是后台展示给用户的订阅链接前缀；`sub.serverAddr` 是生成配置里代理连接 Gateway 的公网地址。订阅服务不是 QUIC 网站，也不处理 Gateway UDP 端口上的 `/sub` 路径。
 
 用户、节点和授权都在首次启动后通过后台创建。正常运行 YAML 不应包含 `users`、`nodes` 或 `fallback`。
+
+### 入站伪装
+
+不配置 `masquerade` 时，Hysteria2 入站对所有非认证的 HTTP/3 请求返回 404。主动探测者可以据此确认这是个 Hysteria2 端点。配置后，这些请求会被转发到一个固定的 web 后端：
+
+```yaml
+inbounds:
+  - name: hy2-public
+    type: hysteria2
+    listen: ":8443"
+    masquerade:
+      type: proxy
+      proxy:
+        url: http://127.0.0.1:8080
+        rewriteHost: true
+```
+
+要点：
+
+- 目前只实现 `type: proxy`。`url` 是配置里的固定值，永远不受请求内容影响，因此入站不会变成开放代理。
+- 建议指向本机源站（例如 `http://127.0.0.1:8080`），而不是绕回自己的公网域名：后者每次探测都要多一次公网 TLS 往返，而且当该域名解析到本机时可能形成环路。
+- `rewriteHost: true` 时后端看到自己的 hostname，适合按虚拟主机分发的后端；默认保留探测者发来的 Host。
+- Gateway 不会发送 `X-Forwarded-For`、`X-Forwarded-Host`、`X-Forwarded-Proto` 或 `Forwarded`，因为一个普通网站不会暴露前面还有代理。后端不可用时返回空的 502，不含任何代理错误信息。
+- 伪装只覆盖 Hysteria2 UDP 端口上的 HTTP/3 探测。Trojan 的 TCP 端口在认证失败时仍然直接关闭连接，那需要另外的 fallback 能力，目前未实现。
 
 ## 4. systemd 部署
 
@@ -235,7 +260,7 @@ sudo -u proxygateway /usr/local/bin/validate-inbounds \
   --input /etc/proxy-gateway/gateway.yaml
 ```
 
-新运行时只接受具名 `inbounds`；旧顶层 `listen/quic/api` 和管理字段会明确拒绝。`obfs` 与 `masquerade` 无数据面实现，迁移与运行时都拒绝。
+新运行时只接受具名 `inbounds`；旧顶层 `listen/quic/api` 和管理字段会明确拒绝。`obfs` 无数据面实现，迁移与运行时都拒绝。旧顶层 `masquerade` 的 `type: proxy` 会被迁移到 `inbounds[].masquerade`，迁移输出会提示它升级后开始生效；其他 masquerade 模式仍未实现，迁移会报错。
 
 如果数据库用户表已错误，需要以旧 YAML 完整重建用户和授权：
 

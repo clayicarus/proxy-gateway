@@ -115,14 +115,6 @@ func TestLoadRejectsUnsupportedInboundFeatures(t *testing.T) {
     password: secret`,
 		},
 		{
-			name: "masquerade",
-			feature: `masquerade:
-  type: proxy
-  proxy:
-    url: https://example.com
-    rewriteHost: true`,
-		},
-		{
 			name:    "obfs",
 			feature: "obfs: null",
 		},
@@ -139,6 +131,29 @@ tls:
 				t.Fatalf("error = %v, want explicit unsupported %s error", err, test.name)
 			}
 		})
+	}
+}
+
+// The legacy loader only feeds the management-data migration. Masquerade is now
+// implemented per inbound in the runtime schema, so the legacy field must no
+// longer block that migration even though the legacy loader ignores it.
+func TestLoadIgnoresLegacyMasquerade(t *testing.T) {
+	path := writeTempFile(t, `
+tls:
+  cert: test.crt
+  key: test.key
+masquerade:
+  type: proxy
+  proxy:
+    url: https://example.com
+    rewriteHost: true
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load = %v", err)
+	}
+	if cfg.Masquerade == nil || cfg.Masquerade.Proxy.URL != "https://example.com" {
+		t.Fatalf("legacy masquerade was not parsed: %#v", cfg.Masquerade)
 	}
 }
 

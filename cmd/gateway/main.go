@@ -146,7 +146,7 @@ func runGatewayContext(runCtx context.Context, args []string) error {
 		var service inbound.Service
 		switch configuredInbound.Type {
 		case config.Hysteria2InboundType:
-			service, err = hyInbound.NewService(configuredInbound, tlsCert, kernel)
+			service, err = hyInbound.NewService(configuredInbound, tlsCert, kernel, logger)
 		case config.TrojanInboundType:
 			service, err = trojanInbound.NewService(configuredInbound, tlsCert, kernel, logger)
 		default:

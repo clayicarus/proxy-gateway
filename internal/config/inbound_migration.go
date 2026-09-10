@@ -55,9 +55,7 @@ func MigrateLegacyInbounds(data []byte) (*MigrationResult, error) {
 	if hasTopLevelKey(&root, "obfs") {
 		return nil, fmt.Errorf("legacy field obfs is unsupported and cannot be migrated")
 	}
-	if hasTopLevelKey(&root, "masquerade") {
-		return nil, fmt.Errorf("legacy field masquerade is unsupported and cannot be migrated")
-	}
+	hasMasquerade := hasTopLevelKey(&root, "masquerade")
 
 	var legacy legacyInboundConfig
 	if err := decodeStrictSingleDocument(data, &legacy); err != nil {
@@ -93,6 +91,25 @@ func MigrateLegacyInbounds(data []byte) (*MigrationResult, error) {
 	}
 
 	result := &MigrationResult{}
+	if hasMasquerade {
+		// The legacy runtime parsed masquerade but never used it. The new
+		// hysteria2 inbound implements the proxy mode, so migrate it and say
+		// so: after the upgrade the field starts taking effect.
+		if legacy.Masquerade == nil || legacy.Masquerade.Type == "" {
+			return nil, fmt.Errorf("legacy field masquerade is unsupported without an explicit type and proxy url")
+		}
+		if legacy.Masquerade.Type != MasqueradeProxyType || legacy.Masquerade.Proxy.URL == "" {
+			return nil, fmt.Errorf("legacy masquerade type %q is unsupported and cannot be migrated; only %q with a proxy url is implemented", legacy.Masquerade.Type, MasqueradeProxyType)
+		}
+		output.Inbounds[0].Masquerade = &InboundMasqueradeConfig{
+			Type: MasqueradeProxyType,
+			Proxy: &MasqueradeProxyConfig{
+				URL:         legacy.Masquerade.Proxy.URL,
+				RewriteHost: legacy.Masquerade.Proxy.RewriteHost,
+			},
+		}
+		result.Diagnostics = append(result.Diagnostics, "legacy masquerade was migrated to the hysteria2 inbound and is now enforced by the data plane")
+	}
 	if legacy.Trojan != nil && legacy.Trojan.Listen != "" {
 		output.Inbounds = append(output.Inbounds, Inbound{
 			Name:   migratedTrojanInboundName,

@@ -180,6 +180,85 @@ tls:
 	}
 }
 
+func TestParseInboundConfigMasquerade(t *testing.T) {
+	cfg, err := ParseInboundConfig([]byte(`
+inbounds:
+  - name: hy2
+    type: hysteria2
+    listen: ":443"
+    masquerade:
+      type: proxy
+      proxy:
+        url: http://127.0.0.1:8080/site
+        rewriteHost: true
+tls:
+  cert: cert.pem
+  key: key.pem
+`))
+	if err != nil {
+		t.Fatalf("ParseInboundConfig failed: %v", err)
+	}
+	masquerade := cfg.Inbounds[0].Masquerade
+	if masquerade == nil || masquerade.Type != MasqueradeProxyType || masquerade.Proxy == nil {
+		t.Fatalf("masquerade was not preserved: %#v", masquerade)
+	}
+	if masquerade.Proxy.URL != "http://127.0.0.1:8080/site" || !masquerade.Proxy.RewriteHost {
+		t.Fatalf("masquerade proxy = %#v", masquerade.Proxy)
+	}
+}
+
+func TestParseInboundConfigRejectsInvalidMasquerade(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{name: "unimplemented type", body: "      type: file\n      proxy:\n        url: http://127.0.0.1:8080\n", wantErr: "only \"proxy\" is implemented"},
+		{name: "missing proxy", body: "      type: proxy\n", wantErr: "proxy.url must be configured"},
+		{name: "empty url", body: "      type: proxy\n      proxy:\n        url: \"\"\n", wantErr: "proxy.url must be configured"},
+		{name: "bad scheme", body: "      type: proxy\n      proxy:\n        url: ftp://example.com\n", wantErr: "must use http or https"},
+		{name: "no host", body: "      type: proxy\n      proxy:\n        url: http:///only/path\n", wantErr: "must name a backend host"},
+		{name: "credentials", body: "      type: proxy\n      proxy:\n        url: https://user:pass@example.com\n", wantErr: "must not embed credentials"},
+		{name: "query", body: "      type: proxy\n      proxy:\n        url: https://example.com/?probe=1\n", wantErr: "must not carry a query or fragment"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := ParseInboundConfig([]byte(`
+inbounds:
+  - name: hy2
+    type: hysteria2
+    listen: ":443"
+    masquerade:
+` + test.body + `tls:
+  cert: cert.pem
+  key: key.pem
+`))
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseInboundConfigRejectsMasqueradeOnTrojan(t *testing.T) {
+	_, err := ParseInboundConfig([]byte(`
+inbounds:
+  - name: trojan
+    type: trojan
+    listen: ":443"
+    masquerade:
+      type: proxy
+      proxy:
+        url: http://127.0.0.1:8080
+tls:
+  cert: cert.pem
+  key: key.pem
+`))
+	if err == nil || !strings.Contains(err.Error(), "only valid for a hysteria2 inbound") {
+		t.Fatalf("cross-type masquerade error = %v", err)
+	}
+}
+
 func TestParseInboundConfigRejectsTrojanOptionsOnHysteria2(t *testing.T) {
 	_, err := ParseInboundConfig([]byte(`
 inbounds:

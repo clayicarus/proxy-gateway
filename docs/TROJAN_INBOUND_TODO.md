@@ -51,4 +51,5 @@
 - [ ] 生成 Clash.Meta Trojan 订阅条目，每个用户节点组合独立、名称不冲突，并按已支持的 UDP 能力输出 `udp: true`。
 - [ ] 增加管理后台的 Trojan 配置可见性和安全提示；不显示或记录不必要的原始凭据。
 - [ ] 评估独立 `access_credentials` 表，以支持每协议独立凭据、单独撤销、轮换与审计。
-- [ ] 若确有部署需求，再单独设计 mux、HTTPS fallback / SNI 多路复用及其对 fail-closed 策略的影响。
+- [ ] 实现 Trojan fallback，使认证失败的连接表现为普通网站。契约与验收见 [INBOUND_REFACTOR_REVISED.md](INBOUND_REFACTOR_REVISED.md) 的 TODO-PROBE-01：首包保序回放、短首包超时也要回落、各种失败对外不可区分、ALPN 策略、无归属流量的独立上限与脱敏日志、固定后端。Hy2 入站的 `masquerade` 已实现，但它只覆盖 UDP 端口上的 HTTP/3 探测，不改变 Trojan TCP 端口的行为。
+- [ ] 若确有部署需求，再单独设计 mux 及 SNI 多路复用（同 TCP 端口共存真实 HTTPS 站点）及其对 fail-closed 策略的影响。

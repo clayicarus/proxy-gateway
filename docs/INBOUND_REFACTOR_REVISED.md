@@ -380,7 +380,8 @@ trafficFlushInterval: 10s
 - UDP 与 TCP 可以使用相同数字端口；同传输的入站、管理 HTTP 和订阅 HTTP 都进入冲突检查。确定的冲突预先报错，域名/双栈重叠由实际 bind 判定并回收，不只比较地址字符串。
 - 启用订阅时必须有 `sub.inbound`，指向存在的 Hy2 实例；不存在或类型错误均失败。保留一个订阅端点及现有路由条目，不自动枚举所有入站生成多套代理。
 - `sub.serverAddr` 保留为显式客户端地址，可以与 bind 地址不同以支持反向代理/NAT；不从 listen 或列表第一项推测公网地址。
-- 此前 master 会解析 `obfs`/`masquerade`，但 Gateway 数据面并未实现对应能力。S1 已将这两个字段改为启动时明确拒绝，并提供失败用例、迁移诊断和 release note；这属于正确性修复，同时也是用户可见的启动行为变化。S4 的新 schema 与迁移脚本继续拒绝，不能静默忽略或宣称已支持。
+- 此前 master 会解析 `obfs`/`masquerade`，但 Gateway 数据面并未实现对应能力。S1 已将这两个字段改为启动时明确拒绝，并提供失败用例、迁移诊断和 release note；这属于正确性修复，同时也是用户可见的启动行为变化。`obfs` 至今没有实现，运行时与迁移都继续拒绝。
+- masquerade 之后作为 Hy2 入站能力实现，配置位置是 `inbounds[].masquerade`，只支持 `type: proxy` 转发到一个固定 web 后端。顶层旧字段仍不属于运行时 schema；迁移脚本负责把旧的 proxy 模式改写到该入站，并在诊断中说明它升级后开始生效。未实现的 masquerade 模式仍然报错，不静默忽略、不宣称已支持。
 
 ### 11.2 脚本契约
 
@@ -403,7 +404,8 @@ scripts/validate-inbounds --input gateway-new.yaml
 | 非空旧 trojan.listen | 只有目标版本已包含 Trojan adapter 才生成具名 Trojan 实例；否则拒绝，不能丢掉它后返回成功。 |
 | 省略/空 listen 的旧 trojan | 保持原禁用状态，不生成会被新默认值启用的实例。 |
 | users/nodes 和旧订阅 secret | 属于独立管理数据迁移。遇到需要处理的数据明确报错并保留源文件，提示先由用户处理管理数据；不得丢弃后假定已入库。 |
-| obfs/masquerade、未知字段、无损转换不明 | 报错并标明字段，不自动删除或猜测。 |
+| 顶层 masquerade | `type: proxy` 且有 url 时改写到生成的 Hy2 实例，并给出"升级后开始生效"的诊断；其他模式或缺 url 时报错。 |
+| obfs、未知字段、无损转换不明 | 报错并标明字段，不自动删除或猜测。 |
 | 已经是新 schema | 明确报告输入不是旧 schema；不再次包装 inbounds。 |
 
 输出先在内存中完成转换并严格验证，再写入新目标；使用排他创建等机制拒绝覆盖，不只做一次存在检查。源/目标指向同一文件、别名路径或已有目标时失败。写入失败清理本次新建的部分结果，不能留下看似成功的新配置。日志只给字段路径和诊断，不输出密码、token、secret、私钥或完整配置。
@@ -498,6 +500,7 @@ S0 的能力实验与迁移工具可以单独交付；独立共享缺陷修复�
 - S3/S4 已将生产 Gateway 切换到 session-aware Hy2 adapter 和唯一 `inbounds` schema；多个 listener 在全部构造成功后才启动，停机保留 12 秒 worker 与至少 3 秒最终刷盘/SQLite close 预算。`internal/event` 和旧 `router.RoutingOutbound` 单槽 API 已删除；`internal/router` 只保留协议无关的显式策略路由，Direct/Hy2 node client、重试和连接资源管理收敛到 `internal/outbound`。Gateway 生命周期测试覆盖了后续 inbound bind 失败时释放已取得 listener，以及正常运行在取消后的收敛。
 
 - S5 迁入 Trojan TCP CONNECT：TLS 入站、有界首包 parser、SHA-224 凭据索引与经 `Kernel` 的显式节点选择、计量 relay。
+- Hy2 入站增加 `masquerade`（`type: proxy`）：未认证的 HTTP/3 请求转发到固定 web 后端，不再一律 404。它只使用 fork 已有的 `MasqHandler` 钩子，不进入认证、会话、路由或账本路径；后端 URL 不受请求内容影响，不发 `X-Forwarded-*`，失败返回空 502，停机时释放连接池。Trojan TCP 端口的 fallback 仍未实现，见 §15。
 - S6 增加 Trojan UDP ASSOCIATE：association 内每个 datagram 独立分帧并在写出前准入，上行按 payload 计 `tx`、下行计 `rx`，分帧头不计入；策略拒绝关闭整条 association，单包发送失败只丢包；`udpIdleTimeout` 回收空闲 association，`Close`/`Wait` 覆盖双向 relay、出站 flow 和空闲看门狗。direct 与远端 Hy2 node 的 UDP 两跳、多目标 datagram 和分帧 parser fuzz 均有测试。
 
 仍需扩展的验证包括 worker 预算耗尽、跨月 pending/flush 竞争、Trojan 的到期/超额/限速与 SQLite flush 断言、协议压测和目标 Linux CI。它们不改变已激活的请求身份、路由或计量语义。
@@ -520,3 +523,19 @@ S0 的能力实验与迁移工具可以单独交付；独立共享缺陷修复�
 - 增加“用户已确定但头解析失败/截断/超时”“无 payload 的失败请求”“出站建立失败”“部分 I/O 后报错”“身份确定后补记”“无法归属用户”和并发请求隔离的计量测试。
 
 本次仅登记 TODO，不修改当前账务、额度或限速实现；S0–S5 的 UDP 兼容事件和既有失败计量规则继续作为当前基线，后续通过独立变更实现本项。
+
+- [ ] **TODO-PROBE-01：为 Trojan TCP 入站实现 fallback，使认证失败的连接表现为一个普通网站。**
+
+决策记录（2026-09-11）：Hy2 入站的 `masquerade` 已实现，Trojan 的 fallback 单独排期。当前 Trojan 在 TLS 握手失败、凭据读取失败、凭据不匹配和命令非法时一律直接关闭连接，主动探测者能观察到"TLS 成功但握手后任何数据都被静默关闭"这一指纹。
+
+fallback 不是 masquerade 的简单对称实现，它的难点在判定时机而不是转发本身。后续设计与验收至少包括：
+
+- 首包必须保序保留。当前 `ReadCredential` 用固定长度 `io.ReadFull` 消费 58 字节后即丢弃；fallback 要求把已读字节完整按序回放给后端，之后的 relay 不重复、不丢、不乱序。
+- 判定不能只依赖"读满 58 字节后哈希不匹配"。合法 HTTP 请求可能短于 58 字节就停下等响应（`GET / HTTP/1.1\r\n\r\n` 只有 18 字节），当前实现会阻塞到握手 deadline 再关闭。需要在 deadline 内尽量读取，并在数据不构成合法 Trojan 头时也进入 fallback；这条超时路径必须有专门测试。
+- 凭据不匹配、格式非法和长度不足对外必须不可区分，包括响应时延；否则不同失败原因本身就是指纹。同时评估凭据比较是否需要恒定时间。
+- 明确 ALPN 策略。当前入站不设 `NextProtos`，浏览器提 h2 时不协商并退回 http/1.1；要让真实浏览器访问的行为与真网站一致，需要决定声明 `http/1.1` 还是 h2，并确认后端支持。
+- fallback 流量是无归属流量：不得进入已认证用户的 session、账本、额度或限速路径，但需要独立的并发上限、独立超时和脱敏日志（绝不记录疑似凭据的字节），并被 `Close`/`Wait` 覆盖。现有 `connections` registry 可直接登记后端连接。
+- 后端目标必须是配置里的固定地址，不接受任何来自客户端的输入，避免变成 SSRF 或开放代理。
+- 验收覆盖：短首包超时回落、非法哈希回落、合法哈希但命令非法仍应关闭连接、首包字节完整到达后端、后端不可用、并发上限、停机取消。
+
+本次仅登记 TODO，不修改 Trojan 的现有认证与关闭行为。

@@ -15,6 +15,7 @@
 - systemd 重启调度、watchdog、优雅停机和进程退出原因记录
 - 内建 Direct 和远端 Hysteria2 出站
 - Trojan 入站，支持 TCP CONNECT 与 UDP ASSOCIATE，使用每个用户、节点独立的派生凭据
+- Hysteria2 入站可选伪装：未认证的 HTTP/3 探测被转发到指定的 web 后端
 
 服务端没有隐式 fallback。节点缺失、上下文错配或拨号失败都会直接返回错误；`direct` 也必须由客户端明确选择并获用户授权。
 
@@ -51,6 +52,11 @@ inbounds:
   - name: hy2-public
     type: hysteria2
     listen: :8443
+    masquerade:
+      type: proxy
+      proxy:
+        url: http://127.0.0.1:8080
+        rewriteHost: true
   - name: trojan-public
     type: trojan
     listen: :8443
@@ -82,7 +88,7 @@ systemd:
   watchdog: true
 ```
 
-必须提供 `tls.cert` 与 `tls.key` 证书文件。`inbounds` 可配置具名的 Hysteria2 UDP 或 Trojan TCP 入口；两者可以共用数值端口。`sub.inbound` 目前只支持选择 Hysteria2 入口；`admin.listen` 和 `sub.listen` 是两个独立的 HTTP/TCP 端口。`sub.publicURL` 是用户获取订阅的 URL 前缀，`sub.serverAddr` 则是订阅内容中客户端连接 Gateway 的地址。
+必须提供 `tls.cert` 与 `tls.key` 证书文件。`inbounds` 可配置具名的 Hysteria2 UDP 或 Trojan TCP 入口；两者可以共用数值端口。Hysteria2 入站的 `masquerade` 是可选的，见下文"入站伪装"。`sub.inbound` 目前只支持选择 Hysteria2 入口；`admin.listen` 和 `sub.listen` 是两个独立的 HTTP/TCP 端口。`sub.publicURL` 是用户获取订阅的 URL 前缀，`sub.serverAddr` 则是订阅内容中客户端连接 Gateway 的地址。
 
 用户和节点不写在正常运行 YAML 中。首次启动后通过管理后台创建。
 
@@ -129,6 +135,23 @@ username:node:password
 客户端应将这个原始值作为 Trojan password；协议在 TLS 内发送其 SHA-224。服务端不会持久化或写入日志。一个用户有多个节点时，配置多个 Trojan 代理条目来显式选择节点。Trojan 订阅生成尚未实现。
 
 `trojan.udpIdleTimeout` 只回收双向都没有数据报的 UDP association，默认 60s。
+
+### 入站伪装
+
+不配置 `masquerade` 时，Hysteria2 入站对所有非认证的 HTTP/3 请求返回 404，主动探测可以据此确认这是个 Hysteria2 端点。配置 `type: proxy` 后，这些请求被转发到一个固定的 web 后端，端点表现为一个普通网站：
+
+```yaml
+masquerade:
+  type: proxy
+  proxy:
+    url: http://127.0.0.1:8080
+    rewriteHost: true
+```
+
+- `url` 是配置里的固定值，不受请求内容影响，入站不会变成开放代理。建议指向本机源站而不是绕回自己的公网域名，后者每次探测都要多一次公网 TLS 往返，且域名解析到本机时可能形成环路。
+- `rewriteHost: true` 让后端看到自己的 hostname，适合按虚拟主机分发；默认保留探测者发来的 Host。
+- Gateway 不发送 `X-Forwarded-*` 和 `Forwarded`，后端不可用时返回空的 502。
+- 伪装只覆盖 Hysteria2 UDP 端口上的 HTTP/3 探测。Trojan TCP 端口在认证失败时仍直接关闭连接，fallback 尚未实现。
 
 ## 旧 YAML 迁移
 

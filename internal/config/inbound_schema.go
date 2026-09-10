@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -32,11 +33,29 @@ type InboundConfig struct {
 
 // Inbound is a named protocol listener.
 type Inbound struct {
-	Name   string               `yaml:"name"`
-	Type   string               `yaml:"type"`
-	Listen string               `yaml:"listen"`
-	QUIC   *QUICConfig          `yaml:"quic,omitempty"`
-	Trojan *TrojanInboundConfig `yaml:"trojan,omitempty"`
+	Name       string                   `yaml:"name"`
+	Type       string                   `yaml:"type"`
+	Listen     string                   `yaml:"listen"`
+	QUIC       *QUICConfig              `yaml:"quic,omitempty"`
+	Trojan     *TrojanInboundConfig     `yaml:"trojan,omitempty"`
+	Masquerade *InboundMasqueradeConfig `yaml:"masquerade,omitempty"`
+}
+
+// InboundMasqueradeConfig decides what an unauthenticated HTTP/3 probe of a
+// Hysteria2 inbound sees. Without it the inbound answers 404 for everything.
+type InboundMasqueradeConfig struct {
+	Type  string                 `yaml:"type"`
+	Proxy *MasqueradeProxyConfig `yaml:"proxy,omitempty"`
+}
+
+// MasqueradeProxyConfig forwards probe requests to one fixed web backend. The
+// URL is never derived from request content, so the inbound cannot be used as
+// an open proxy.
+type MasqueradeProxyConfig struct {
+	URL string `yaml:"url"`
+	// RewriteHost sends the backend its own hostname instead of the Host the
+	// probe used. Enable it when the backend selects a virtual host by Host.
+	RewriteHost bool `yaml:"rewriteHost,omitempty"`
 }
 
 // TrojanInboundConfig controls resource limits for a Trojan TCP/TLS inbound.
@@ -96,6 +115,14 @@ func (c *InboundConfig) validate() error {
 		listener, err := parseListener(path+".listen", inbound.Listen)
 		if err != nil {
 			return err
+		}
+		if inbound.Masquerade != nil {
+			if inbound.Type != Hysteria2InboundType {
+				return fmt.Errorf("%s.masquerade is only valid for a hysteria2 inbound", path)
+			}
+			if err := validateInboundMasquerade(path+".masquerade", inbound.Masquerade); err != nil {
+				return err
+			}
 		}
 		if inbound.Type == Hysteria2InboundType {
 			if inbound.Trojan != nil {
@@ -214,6 +241,35 @@ func validateTrojanInbound(path string, trojan *TrojanInboundConfig) error {
 	}
 	if trojan.UDPIdleTimeout != 0 && (trojan.UDPIdleTimeout < 5*time.Second || trojan.UDPIdleTimeout > 30*time.Minute) {
 		return fmt.Errorf("%s.udpIdleTimeout must be between 5s and 30m when configured", path)
+	}
+	return nil
+}
+
+// MasqueradeProxyType is the only masquerade mode the data plane implements.
+const MasqueradeProxyType = "proxy"
+
+func validateInboundMasquerade(path string, masquerade *InboundMasqueradeConfig) error {
+	if masquerade.Type != MasqueradeProxyType {
+		return fmt.Errorf("%s.type has unsupported value %q; only %q is implemented", path, masquerade.Type, MasqueradeProxyType)
+	}
+	if masquerade.Proxy == nil || masquerade.Proxy.URL == "" {
+		return fmt.Errorf("%s.proxy.url must be configured", path)
+	}
+	target, err := url.Parse(masquerade.Proxy.URL)
+	if err != nil {
+		return fmt.Errorf("%s.proxy.url is invalid: %w", path, err)
+	}
+	if target.Scheme != "http" && target.Scheme != "https" {
+		return fmt.Errorf("%s.proxy.url must use http or https", path)
+	}
+	if target.Host == "" {
+		return fmt.Errorf("%s.proxy.url must name a backend host", path)
+	}
+	if target.User != nil {
+		return fmt.Errorf("%s.proxy.url must not embed credentials", path)
+	}
+	if target.RawQuery != "" || target.Fragment != "" {
+		return fmt.Errorf("%s.proxy.url must not carry a query or fragment", path)
 	}
 	return nil
 }

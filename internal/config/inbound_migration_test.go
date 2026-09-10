@@ -202,3 +202,52 @@ func TestMigrateLegacyInboundsFileCreatesExclusivelyWithoutDatabaseAccess(t *tes
 		t.Fatal("source and target path must not be accepted")
 	}
 }
+
+func TestMigrateLegacyInboundsMigratesMasquerade(t *testing.T) {
+	result, err := MigrateLegacyInbounds([]byte(`
+listen: ":8443"
+tls:
+  cert: ./cert.pem
+  key: ./key.pem
+masquerade:
+  type: proxy
+  proxy:
+    url: http://127.0.0.1:8080
+    rewriteHost: true
+`))
+	if err != nil {
+		t.Fatalf("MigrateLegacyInbounds failed: %v", err)
+	}
+	diagnostics := strings.Join(result.Diagnostics, "\n")
+	if !strings.Contains(diagnostics, "now enforced by the data plane") {
+		t.Fatalf("expected an enforcement diagnostic, got %#v", result.Diagnostics)
+	}
+	cfg, err := ParseInboundConfig(result.YAML)
+	if err != nil {
+		t.Fatalf("generated YAML did not round trip: %v\n%s", err, result.YAML)
+	}
+	masquerade := cfg.Inbounds[0].Masquerade
+	if masquerade == nil || masquerade.Proxy == nil || masquerade.Proxy.URL != "http://127.0.0.1:8080" || !masquerade.Proxy.RewriteHost {
+		t.Fatalf("masquerade was not migrated: %#v", masquerade)
+	}
+}
+
+func TestMigrateLegacyInboundsRejectsUnimplementedMasquerade(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{name: "file mode", body: "masquerade:\n  type: file\n", wantErr: "only \"proxy\" with a proxy url is implemented"},
+		{name: "proxy without url", body: "masquerade:\n  type: proxy\n", wantErr: "only \"proxy\" with a proxy url is implemented"},
+		{name: "empty", body: "masquerade: null\n", wantErr: "field masquerade is unsupported"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := MigrateLegacyInbounds([]byte("listen: \":8443\"\ntls:\n  cert: ./cert.pem\n  key: ./key.pem\n" + test.body))
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}

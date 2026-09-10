@@ -159,7 +159,7 @@ flowchart LR
 
 ## 配置来源
 
-运行时 YAML 只接受唯一的 `inbounds` schema，保存启动前必须知道的参数：UDP/TLS/QUIC、管理和订阅监听、SQLite 路径、自然月时区、流量 flush 周期和 systemd 设置。顶层旧字段 `listen`、`quic`、`api`、`users`、`nodes`、`obfs` 和 `masquerade` 不属于运行时 schema，会被严格解析拒绝。TLS 使用已有的证书和私钥文件，证书签发与续期由外部工具完成。
+运行时 YAML 只接受唯一的 `inbounds` schema，保存启动前必须知道的参数：UDP/TLS/QUIC、每个入站的协议选项（Hysteria2 的 `masquerade`、Trojan 的握手与 UDP 上限）、管理和订阅监听、SQLite 路径、自然月时区、流量 flush 周期和 systemd 设置。顶层旧字段 `listen`、`quic`、`api`、`users`、`nodes`、`obfs` 和 `masquerade` 不属于运行时 schema，会被严格解析拒绝；`masquerade` 已改为 `inbounds[].masquerade`。TLS 使用已有的证书和私钥文件，证书签发与续期由外部工具完成。
 
 SQLite 保存：
 

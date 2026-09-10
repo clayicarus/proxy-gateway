@@ -11,7 +11,7 @@
 - Hysteria2 继续监听 UDP；Trojan 监听 TCP。因此两个入站可同用数值端口，例如 UDP `:443` 与 TCP `:443`。Trojan UDP ASSOCIATE 同样在这条 TCP/TLS 连接内传输，不额外监听 UDP。
 - Trojan 在 TLS 内只提交固定的 `SHA224(password)`，服务端不能从哈希中反解用户或节点。
 - 每条 Trojan 凭据绑定一个确定的 `username:node`。一个用户有多个授权节点时，客户端需要使用多个 Trojan 代理条目选择节点。
-- 认证失败或不支持的命令直接关闭连接。本期不提供 HTTP/HTTPS fallback；这会降低主动探测伪装能力，是明确接受的安全与运维取舍。
+- 认证失败或不支持的命令直接关闭连接。目前不提供 HTTP/HTTPS fallback；这会降低主动探测伪装能力，是明确接受的取舍，后续工作登记在 TODO-PROBE-01。Hysteria2 入站的 `masquerade` 只覆盖该 UDP 端口上的 HTTP/3 探测，不改变 Trojan TCP 端口的行为。
 - 现有节点和授权仍以启动快照为准，保存后必须重启；密码、停用、到期、额度和限速仍在约两秒内刷新。
 
 ## 配置契约

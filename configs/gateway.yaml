@@ -9,6 +9,13 @@ inbounds:
     # quic:
     #   maxIdleTimeout: 30s
     #   maxIncomingStreams: 1024
+    # 可选伪装：未认证的 HTTP/3 探测转发到固定 web 后端。
+    # 不配置时该入站对所有非认证请求返回 404。
+    # masquerade:
+    #   type: proxy
+    #   proxy:
+    #     url: http://127.0.0.1:8080
+    #     rewriteHost: true
   # - name: trojan-public
   #   type: trojan
   #   listen: :8443
