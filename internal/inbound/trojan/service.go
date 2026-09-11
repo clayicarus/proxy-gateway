@@ -228,14 +228,26 @@ func (s *Service) handle(rawClient net.Conn) {
 		session, authenticated = s.kernel.AuthenticateTrojan(s.name, rawClient.RemoteAddr(), credential)
 	}
 	if !authenticated {
-		if s.fallback != nil && s.fallback.acquire() {
+		if s.fallback == nil {
+			return
+		}
+		// A connection that produced no header byte has nothing to replay and no
+		// request to answer. Serving it would cost a website slot and an origin
+		// connection for the whole relay lifetime while carrying no request, so
+		// it is closed the way a web server drops a client that never sends one.
+		if prefix.Len() == 0 {
+			s.logger.Debug("Trojan website probe sent no request", zap.String("inbound", s.name))
+			return
+		}
+		if s.fallback.acquire() {
 			defer s.fallback.release()
 			<-s.pending
 			pending = false
-			s.serveFallback(client, rawClient, prefix.Bytes(), probeDeadline)
-		} else if s.fallback != nil {
-			s.logger.Debug("Trojan website connection limit reached", zap.String("inbound", s.name))
+			s.serveFallback(client, rawClient, prefix.Bytes())
+			return
 		}
+		s.logger.Debug("Trojan website connection limit reached", zap.String("inbound", s.name))
+		s.writeOverCapacityResponse(client)
 		return
 	}
 	if s.fallback == nil {

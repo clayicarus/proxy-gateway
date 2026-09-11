@@ -54,4 +54,5 @@
 - [ ] 评估独立 `access_credentials` 表，以支持每协议独立凭据、单独撤销、轮换与审计。
 - [x] 按官方规则完成 Trojan 网站 fallback：完整初始请求结构和凭据共同判定；错误命令、地址、分隔符以及截断/超时均回退，包括正确凭据后出现的格式错误。回放全部已消费首部及未读流，首部最多 320 字节；完整首部校验前不创建代理 session。`probeTimeout` 覆盖整个首部，并保留固定后端、独立资源上限、脱敏日志和完整停机。契约与验收见 [INBOUND_REFACTOR_REVISED.md](INBOUND_REFACTOR_REVISED.md) 的 TODO-PROBE-01。
 - [x] 验证合法 Trojan 请求的目标拨号失败、策略拒绝以及进入代理后的 UDP 分帧错误不会转入 fallback；网站流量不影响用户账本、在线状态或请求追踪。
+- [ ] 修复 TODO-PROBE-02（低优先级）：停用或到期用户的有效凭据会被明文回放到 fallback 源站并进入其 access log；只有"凭据不存在"才应回退。
 - [ ] 若确有部署需求，再单独设计 mux 及 SNI 多路复用（同 TCP 端口共存真实 HTTPS 站点）及其对 fail-closed 策略的影响。

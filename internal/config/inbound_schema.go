@@ -156,7 +156,7 @@ func (c *InboundConfig) validate() error {
 				return fmt.Errorf("%s.quic is only valid for a hysteria2 inbound", path)
 			}
 			if inbound.Trojan != nil {
-				if err := validateTrojanInbound(path+".trojan", inbound.Trojan); err != nil {
+				if err := validateTrojanInbound(path+".trojan", inbound.Trojan, listener); err != nil {
 					return err
 				}
 			}
@@ -265,10 +265,21 @@ func validateSubscriptionEndpoint(path string, endpoint SubscriptionEndpoint, in
 	return nil
 }
 
-func validateTrojanInbound(path string, trojan *TrojanInboundConfig) error {
+func validateTrojanInbound(path string, trojan *TrojanInboundConfig, listen listenerAddress) error {
 	if trojan.Fallback != nil {
-		if _, err := trojan.Fallback.WithDefaults(); err != nil {
+		fallback, err := trojan.Fallback.WithDefaults()
+		if err != nil {
 			return fmt.Errorf("%s.%w", path, err)
+		}
+		// A backend pointing at this listener makes every probe re-enter the
+		// inbound, which only fails after another TLS handshake and burns a
+		// pending slot per probe with an opaque error.
+		backend, err := parseListener(path+".fallback.addr", fallback.Addr)
+		if err != nil {
+			return err
+		}
+		if listenersDefinitelyConflict(listen, backend) {
+			return fmt.Errorf("%s.fallback.addr must not point at the inbound's own listen address", path)
 		}
 	}
 	if trojan.HandshakeTimeout < 0 {

@@ -20,7 +20,7 @@ inbounds:
         addr: 127.0.0.1:8080
         probeTimeout: 1s
         dialTimeout: 3s
-        timeout: 30s
+        idleTimeout: 30s
         maxConnections: 32
 
 tls:
