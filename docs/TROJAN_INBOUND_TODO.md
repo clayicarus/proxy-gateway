@@ -6,9 +6,10 @@
 
 ## 阶段 0：先锁定契约
 
-- [x] 确认支持 TCP CONNECT 与 UDP ASSOCIATE；拒绝 BIND、mux 和 fallback。
+- [x] 确认支持 TCP CONNECT、UDP ASSOCIATE 和可选网站 fallback；BIND、mux 等非标准命令不进入代理路径，启用 fallback 时按非法初始请求回退。
+- [x] fallback 判定遵循 [Trojan 官方协议](https://github.com/trojan-gfw/trojan/blob/3e7bb9aecdc694f9bcae8d646fae395f773d60f8/docs/protocol.md#L49)：完整请求结构与凭据必须同时有效；任何初始请求格式错误都回退，即使其中的凭据正确。
 - [x] 确认 Trojan 原始 password 固定为 `username:node:password`，每个用户节点组合独立。
-- [x] 决定当前只提供手工客户端配置；Trojan 订阅输出留到后续，`serverAddr`/`sni`/`insecure` 届时一并加入。
+- [x] 确定订阅契约：单入口使用 `sub.inbound`，多入口使用 `sub.endpoints[]`，分别配置 `serverAddr`、`sni` 和 `insecure`。
 - [x] 明确未认证连接的 TLS 握手与首包解析超时、并发上限，以及 UDP association 的空闲上限（`handshakeTimeout`、`maxPendingConnections`、`udpIdleTimeout`）。
 - [ ] 补充上述阈值的压测依据；当前默认值是保守常量，没有实测支撑。
 
@@ -25,7 +26,7 @@
 ## 阶段 2：Trojan 服务
 
 - [x] 独立 TCP listener、TLS `HandshakeContext`、握手/首包 deadline、accept 错误退避与连接追踪。
-- [x] 精确解析 `SHA224(password) + CRLF + 命令 + address + port + CRLF`，拒绝截断、超长、未知 ATYP、空域名、非法域名字符、零端口和不支持的命令。
+- [x] 精确解析 `SHA224(password) + CRLF + 命令 + address + port + CRLF`，按官方规则将截断、未知 ATYP、空域名、错误分隔符和不支持的命令判为非法结构。CONNECT 零端口、域名字符等本地目标限制单独校验，不能将结构完整且凭据有效的请求送入 fallback。
 - [x] 通过 `Kernel.AuthenticateTrojan` 取得私有 session，再由 `Kernel.OpenTCP` 选择出站；adapter 拿不到路由 ID 或裸 outbound。
 - [x] 实现双向计量 TCP relay；准入返回 false 时关闭两端且不再转发。
 - [x] 实现 UDP ASSOCIATE：`Kernel.OpenUDP` 打开出站 flow，逐 datagram 分帧、准入与转发，空闲回收，单包失败只丢包。
@@ -35,7 +36,7 @@
 ## 阶段 3：测试与验收
 
 - [x] 单元测试 SHA-224 索引、热刷新、哈希格式和用户节点映射。
-- [x] 表驱动解析测试：IPv4、IPv6、最长域名、截断首包、错误 CRLF、错误命令、非法端口、非法域名字符。
+- [x] 表驱动解析测试：IPv4、IPv6、最长域名、截断首包、错误 CRLF、错误命令；区分非法请求结构与零端口、非法域名字符等本地目标拒绝。
 - [x] 表驱动 UDP 分帧测试：往返编码、逐包边界、零端口、错误 CRLF、超出缓冲的长度、截断 payload。
 - [x] `FuzzReadRequest` 与 `FuzzReadPacket` 覆盖任意输入不 panic、不越界、不产生无法解析的目标；已收录一个回归语料。
 - [x] TCP e2e：Trojan -> Direct -> 本地目标；验证双向 payload 与 tx/rx 计量。
@@ -46,10 +47,11 @@
 - [x] 运行 `CGO_ENABLED=1 go test ./...`、`go test -race ./...`、`go vet ./...`、`gofmt`。
 - [ ] 对未认证握手、空闲已认证连接、并发 relay 与关闭过程做负载测试，确定上限和系统资源消耗。
 
-## 阶段 4：后续，不与当前实现混合
+## 阶段 4：订阅与后续
 
-- [ ] 生成 Clash.Meta Trojan 订阅条目，每个用户节点组合独立、名称不冲突，并按已支持的 UDP 能力输出 `udp: true`。
+- [x] 生成 Clash.Meta Trojan 订阅条目，每个用户节点组合独立、名称不冲突，并按已支持的 UDP 能力输出 `udp: true`；验证运行时配置到 HTTP 订阅再到 TCP/UDP 转发的完整路径。
 - [ ] 增加管理后台的 Trojan 配置可见性和安全提示；不显示或记录不必要的原始凭据。
 - [ ] 评估独立 `access_credentials` 表，以支持每协议独立凭据、单独撤销、轮换与审计。
-- [ ] 实现 Trojan fallback，使认证失败的连接表现为普通网站。契约与验收见 [INBOUND_REFACTOR_REVISED.md](INBOUND_REFACTOR_REVISED.md) 的 TODO-PROBE-01：首包保序回放、短首包超时也要回落、各种失败对外不可区分、ALPN 策略、无归属流量的独立上限与脱敏日志、固定后端。Hy2 入站的 `masquerade` 已实现，但它只覆盖 UDP 端口上的 HTTP/3 探测，不改变 Trojan TCP 端口的行为。
+- [x] 按官方规则完成 Trojan 网站 fallback：完整初始请求结构和凭据共同判定；错误命令、地址、分隔符以及截断/超时均回退，包括正确凭据后出现的格式错误。回放全部已消费首部及未读流，首部最多 320 字节；完整首部校验前不创建代理 session。`probeTimeout` 覆盖整个首部，并保留固定后端、独立资源上限、脱敏日志和完整停机。契约与验收见 [INBOUND_REFACTOR_REVISED.md](INBOUND_REFACTOR_REVISED.md) 的 TODO-PROBE-01。
+- [x] 验证合法 Trojan 请求的目标拨号失败、策略拒绝以及进入代理后的 UDP 分帧错误不会转入 fallback；网站流量不影响用户账本、在线状态或请求追踪。
 - [ ] 若确有部署需求，再单独设计 mux 及 SNI 多路复用（同 TCP 端口共存真实 HTTPS 站点）及其对 fail-closed 策略的影响。

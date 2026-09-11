@@ -379,6 +379,8 @@ trafficFlushInterval: 10s
 - 不引入 enabled 与空 listen 两套禁用语义：新运行时未列出的实例即不存在，列出的实例必须有效。迁移脚本负责映射旧配置的省略/默认/禁用行为。
 - UDP 与 TCP 可以使用相同数字端口；同传输的入站、管理 HTTP 和订阅 HTTP 都进入冲突检查。确定的冲突预先报错，域名/双栈重叠由实际 bind 判定并回收，不只比较地址字符串。
 - 启用订阅时必须有 `sub.inbound`，指向存在的 Hy2 实例；不存在或类型错误均失败。保留一个订阅端点及现有路由条目，不自动枚举所有入站生成多套代理。
+
+后续订阅扩展已完成：单入口 `sub.inbound` 也可选择 Trojan，多个公开入口通过 `sub.endpoints[]` 显式列出，各自配置公网地址和 TLS 参数；仍不自动发布未列出的入口。当前契约与示例见 [README](../README.zh.md) 和 [Trojan 设计](TROJAN_INBOUND_DESIGN.md)。以上单 Hy2 限制保留为核心重构阶段的范围说明。
 - `sub.serverAddr` 保留为显式客户端地址，可以与 bind 地址不同以支持反向代理/NAT；不从 listen 或列表第一项推测公网地址。
 - 此前 master 会解析 `obfs`/`masquerade`，但 Gateway 数据面并未实现对应能力。S1 已将这两个字段改为启动时明确拒绝，并提供失败用例、迁移诊断和 release note；这属于正确性修复，同时也是用户可见的启动行为变化。`obfs` 至今没有实现，运行时与迁移都继续拒绝。
 - masquerade 之后作为 Hy2 入站能力实现，配置位置是 `inbounds[].masquerade`，只支持 `type: proxy` 转发到一个固定 web 后端。顶层旧字段仍不属于运行时 schema；迁移脚本负责把旧的 proxy 模式改写到该入站，并在诊断中说明它升级后开始生效。未实现的 masquerade 模式仍然报错，不静默忽略、不宣称已支持。
@@ -500,7 +502,7 @@ S0 的能力实验与迁移工具可以单独交付；独立共享缺陷修复�
 - S3/S4 已将生产 Gateway 切换到 session-aware Hy2 adapter 和唯一 `inbounds` schema；多个 listener 在全部构造成功后才启动，停机保留 12 秒 worker 与至少 3 秒最终刷盘/SQLite close 预算。`internal/event` 和旧 `router.RoutingOutbound` 单槽 API 已删除；`internal/router` 只保留协议无关的显式策略路由，Direct/Hy2 node client、重试和连接资源管理收敛到 `internal/outbound`。Gateway 生命周期测试覆盖了后续 inbound bind 失败时释放已取得 listener，以及正常运行在取消后的收敛。
 
 - S5 迁入 Trojan TCP CONNECT：TLS 入站、有界首包 parser、SHA-224 凭据索引与经 `Kernel` 的显式节点选择、计量 relay。
-- Hy2 入站增加 `masquerade`（`type: proxy`）：未认证的 HTTP/3 请求转发到固定 web 后端，不再一律 404。它只使用 fork 已有的 `MasqHandler` 钩子，不进入认证、会话、路由或账本路径；后端 URL 不受请求内容影响，不发 `X-Forwarded-*`，失败返回空 502，停机时释放连接池。Trojan TCP 端口的 fallback 仍未实现，见 §15。
+- Hy2 入站增加 `masquerade`（`type: proxy`）：未认证的 HTTP/3 请求转发到固定 web 后端，不再一律 404。它只使用 fork 已有的 `MasqHandler` 钩子，不进入认证、会话、路由或账本路径；后端 URL 不受请求内容影响，不发 `X-Forwarded-*`，失败返回空 502，停机时释放连接池。Trojan TCP 网站回退已作为独立功能实现，见 §15。
 - S6 增加 Trojan UDP ASSOCIATE：association 内每个 datagram 独立分帧并在写出前准入，上行按 payload 计 `tx`、下行计 `rx`，分帧头不计入；策略拒绝关闭整条 association，单包发送失败只丢包；`udpIdleTimeout` 回收空闲 association，`Close`/`Wait` 覆盖双向 relay、出站 flow 和空闲看门狗。direct 与远端 Hy2 node 的 UDP 两跳、多目标 datagram 和分帧 parser fuzz 均有测试。
 
 仍需扩展的验证包括 worker 预算耗尽、跨月 pending/flush 竞争、Trojan 的到期/超额/限速与 SQLite flush 断言、协议压测和目标 Linux CI。它们不改变已激活的请求身份、路由或计量语义。
@@ -524,18 +526,24 @@ S0 的能力实验与迁移工具可以单独交付；独立共享缺陷修复�
 
 本次仅登记 TODO，不修改当前账务、额度或限速实现；S0–S5 的 UDP 兼容事件和既有失败计量规则继续作为当前基线，后续通过独立变更实现本项。
 
-- [ ] **TODO-PROBE-01：为 Trojan TCP 入站实现 fallback，使认证失败的连接表现为一个普通网站。**
+- [x] **TODO-PROBE-01：严格遵循官方 Trojan 的初始请求判定规则，实现可选网站 fallback。**
 
-决策记录（2026-09-11）：Hy2 入站的 `masquerade` 已实现，Trojan 的 fallback 单独排期。当前 Trojan 在 TLS 握手失败、凭据读取失败、凭据不匹配和命令非法时一律直接关闭连接，主动探测者能观察到"TLS 成功但握手后任何数据都被静默关闭"这一指纹。
+约定修订（2026-09-11）：以 [Trojan 官方协议](https://github.com/trojan-gfw/trojan/blob/3e7bb9aecdc694f9bcae8d646fae395f773d60f8/docs/protocol.md#L49) 的 Valid Trojan Protocol / Other Protocols 规则为准。TLS 成功后，只有完整初始请求结构合法且凭据有效时才进入 Trojan 代理路径；否则启用 `inbounds[].trojan.fallback` 时将解密后的原始字节流交给固定后端。凭据正确不豁免请求格式校验，错误命令、地址、分隔符、截断或读取超时也必须回退。TLS 失败仍关闭；未配置 fallback 时保留关闭行为。
 
-fallback 不是 masquerade 的简单对称实现，它的难点在判定时机而不是转发本身。后续设计与验收至少包括：
+实施契约与验收：
 
-- 首包必须保序保留。当前 `ReadCredential` 用固定长度 `io.ReadFull` 消费 58 字节后即丢弃；fallback 要求把已读字节完整按序回放给后端，之后的 relay 不重复、不丢、不乱序。
-- 判定不能只依赖"读满 58 字节后哈希不匹配"。合法 HTTP 请求可能短于 58 字节就停下等响应（`GET / HTTP/1.1\r\n\r\n` 只有 18 字节），当前实现会阻塞到握手 deadline 再关闭。需要在 deadline 内尽量读取，并在数据不构成合法 Trojan 头时也进入 fallback；这条超时路径必须有专门测试。
-- 凭据不匹配、格式非法和长度不足对外必须不可区分，包括响应时延；否则不同失败原因本身就是指纹。同时评估凭据比较是否需要恒定时间。
-- 明确 ALPN 策略。当前入站不设 `NextProtos`，浏览器提 h2 时不协商并退回 http/1.1；要让真实浏览器访问的行为与真网站一致，需要决定声明 `http/1.1` 还是 h2，并确认后端支持。
-- fallback 流量是无归属流量：不得进入已认证用户的 session、账本、额度或限速路径，但需要独立的并发上限、独立超时和脱敏日志（绝不记录疑似凭据的字节），并被 `Close`/`Wait` 覆盖。现有 `connections` registry 可直接登记后端连接。
-- 后端目标必须是配置里的固定地址，不接受任何来自客户端的输入，避免变成 SSRF 或开放代理。
-- 验收覆盖：短首包超时回落、非法哈希回落、合法哈希但命令非法仍应关闭连接、首包字节完整到达后端、后端不可用、并发上限、停机取消。
+- 有界 tee 保留凭据和请求解析器消费的全部首部，最长为 320 字节：56 字节哈希、CRLF、CMD、ATYP、最长域名地址、端口及末尾 CRLF。EOF/超时前的部分读取也要保留；按顺序回放一次，再转发未读流。验证正确凭据后的非法命令、各类地址、末尾分隔符和最长首部均不丢失字节，并保留写半关闭后的源站响应。
+- `probeTimeout` 约束完整初始首部，同时受原有 TLS/握手总 deadline 限制；不能仅凭凭据前缀正确就延长该窗口。覆盖窗口内分段到达的有效请求、短 HTTP 请求、凭据或请求头截断/超时，以及超时后继续发送的剩余字节。
+- 请求结构校验通过后才验证凭据并取得用户代理 session。未知凭据和非法初始请求均按 Other Protocols 处理，使用相同判定窗口，不产生不同的 Gateway 响应。默认一秒窗口及并发、拨号和连接寿命上限属于资源配置，官方协议不规定其数值；不将它们宣称为官方实现的时延复刻。
+- 按官方 [SOCKS5 地址解析器](https://github.com/trojan-gfw/trojan/blob/3e7bb9aecdc694f9bcae8d646fae395f773d60f8/src/proto/socks5address.cpp) 区分结构校验与目标限制：CONNECT 零端口及非空域名中的特殊字符不属于首部结构错误。本地可继续拒绝这些目标，但必须先验证完整结构与凭据；凭据有效时关闭代理路径，不能回退到网站，凭据无效时仍原样回退。
+- TLS 仅声明 `http/1.1`，固定后端必须提供明文 HTTP/1.1。生成的 Trojan 订阅同步输出 `alpn: [http/1.1]`，普通入口保持原有 ALPN 行为；不实现 HTTP/2 转换或按 SNI 选择后端。
+- 回退流量不取得用户代理 session，不进入路由、账本、额度、限速、在线状态或请求追踪。独立 `maxConnections` 覆盖等待和 relay，在释放握手槽位前取得网站槽位；`dialTimeout` 与 `timeout` 限制后端拨号及连接总时长。后端登记到现有 registry，`Close`/`Wait` 等待双向 relay 结束。日志仅记录固定事件与入口名。
+- 完整首部与凭据校验成功后，目标拨号失败、策略拒绝或后续 UDP 分帧错误属于已建立代理路径的失败，只关闭代理连接，不把代理首部或有效负载改送网站。
+- 后端只使用配置中的固定 `addr`，请求 Host、绝对 URL 或 SNI 不能改变目标。测试覆盖后端不可用、日志脱敏、并发上限、有效客户端与匿名容量隔离、超时及判定/转发期间停机。
+- 保留 `test/e2e/subscription_test.go` 对运行时 YAML、SQLite token、受信任证书、HTTPS/HTTP3 网站、订阅下载以及 Hysteria2 TCP 和 Trojan TCP/UDP 的验证，并补充上述官方判定边界回归；实现完成后重新执行全仓库竞态测试。
 
-本次仅登记 TODO，不修改 Trojan 的现有认证与关闭行为。
+本约定同时限定 TODO-TRAFFIC-01 的归属边界：Trojan 初始请求必须通过完整结构和凭据校验才建立用户代理归属；被判为 Other Protocols 的流量不能仅因凭据片段命中而记入用户。
+
+部署参数、默认值和可替换的静态网站示例见 [DEPLOYMENT.md](DEPLOYMENT.md)。本项不改变认证代理请求的用户授权、出站选择和计量口径。
+
+验收（2026-09-11）：新增完整首部分类、最长首部及部分读取回放、完整首部 deadline、代理失败不回退和匿名流量不签发 session 的回归测试；`go test -race -count=1 -timeout=3m ./...`、`go vet ./...`、三个命令构建及双语 README/配置校验通过。

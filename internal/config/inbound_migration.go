@@ -67,6 +67,9 @@ func MigrateLegacyInbounds(data []byte) (*MigrationResult, error) {
 	if legacy.API.Secret != "" || (legacy.Sub != nil && legacy.Sub.Secret != "") {
 		return nil, fmt.Errorf("legacy subscription secret contains management data; migrate management data first")
 	}
+	if legacy.Sub != nil && (legacy.Sub.Inbound != "" || legacy.Sub.Endpoints != nil) {
+		return nil, fmt.Errorf("legacy sub must not contain inbound or endpoints; use validate-inbounds for the runtime schema")
+	}
 	if legacy.Sub != nil && legacy.Sub.ServerAddr == "" {
 		return nil, fmt.Errorf("sub.serverAddr must be configured; migration will not infer it from listen")
 	}
@@ -116,9 +119,6 @@ func MigrateLegacyInbounds(data []byte) (*MigrationResult, error) {
 			Type:   TrojanInboundType,
 			Listen: legacy.Trojan.Listen,
 		})
-		if legacy.Trojan.ServerAddr != "" || legacy.Trojan.SNI != "" || legacy.Trojan.Insecure {
-			result.Diagnostics = append(result.Diagnostics, "legacy Trojan subscription metadata was not migrated because Trojan subscription generation is unavailable")
-		}
 	}
 	if output.Admin.Listen == "" {
 		output.Admin.Listen = legacy.API.Listen
@@ -127,12 +127,30 @@ func MigrateLegacyInbounds(data []byte) (*MigrationResult, error) {
 	}
 	if legacy.Sub != nil {
 		output.Sub = &InboundSubConfig{
-			Listen:     legacy.Sub.Listen,
-			PublicURL:  legacy.Sub.PublicURL,
-			Inbound:    migratedHysteria2InboundName,
-			ServerAddr: legacy.Sub.ServerAddr,
-			SNI:        legacy.Sub.SNI,
-			Insecure:   legacy.Sub.Insecure,
+			Listen:    legacy.Sub.Listen,
+			PublicURL: legacy.Sub.PublicURL,
+			SubscriptionEndpoint: &SubscriptionEndpoint{
+				Inbound: migratedHysteria2InboundName, ServerAddr: legacy.Sub.ServerAddr,
+				SNI: legacy.Sub.SNI, Insecure: legacy.Sub.Insecure,
+			},
+		}
+	}
+	if legacy.Trojan != nil && legacy.Trojan.Listen != "" &&
+		(legacy.Trojan.ServerAddr != "" || legacy.Trojan.SNI != "" || legacy.Trojan.Insecure) {
+		if output.Sub == nil {
+			result.Diagnostics = append(result.Diagnostics, "legacy Trojan subscription metadata was not migrated because sub is not configured")
+		} else {
+			if legacy.Trojan.ServerAddr == "" {
+				return nil, fmt.Errorf("trojan.serverAddr must be configured to migrate Trojan subscription metadata; it cannot be inferred from listen")
+			}
+			output.Sub = &InboundSubConfig{
+				Listen: legacy.Sub.Listen, PublicURL: legacy.Sub.PublicURL,
+				Endpoints: []SubscriptionEndpoint{
+					{Inbound: migratedHysteria2InboundName, ServerAddr: legacy.Sub.ServerAddr, SNI: legacy.Sub.SNI, Insecure: legacy.Sub.Insecure},
+					{Inbound: migratedTrojanInboundName, ServerAddr: legacy.Trojan.ServerAddr, SNI: legacy.Trojan.SNI, Insecure: legacy.Trojan.Insecure},
+				},
+			}
+			result.Diagnostics = append(result.Diagnostics, "legacy Trojan subscription metadata was migrated; the subscription now publishes both Hysteria2 and Trojan")
 		}
 	}
 

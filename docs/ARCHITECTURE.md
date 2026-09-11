@@ -59,7 +59,7 @@ flowchart LR
 
 监听由 `inbounds` 列表和两个可选 HTTP 服务定义：
 
-- 每个 `inbounds[].listen` 是一个具名 Hysteria2 QUIC/UDP 入口。
+- 每个 `inbounds[].listen` 是一个具名 Hysteria2 QUIC/UDP 或 Trojan TLS/TCP 入口。
 - `admin.listen` 是仅本机访问的管理 HTTP/TCP 入口。
 - `sub.listen` 是可由 Nginx 发布到公网的订阅 HTTP/TCP 入口。
 
@@ -159,7 +159,9 @@ flowchart LR
 
 ## 配置来源
 
-运行时 YAML 只接受唯一的 `inbounds` schema，保存启动前必须知道的参数：UDP/TLS/QUIC、每个入站的协议选项（Hysteria2 的 `masquerade`、Trojan 的握手与 UDP 上限）、管理和订阅监听、SQLite 路径、自然月时区、流量 flush 周期和 systemd 设置。顶层旧字段 `listen`、`quic`、`api`、`users`、`nodes`、`obfs` 和 `masquerade` 不属于运行时 schema，会被严格解析拒绝；`masquerade` 已改为 `inbounds[].masquerade`。TLS 使用已有的证书和私钥文件，证书签发与续期由外部工具完成。
+运行时 YAML 只接受唯一的 `inbounds` schema，保存启动前必须知道的参数：UDP/TLS/QUIC、每个入站的协议选项（Hysteria2 的 `masquerade`、Trojan 的握手与 UDP 上限及可选 `fallback`）、管理和订阅监听、SQLite 路径、自然月时区、流量 flush 周期和 systemd 设置。顶层旧字段 `listen`、`quic`、`api`、`users`、`nodes`、`obfs` 和 `masquerade` 不属于运行时 schema，会被严格解析拒绝；`masquerade` 已改为 `inbounds[].masquerade`。TLS 使用已有的证书和私钥文件，证书签发与续期由外部工具完成。
+
+可选的网站路径独立于用户代理路径：Hy2 将未认证 HTTP/3 请求交给固定网站反向代理；Trojan 在 TLS 后按官方规则校验完整初始请求结构和凭据，仅当两者均有效才进入代理路径。未知凭据、非法或不完整首部在统一窗口后回退，包括正确凭据后出现的格式错误；向固定明文 HTTP/1.1 后端回放已消费的最多 320 字节首部并转发剩余流。Trojan 网站连接有独立并发、拨号和总时长限制，只声明 HTTP/1.1 ALPN，并由 `Close`/`Wait` 覆盖。匿名访问不取得用户 session，不进入路由、账本、额度、限速或请求追踪；完整结构与凭据通过后的目标限制、拨号失败、策略拒绝及后续 UDP 分帧错误只关闭代理连接。
 
 SQLite 保存：
 
@@ -237,9 +239,11 @@ adapter 的 session/request 回调维护内存中的连接和目标快照，管�
 
 管理 Web 使用服务端模板和表单，不提供通用管理 JSON API。`/live` 和 `/traffic-range` 是同一后台页面使用的只读数据端点；写操作只能 POST，并要求进程启动时生成的 CSRF token。为兼容 SSH 和本地反向代理，不依赖容易误判的 Origin/Referer 校验。后台没有登录鉴权，因此监听地址会被强制校验为 loopback。
 
-订阅服务是独立 handler。URL token 是 bearer credential：新 token 随机生成，数据库只保存 SHA-256 哈希；重置后旧链接立即失效。订阅从数据库读取用户当前密码和生命周期状态，但只下发进程启动时已加载的节点与授权快照，防止待重启配置提前暴露。`sub.inbound` 显式绑定生成订阅所使用的 Hysteria2 入口。配置通过 `yaml.v3` 结构化编码，所有数据库和 YAML 来源的字符串均按 YAML 标量转义。
+订阅服务是独立 handler。URL token 是 bearer credential：新 token 随机生成，数据库只保存 SHA-256 哈希；重置后旧链接立即失效。订阅从数据库读取用户当前密码和生命周期状态，但只下发进程启动时已加载的节点与授权快照，防止待重启配置提前暴露。`sub.inbound` 显式绑定一个 Hysteria2 或 Trojan 入口，也可改用 `sub.endpoints[]` 显式发布多个入口；两种写法不能混用。配置通过 `yaml.v3` 结构化编码，所有数据库和 YAML 来源的字符串均按 YAML 标量转义，响应使用 `Cache-Control: no-store`。
 
-`sub.publicURL` 只决定后台展示的订阅 URL，`sub.serverAddr` 决定生成配置中每个 Hysteria2 代理连接的 Gateway 地址。所有代理都先连接 Gateway，不会把远端 Node 地址直接发给用户。
+`sub.publicURL` 只决定后台展示的订阅 URL，单入口的 `sub.serverAddr` 或每个 `sub.endpoints[].serverAddr` 决定客户端连接对应 Gateway 入口的公网地址。每个入口独立配置 SNI 和证书校验选项；为用户每个已授权节点生成一个对应协议的代理，Trojan 使用原始 `username:node:password` 并输出 `udp: true`。协议和入口后缀及重复名称消歧保证选择组引用唯一。所有代理都先连接 Gateway，不会把远端 Node 地址直接发给用户。
+
+启用网站回退的 Trojan 入口在订阅中额外输出 `alpn: [http/1.1]`。完整网站示例让 Nginx 源站将 `/sub/` 转发到独立订阅 handler，普通网站和订阅可以共用 Trojan 的公网 TLS 入口。
 
 ## systemd 与停机
 

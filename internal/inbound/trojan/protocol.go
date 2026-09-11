@@ -16,6 +16,10 @@ import (
 
 const credentialLength = sha256.Size224 * 2
 
+// maxInitialHeaderSize bounds the credential, both CRLFs, CMD, ATYP, the
+// longest length-prefixed domain and port. Payload bytes are not part of it.
+const maxInitialHeaderSize = credentialLength + 2 + 1 + 1 + 1 + 255 + 2 + 2
+
 const (
 	commandConnect      = 0x01
 	commandUDPAssociate = 0x03
@@ -39,6 +43,11 @@ var (
 	ErrInvalidDelimiter  = errors.New("invalid Trojan delimiter")
 	ErrInvalidPacket     = errors.New("invalid Trojan UDP packet")
 )
+
+// errInvalidTarget marks a complete, structurally valid request that local
+// target validation rejects. With valid credentials it must close as a proxy
+// failure, never fall back to the website.
+var errInvalidTarget = errors.New("invalid Trojan proxy target")
 
 // RawPassword is the per-user, per-node password that a Trojan client uses.
 func RawPassword(username, node, password string) string {
@@ -81,7 +90,8 @@ type Request struct {
 func (r Request) UDPAssociate() bool { return r.Command == commandUDPAssociate }
 
 // ReadRequest reads the Trojan request command, its SOCKS-style address and the
-// trailing CRLF. BIND and every unknown command are rejected.
+// trailing CRLF. BIND and every unknown command are rejected. Local target
+// errors wrap errInvalidTarget only after the entire wire structure is valid.
 func ReadRequest(reader io.Reader) (Request, error) {
 	var prefix [2]byte
 	if _, err := io.ReadFull(reader, prefix[:]); err != nil {
@@ -99,13 +109,19 @@ func ReadRequest(reader io.Reader) (Request, error) {
 		return Request{}, fmt.Errorf("%w: truncated port or delimiter", ErrInvalidAddress)
 	}
 	port := binary.BigEndian.Uint16(suffix[:2])
+	if suffix[2] != '\r' || suffix[3] != '\n' {
+		return Request{}, ErrInvalidDelimiter
+	}
+	// The official parser treats nonempty domain bytes and every uint16 port
+	// as structurally valid. Keep local target restrictions separate so they
+	// cannot turn an authenticated proxy request into anonymous website data.
+	if prefix[1] == addressDomain && !validDomain(host) {
+		return Request{}, fmt.Errorf("%w: %w: domain contains a forbidden character", errInvalidTarget, ErrInvalidAddress)
+	}
 	// The UDP ASSOCIATE header address is nominal and clients commonly send an
 	// unspecified address with port zero. CONNECT must name a real port.
 	if port == 0 && prefix[0] == commandConnect {
-		return Request{}, ErrInvalidPort
-	}
-	if suffix[2] != '\r' || suffix[3] != '\n' {
-		return Request{}, ErrInvalidDelimiter
+		return Request{}, fmt.Errorf("%w: %w", errInvalidTarget, ErrInvalidPort)
 	}
 	return Request{Command: prefix[0], Target: net.JoinHostPort(host, strconv.Itoa(int(port)))}, nil
 }
@@ -133,6 +149,9 @@ func ReadPacket(reader io.Reader, buffer []byte) (string, int, error) {
 	host, err := readHost(reader, addressType[0])
 	if err != nil {
 		return "", 0, err
+	}
+	if addressType[0] == addressDomain && !validDomain(host) {
+		return "", 0, fmt.Errorf("%w: domain contains a forbidden character", ErrInvalidAddress)
 	}
 	var header [6]byte
 	if _, err := io.ReadFull(reader, header[:]); err != nil {
@@ -220,11 +239,7 @@ func readHost(reader io.Reader, addressType byte) (string, error) {
 		if _, err := io.ReadFull(reader, raw); err != nil {
 			return "", fmt.Errorf("%w: truncated domain", ErrInvalidAddress)
 		}
-		host := string(raw)
-		if !validDomain(host) {
-			return "", fmt.Errorf("%w: domain contains a forbidden character", ErrInvalidAddress)
-		}
-		return host, nil
+		return string(raw), nil
 	default:
 		return "", fmt.Errorf("%w: unknown address type", ErrInvalidAddress)
 	}

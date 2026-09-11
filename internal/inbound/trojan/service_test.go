@@ -6,13 +6,13 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
-	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"github.com/clayicarus/proxy-gateway/internal/policy"
+	"github.com/clayicarus/proxy-gateway/test/testutil"
 	"go.uber.org/zap"
 )
 
@@ -176,21 +176,19 @@ func TestServiceClosesUDPAssociationWhenPolicyRejectsDatagram(t *testing.T) {
 }
 
 func startService(t *testing.T, options *config.TrojanInboundConfig) (*Service, *policy.Kernel) {
+	return startServiceWithLogger(t, options, zap.NewNop())
+}
+
+func startServiceWithLogger(t *testing.T, options *config.TrojanInboundConfig, logger *zap.Logger) (*Service, *policy.Kernel) {
 	t.Helper()
-	certificate, err := tls.LoadX509KeyPair(
-		filepath.Join("..", "..", "..", "third_party", "hysteria-core", "internal", "integration_tests", "test.crt"),
-		filepath.Join("..", "..", "..", "third_party", "hysteria-core", "internal", "integration_tests", "test.key"),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	certificate := testutil.TLSCertificate(t)
 	users := map[string]config.UserConfig{
 		"alice": {Password: "secret", Routes: []string{"direct"}},
 	}
-	kernel := policy.New(users, nil, nil, zap.NewNop(), time.UTC)
+	kernel := policy.New(users, nil, nil, logger, time.UTC)
 	service, err := NewService(config.Inbound{
 		Name: "trojan-test", Type: config.TrojanInboundType, Listen: "127.0.0.1:0", Trojan: options,
-	}, certificate, kernel, zap.NewNop())
+	}, certificate, kernel, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
