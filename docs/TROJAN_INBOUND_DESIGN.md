@@ -4,14 +4,14 @@
 
 本文定义并记录 Proxy Gateway 的 Trojan 入站。目标是在不改变现有出站、用户策略、SQLite 流量口径和管理数据模型的前提下，增加标准 Trojan 入站。
 
-第一期已交付 TCP CONNECT；第二期已交付 UDP ASSOCIATE。BIND、mux、协议 fallback 和 Trojan 专用数据库凭据仍不支持。Gateway 继续坚持客户端显式选择节点、服务端不自动切换节点或回退到 `direct`。
+已交付 TCP CONNECT、UDP ASSOCIATE、Clash 订阅和可选的 HTTPS 网站回退。BIND、mux 和 Trojan 专用数据库凭据仍不支持。Gateway 继续坚持客户端显式选择节点、服务端不自动切换节点或回退到 `direct`。
 
 ## 已确认的约束
 
 - Hysteria2 继续监听 UDP；Trojan 监听 TCP。因此两个入站可同用数值端口，例如 UDP `:443` 与 TCP `:443`。Trojan UDP ASSOCIATE 同样在这条 TCP/TLS 连接内传输，不额外监听 UDP。
 - Trojan 在 TLS 内只提交固定的 `SHA224(password)`，服务端不能从哈希中反解用户或节点。
 - 每条 Trojan 凭据绑定一个确定的 `username:node`。一个用户有多个授权节点时，客户端需要使用多个 Trojan 代理条目选择节点。
-- 认证失败或不支持的命令直接关闭连接。目前不提供 HTTP/HTTPS fallback；这会降低主动探测伪装能力，是明确接受的取舍，后续工作登记在 TODO-PROBE-01。Hysteria2 入站的 `masquerade` 只覆盖该 UDP 端口上的 HTTP/3 探测，不改变 Trojan TCP 端口的行为。
+- 默认认证失败即关闭；配置 `trojan.fallback` 后，TLS 成功但无有效凭据的连接会回退到固定 HTTP/1.1 源站。已认证但命令不支持时仍关闭。Hysteria2 的 `masquerade` 独立覆盖 UDP 上的 HTTP/3，两者可使用同一网站后端。
 - 现有节点和授权仍以启动快照为准，保存后必须重启；密码、停用、到期、额度和限速仍在约两秒内刷新。
 
 ## 配置契约
@@ -22,7 +22,7 @@
 inbounds:
   - name: trojan-public
     type: trojan
-    listen: ":443"                       # TCP/TLS 入站
+    listen: ":443"                       # TCP/TLS inbound
     trojan:
       handshakeTimeout: 10s
       maxPendingConnections: 256
@@ -33,7 +33,7 @@ inbounds:
 
 `udpIdleTimeout` 只回收双向都没有 datagram 的 UDP association，默认 60s，不是 TCP CONNECT 的空闲超时。
 
-本期没有 Trojan 订阅输出，因而 `serverAddr`、`sni` 与 `insecure` 可在第二期实现订阅时加入；若它们随第一期一并加入，必须明确仅影响生成的客户端配置，绝不改变服务端 TLS 验证或安全策略。
+订阅通过 `sub.inbound` 选择单个入口，或通过 `sub.endpoints[]` 发布多个入口。每项的 `serverAddr`、`sni` 与 `insecure` 只影响生成的客户端配置，服务端仍使用顶层 TLS 证书。公网地址必须显式提供，不能从 `inbounds[].listen` 推断。完整示例见 [gateway-mixed.yaml](../configs/gateway-mixed.yaml)。
 
 ## 凭据与身份映射
 
@@ -116,7 +116,7 @@ connectionTracker.StartTCP(clientAddr, target)
 
 ## 流量、配额与限速
 
-双向 relay 不可直接使用两个裸 `io.Copy`。每次有效负载读取后都必须经计量包装器：
+已认证代理请求的双向 relay 不可直接使用两个裸 `io.Copy`。每次有效负载读取后都必须经计量包装器：
 
 ```text
 client -> target: TrafficLogger.LogTraffic(id, n, 0)
@@ -135,17 +135,29 @@ UDP association 使用同一账本，按 datagram 而不是按 chunk 准入：�
 - 每个连接在 TLS handshake 和 Trojan 首包解析期间设置短 deadline，成功解析后清除 deadline。该 deadline 是防 Slowloris 的必要边界，不是空闲会话超时策略。
 - 限制并发握手/未认证连接数，并确保 accept 错误采用退避，避免文件描述符耗尽或忙循环。具体阈值应配置化或先以保守常量实现，并在压测后确定。
 - `Service.Close` 必须停止 accept、关闭所有已认证与握手中的连接及其出站 TCP 连接和 UDP flow，并等待其 goroutine 退出；主进程必须在最终 flush 前完成该步骤，避免关闭后的 relay 丢失最终计量。
-- 使用共享证书不代表自动得到 Web fallback 或 SNI 多路复用。若以后要同 TCP 端口提供 HTTPS 网站，需单独设计 TLS/SNI/ALPN 路由，不能混入本次范围。
+- 网站回退显式配置后才启用，并纳入相同的连接注册表及 `Close`/`Wait`。SNI 多路复用不在当前范围，网站后端始终由配置固定。
+
+## HTTPS 网站回退
+
+`trojan.fallback.addr` 指向固定明文 HTTP/1.1 源站。TLS 在 Trojan listener 终止，只声明 `http/1.1` ALPN；不选择客户端请求中的 Host/SNI 作为目标，不建立用户代理 session，也不进入用户账本、额度和限速路径。
+
+凭据读取通过有界 tee 保留最多 58 字节，包括 EOF 和超时前的部分读取。未知凭据、格式错误与短首包统一等到 `probeTimeout` 窗口结束，再通过 `io.MultiReader` 回放已消费字节并继续转发未读流。有效凭据恢复原有的请求解析 deadline，非法命令仍关闭。网站回放保留客户端的写半关闭，以允许源站在请求发送完毕后返回响应。
+
+独立 `maxConnections` 覆盖分类等待与后端 relay；在释放握手槽位前取得网站槽位，防止创建无界等待连接。`dialTimeout` 限制拨号，`timeout` 限制判定结束后拨号与转发的总时长；根 context 取消立即中断等待和连接。后端登记到现有 registry，双向 relay 完全退出后才释放 handler。诊断仅记录事件与入口名，不记录首包、疑似凭据、请求路径或原始 TLS 错误。
+
+默认值和部署方式见 [部署指南](DEPLOYMENT.md)。配置与单元测试覆盖短请求、超时后续读、错误凭据、准确回放、固定目标、半关闭、容量限制、有效客户端隔离、后端故障和停机。端到端测试使用完整运行时配置，验证 HTTPS/HTTP3 网站、通过网站入口取得订阅，以及按订阅配置完成 Hysteria2 TCP、Trojan TCP/UDP。
 
 ## 订阅与管理后台
 
-目前不修改 SQLite schema、管理后台或现有 Hysteria2 订阅，管理员可按上述公式生成每个节点的 Trojan password 做受控测试。
+订阅复用 SQLite 用户、密码、订阅 token 与启动时的节点授权快照。管理后台生成的同一个订阅 URL 可以提供 Hysteria2、Trojan 或混合配置；已有单 Hysteria2 订阅配置继续可用。
 
-Trojan 订阅输出仍未实现。实现时为每个已授权节点生成一个独立代理：`type: trojan`、Trojan `server`/`port`、该节点派生 password、TLS `sni` 和 `skip-cert-verify`，并且由于 UDP ASSOCIATE 已支持，可以生成 `udp: true`。代理名称必须带协议后缀，避免与同节点的 Hysteria2 条目冲突。输出 Trojan password 等同于输出现有 Hy2 原始密码，应继续遵循订阅 token 的 bearer credential 保护规则。
+每个已授权节点与每个公开 Trojan 入口生成独立代理：`type: trojan`、该入口的 `server`/`port`、原始 `username:node:password`、TLS `sni` 和 `skip-cert-verify`，并按已支持的 UDP ASSOCIATE 输出 `udp: true`。Trojan 和混合订阅的代理名称带协议后缀；同协议多个入口再加入口名称，重复别名自动消歧。客户端选择组包含所有生成的代理。`direct` 授权条目使用相同的入口和 TLS 规则，客户端本地 `DIRECT` 仍是独立选项。
+
+密码与用户状态实时读取，token 重置立即失效；新增用户和节点授权仍需重启后生效。订阅包含客户端凭据，响应设置 `Cache-Control: no-store`。启用网站回退的 Trojan 入口额外输出 `alpn: [http/1.1]`，其他入口不受影响。配置测试覆盖单 Trojan、混合入口、IPv6、未知或重复入口、端口和通配地址；API 测试覆盖授权快照、密码与 token 更新、名称冲突和 TLS 参数，端到端测试从运行时 YAML 和 HTTP 订阅实际建立 Hysteria2 TCP、Trojan TCP 与 UDP 连接。
 
 ## 非目标与后续
 
-- Trojan BIND、mux、fallback、同端口 HTTPS 伪装均不在当前范围。
+- Trojan BIND、mux 和基于 SNI 的多站点复用不在当前范围。
 - 不引入服务端节点自动选择或 fallback。
 - 不修改现有 Hy2 wire protocol、认证格式、出站协议、SQLite 流量 schema 或用户授权模型。
 - 需要独立 Trojan 凭据、按协议撤销和审计时，新增 `access_credentials` 表，而非继续扩展派生密码规则。

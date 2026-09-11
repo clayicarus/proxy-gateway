@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"mime"
 	"net"
 	"net/http"
@@ -37,7 +38,7 @@ func NewDatabaseSubscriptionHandler(cfg *config.Config, store *storage.SQLiteSto
 		cfg:          cfg,
 		store:        store,
 		activeRoutes: activeRoutes,
-		nodes:        nodes,
+		nodes:        maps.Clone(nodes),
 		logger:       logger,
 	}
 }
@@ -47,6 +48,7 @@ func (h *DatabaseSubscriptionHandler) Handler() http.Handler {
 }
 
 func (h *DatabaseSubscriptionHandler) handle(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -77,27 +79,51 @@ func (h *DatabaseSubscriptionHandler) handle(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "subscription pending Gateway restart", http.StatusServiceUnavailable)
 		return
 	}
+	endpoints, err := h.subscriptionEndpoints()
+	if err != nil {
+		h.logger.Error("invalid subscription configuration", zap.Error(err))
+		http.Error(w, "subscription is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	protocolCounts := make(map[string]int)
+	for _, endpoint := range endpoints {
+		protocolCounts[endpoint.Type]++
+	}
+	// Built-in outbound and group names must not be shadowed by node aliases.
+	usedNames := map[string]bool{
+		"DIRECT": true, "REJECT": true, "REJECT-DROP": true,
+		"PASS": true, "COMPATIBLE": true, "GLOBAL": true, "规则代理": true,
+	}
 	data := managedSubscriptionData{}
-	host, port := splitHostPort(h.gatewayAddress())
 	for _, route := range routes {
-		if route == "direct" {
-			data.Proxies = append(data.Proxies, managedProxy{Name: "direct", Server: host, Port: port, Auth: fmt.Sprintf("%s:%s:%s", user.Username, route, user.Password)})
-			continue
+		alias := route
+		if route != "direct" {
+			node, ok := h.nodes[route]
+			if !ok {
+				continue
+			}
+			if node.Alias != "" {
+				alias = node.Alias
+			}
 		}
-		node, ok := h.nodes[route]
-		if !ok {
-			continue
+		for _, endpoint := range endpoints {
+			name := alias
+			// Preserve existing Hysteria2-only names. Mixed subscriptions and
+			// Trojan entries make the selected protocol visible to the user.
+			if len(endpoints) > 1 || endpoint.Type == config.TrojanInboundType {
+				name += "-" + endpoint.Type
+			}
+			if protocolCounts[endpoint.Type] > 1 {
+				name += "-" + endpoint.Inbound
+			}
+			data.Proxies = append(data.Proxies, managedProxy{
+				Name: uniqueProxyName(name, usedNames), Type: endpoint.Type,
+				Server: endpoint.Server, Port: endpoint.Port,
+				Auth: fmt.Sprintf("%s:%s:%s", user.Username, route, user.Password),
+				SNI:  endpoint.SNI, Insecure: endpoint.Insecure,
+				UDP: endpoint.Type == config.TrojanInboundType, ALPN: endpoint.ALPN,
+			})
 		}
-		name := node.Alias
-		if name == "" {
-			name = route
-		}
-		proxy := managedProxy{Name: name, Server: host, Port: port, Auth: fmt.Sprintf("%s:%s:%s", user.Username, route, user.Password), SNI: h.sni(), Insecure: h.insecure()}
-		if h.cfg.Obfs != nil && h.cfg.Obfs.Type == "salamander" {
-			proxy.Obfs = "salamander"
-			proxy.ObfsPasswd = h.cfg.Obfs.Salamander.Password
-		}
-		data.Proxies = append(data.Proxies, proxy)
 	}
 	if len(data.Proxies) == 0 {
 		http.Error(w, "subscription has no active routes", http.StatusServiceUnavailable)
@@ -120,49 +146,67 @@ func (h *DatabaseSubscriptionHandler) handle(w http.ResponseWriter, r *http.Requ
 	_, _ = w.Write(body)
 }
 
-func (h *DatabaseSubscriptionHandler) gatewayAddress() string {
-	if h.cfg.Sub != nil && h.cfg.Sub.ServerAddr != "" {
-		return h.cfg.Sub.ServerAddr
-	}
-	return h.cfg.Listen
+type subscriptionEndpoint struct {
+	config.SubscriptionEndpoint
+	Type   string
+	Server string
+	Port   int
+	ALPN   []string
 }
 
-func (h *DatabaseSubscriptionHandler) sni() string {
-	if h.cfg.Sub != nil {
-		return h.cfg.Sub.SNI
+func (h *DatabaseSubscriptionHandler) subscriptionEndpoints() ([]subscriptionEndpoint, error) {
+	inbounds := make(map[string]config.Inbound, len(h.cfg.Inbounds))
+	for _, inbound := range h.cfg.Inbounds {
+		inbounds[inbound.Name] = inbound
 	}
-	return ""
+	var endpoints []subscriptionEndpoint
+	for _, published := range h.cfg.Sub.ClientEndpoints() {
+		inbound := inbounds[published.Inbound]
+		protocol := inbound.Type
+		if protocol != config.Hysteria2InboundType && protocol != config.TrojanInboundType {
+			return nil, fmt.Errorf("subscription inbound %q is missing or unsupported", published.Inbound)
+		}
+		host, rawPort, err := net.SplitHostPort(published.ServerAddr)
+		if err != nil || host == "" || net.ParseIP(host).IsUnspecified() {
+			return nil, fmt.Errorf("subscription inbound %q requires a client-reachable serverAddr", published.Inbound)
+		}
+		port, err := strconv.Atoi(rawPort)
+		if err != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("subscription inbound %q has an invalid serverAddr port", published.Inbound)
+		}
+		endpoint := subscriptionEndpoint{
+			SubscriptionEndpoint: published, Type: protocol, Server: host, Port: port,
+		}
+		if protocol == config.TrojanInboundType && inbound.Trojan != nil && inbound.Trojan.Fallback != nil {
+			endpoint.ALPN = []string{"http/1.1"}
+		}
+		endpoints = append(endpoints, endpoint)
+	}
+	if len(endpoints) == 0 {
+		return nil, fmt.Errorf("no subscription endpoints are configured")
+	}
+	return endpoints, nil
 }
 
-func (h *DatabaseSubscriptionHandler) insecure() bool {
-	return h.cfg.Sub != nil && h.cfg.Sub.Insecure
-}
-
-func splitHostPort(addr string) (host string, port int) {
-	host, rawPort, err := net.SplitHostPort(addr)
-	if err != nil {
-		return addr, 443
+func uniqueProxyName(base string, used map[string]bool) string {
+	name := base
+	for suffix := 2; used[name]; suffix++ {
+		name = fmt.Sprintf("%s (%d)", base, suffix)
 	}
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	port, err = strconv.Atoi(rawPort)
-	if err != nil || port < 1 || port > 65535 {
-		return host, 443
-	}
-	return host, port
+	used[name] = true
+	return name
 }
 
 type managedProxy struct {
-	Name       string `yaml:"name"`
-	Type       string `yaml:"type"`
-	Server     string `yaml:"server"`
-	Port       int    `yaml:"port"`
-	Auth       string `yaml:"password"`
-	SNI        string `yaml:"sni,omitempty"`
-	Insecure   bool   `yaml:"skip-cert-verify,omitempty"`
-	Obfs       string `yaml:"obfs,omitempty"`
-	ObfsPasswd string `yaml:"obfs-password,omitempty"`
+	Name     string   `yaml:"name"`
+	Type     string   `yaml:"type"`
+	Server   string   `yaml:"server"`
+	Port     int      `yaml:"port"`
+	Auth     string   `yaml:"password"`
+	SNI      string   `yaml:"sni,omitempty"`
+	Insecure bool     `yaml:"skip-cert-verify"`
+	UDP      bool     `yaml:"udp,omitempty"`
+	ALPN     []string `yaml:"alpn,omitempty"`
 }
 
 type managedSubscriptionData struct {
@@ -188,7 +232,6 @@ type managedClashConfig struct {
 func renderManagedSubscription(data managedSubscriptionData) ([]byte, error) {
 	names := make([]string, 0, len(data.Proxies)+1)
 	for i := range data.Proxies {
-		data.Proxies[i].Type = "hysteria2"
 		names = append(names, data.Proxies[i].Name)
 	}
 	names = append(names, "DIRECT")

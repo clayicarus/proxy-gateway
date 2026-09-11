@@ -18,8 +18,7 @@ const (
 	TrojanInboundType    = "trojan"
 )
 
-// InboundConfig is the strict configuration schema that will become the
-// runtime schema in S4. ParseInboundConfig can be used offline before then.
+// InboundConfig is the strict runtime configuration schema.
 type InboundConfig struct {
 	Inbounds             []Inbound         `yaml:"inbounds"`
 	TLS                  TLSConfig         `yaml:"tls"`
@@ -65,20 +64,33 @@ type TrojanInboundConfig struct {
 	// UDPIdleTimeout reclaims a UDP association that saw no datagram in either
 	// direction. It is not a TCP CONNECT idle timeout.
 	UDPIdleTimeout time.Duration `yaml:"udpIdleTimeout,omitempty"`
+	// Fallback serves unauthenticated TLS connections through a fixed HTTP/1.1 backend.
+	Fallback *TrojanFallbackConfig `yaml:"fallback,omitempty"`
 }
 
-// InboundSubConfig is the subscription schema after it is bound to a named
-// Hysteria2 inbound. Legacy secrets deliberately have no field here.
-type InboundSubConfig struct {
-	Listen     string `yaml:"listen,omitempty"`
-	PublicURL  string `yaml:"publicURL,omitempty"`
+// SubscriptionEndpoint publishes the client-facing address of a named inbound.
+// Its address is explicit because a listener may sit behind NAT or a proxy.
+type SubscriptionEndpoint struct {
 	Inbound    string `yaml:"inbound"`
 	ServerAddr string `yaml:"serverAddr"`
 	SNI        string `yaml:"sni,omitempty"`
 	Insecure   bool   `yaml:"insecure,omitempty"`
 }
 
-// ParseInboundConfig strictly parses and validates the future inbound schema.
+// InboundSubConfig publishes one or more named inbounds in a subscription.
+// Legacy secrets deliberately have no field here.
+type InboundSubConfig struct {
+	Listen    string `yaml:"listen,omitempty"`
+	PublicURL string `yaml:"publicURL,omitempty"`
+	// A pointer distinguishes absent single-endpoint fields from explicitly
+	// configured defaults such as insecure: false when checking mixed syntax.
+	*SubscriptionEndpoint `yaml:",inline"`
+	// Endpoints replaces the single-inbound fields when several listeners
+	// should be available through the same subscription URL.
+	Endpoints []SubscriptionEndpoint `yaml:"endpoints,omitempty"`
+}
+
+// ParseInboundConfig strictly parses and validates the runtime inbound schema.
 // It does not read certificates, open databases, resolve DNS, or bind ports.
 func ParseInboundConfig(data []byte) (*InboundConfig, error) {
 	var cfg InboundConfig
@@ -96,7 +108,7 @@ func (c *InboundConfig) validate() error {
 		return fmt.Errorf("inbounds must contain at least one item")
 	}
 
-	names := make(map[string]inboundIdentity, len(c.Inbounds))
+	names := make(map[string]string, len(c.Inbounds))
 	udpListeners := make([]namedListener, 0, len(c.Inbounds))
 	tcpListeners := make([]namedListener, 0, len(c.Inbounds)+2)
 	for i := range c.Inbounds {
@@ -106,9 +118,9 @@ func (c *InboundConfig) validate() error {
 			return fmt.Errorf("%s.name must be non-empty and have no surrounding whitespace", path)
 		}
 		if previous, exists := names[inbound.Name]; exists {
-			return fmt.Errorf("%s.name duplicates %s.name", path, previous.path)
+			return fmt.Errorf("%s.name duplicates %s.name", path, previous)
 		}
-		names[inbound.Name] = inboundIdentity{path: path, inboundType: inbound.Type}
+		names[inbound.Name] = path
 		if inbound.Type != Hysteria2InboundType && inbound.Type != TrojanInboundType {
 			return fmt.Errorf("%s.type has unsupported value %q", path, inbound.Type)
 		}
@@ -190,25 +202,32 @@ func (c *InboundConfig) validate() error {
 		tcpListeners = append(tcpListeners, namedListener{name: "admin", listener: listener})
 	}
 	if c.Sub != nil {
-		if c.Sub.Inbound == "" {
-			return fmt.Errorf("sub.inbound must be configured")
-		}
-		inbound, exists := names[c.Sub.Inbound]
-		if !exists {
-			return fmt.Errorf("sub.inbound references unknown inbound %q", c.Sub.Inbound)
-		}
-		if inbound.inboundType != Hysteria2InboundType {
-			return fmt.Errorf("sub.inbound must reference a hysteria2 inbound")
-		}
-		if c.Sub.ServerAddr == "" {
-			return fmt.Errorf("sub.serverAddr must be configured")
-		}
-		serverAddress, err := parseListener("sub.serverAddr", c.Sub.ServerAddr)
-		if err != nil {
-			return err
-		}
-		if serverAddress.wildcard {
-			return fmt.Errorf("sub.serverAddr must name a client-reachable host")
+		if c.Sub.Endpoints != nil {
+			if len(c.Sub.Endpoints) == 0 {
+				return fmt.Errorf("sub.endpoints must contain at least one item")
+			}
+			if c.Sub.SubscriptionEndpoint != nil {
+				return fmt.Errorf("sub.endpoints cannot be combined with sub.inbound, sub.serverAddr, sub.sni or sub.insecure")
+			}
+			seen := make(map[string]bool, len(c.Sub.Endpoints))
+			for i, endpoint := range c.Sub.Endpoints {
+				path := fmt.Sprintf("sub.endpoints[%d]", i)
+				if err := validateSubscriptionEndpoint(path, endpoint, names); err != nil {
+					return err
+				}
+				if seen[endpoint.Inbound] {
+					return fmt.Errorf("%s.inbound duplicates subscription inbound %q", path, endpoint.Inbound)
+				}
+				seen[endpoint.Inbound] = true
+			}
+		} else {
+			endpoint := SubscriptionEndpoint{}
+			if c.Sub.SubscriptionEndpoint != nil {
+				endpoint = *c.Sub.SubscriptionEndpoint
+			}
+			if err := validateSubscriptionEndpoint("sub", endpoint, names); err != nil {
+				return err
+			}
 		}
 		if c.Sub.Listen != "" {
 			listener, err := parseListener("sub.listen", c.Sub.Listen)
@@ -226,7 +245,32 @@ func (c *InboundConfig) validate() error {
 	return nil
 }
 
+func validateSubscriptionEndpoint(path string, endpoint SubscriptionEndpoint, inbounds map[string]string) error {
+	if endpoint.Inbound == "" {
+		return fmt.Errorf("%s.inbound must be configured", path)
+	}
+	if _, exists := inbounds[endpoint.Inbound]; !exists {
+		return fmt.Errorf("%s.inbound references unknown inbound %q", path, endpoint.Inbound)
+	}
+	if endpoint.ServerAddr == "" {
+		return fmt.Errorf("%s.serverAddr must be configured", path)
+	}
+	address, err := parseListener(path+".serverAddr", endpoint.ServerAddr)
+	if err != nil {
+		return err
+	}
+	if address.wildcard {
+		return fmt.Errorf("%s.serverAddr must name a client-reachable host", path)
+	}
+	return nil
+}
+
 func validateTrojanInbound(path string, trojan *TrojanInboundConfig) error {
+	if trojan.Fallback != nil {
+		if _, err := trojan.Fallback.WithDefaults(); err != nil {
+			return fmt.Errorf("%s.%w", path, err)
+		}
+	}
 	if trojan.HandshakeTimeout < 0 {
 		return fmt.Errorf("%s.handshakeTimeout must not be negative", path)
 	}
@@ -303,11 +347,6 @@ type listenerAddress struct {
 	port     uint16
 	wildcard bool
 	family   int
-}
-
-type inboundIdentity struct {
-	path        string
-	inboundType string
 }
 
 type namedListener struct {

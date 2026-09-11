@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"time"
+	_ "time/tzdata" // Keep named zones available without an OS timezone database.
 
 	"gopkg.in/yaml.v3"
 )
@@ -164,6 +165,23 @@ type SubConfig struct {
 	// Insecure skips TLS verification in generated client config (for self-signed certs).
 	Insecure bool   `yaml:"insecure,omitempty"`
 	Inbound  string `yaml:"inbound,omitempty"`
+	// Endpoints publishes several named inbounds through one subscription.
+	Endpoints []SubscriptionEndpoint `yaml:"endpoints,omitempty"`
+}
+
+// ClientEndpoints returns the explicit endpoints advertised to clients. The
+// original single-inbound fields remain supported for existing configurations.
+func (s *SubConfig) ClientEndpoints() []SubscriptionEndpoint {
+	if s == nil {
+		return nil
+	}
+	if s.Endpoints != nil {
+		return append([]SubscriptionEndpoint(nil), s.Endpoints...)
+	}
+	return []SubscriptionEndpoint{{
+		Inbound: s.Inbound, ServerAddr: s.ServerAddr,
+		SNI: s.SNI, Insecure: s.Insecure,
+	}}
 }
 
 // LoadRuntime reads the only schema accepted by the gateway data plane.
@@ -190,13 +208,19 @@ func LoadRuntime(path string) (*Config, error) {
 		cfg.QUIC = cfg.Inbounds[0].QUIC
 	}
 	if inbound.Sub != nil {
+		single := SubscriptionEndpoint{}
+		if inbound.Sub.SubscriptionEndpoint != nil {
+			single = *inbound.Sub.SubscriptionEndpoint
+		}
 		cfg.Sub = &SubConfig{
 			Listen: inbound.Sub.Listen, PublicURL: inbound.Sub.PublicURL,
-			Inbound: inbound.Sub.Inbound, ServerAddr: inbound.Sub.ServerAddr,
-			SNI: inbound.Sub.SNI, Insecure: inbound.Sub.Insecure,
+			Inbound: single.Inbound, ServerAddr: single.ServerAddr,
+			SNI: single.SNI, Insecure: single.Insecure,
+			Endpoints: append([]SubscriptionEndpoint(nil), inbound.Sub.Endpoints...),
 		}
+		primaryInbound := cfg.Sub.ClientEndpoints()[0].Inbound
 		for i := range cfg.Inbounds {
-			if cfg.Inbounds[i].Name == inbound.Sub.Inbound {
+			if cfg.Inbounds[i].Name == primaryInbound {
 				cfg.Listen = cfg.Inbounds[i].Listen
 				cfg.QUIC = cfg.Inbounds[i].QUIC
 				break

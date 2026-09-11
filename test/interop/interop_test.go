@@ -9,11 +9,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
 	hyClient "github.com/apernet/hysteria/core/v2/client"
 	hyServer "github.com/apernet/hysteria/core/v2/server"
+	"github.com/clayicarus/proxy-gateway/test/testutil"
 )
 
 type session struct{ transport hyServer.Transport }
@@ -67,9 +69,12 @@ func fixtureDir(t *testing.T) string {
 func buildUpstream(t *testing.T, name string) string {
 	t.Helper()
 	binary := filepath.Join(t.TempDir(), name)
-	command := exec.Command("go", "build", "-o", binary, "./cmd/"+name)
+	if runtime.GOOS == "windows" {
+		binary += ".exe"
+	}
+	command := exec.Command("go", "build", "-buildvcs=false", "-o", binary, "./cmd/"+name)
 	command.Dir = fixtureDir(t)
-	command.Env = append(os.Environ(), "GOCACHE=/tmp/hy2-gateway-go-build", "GOPROXY=off")
+	command.Env = append(os.Environ(), "GOPROXY=off")
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("build upstream %s: %v\n%s", name, err, output)
 	}
@@ -79,10 +84,7 @@ func buildUpstream(t *testing.T, name string) string {
 func TestUpstreamClientToGatewayServer(t *testing.T) {
 	target, closeTarget := echoTarget(t)
 	defer closeTarget()
-	cert, err := tls.LoadX509KeyPair("../../third_party/hysteria-core/internal/integration_tests/test.crt", "../../third_party/hysteria-core/internal/integration_tests/test.key")
-	if err != nil {
-		t.Fatal(err)
-	}
+	cert := testutil.TLSCertificate(t)
 	packet, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
 		t.Fatal(err)
@@ -97,9 +99,10 @@ func TestUpstreamClientToGatewayServer(t *testing.T) {
 	}
 	go func() { _ = server.Serve() }()
 	defer server.Close()
+	binary := buildUpstream(t, "client")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, buildUpstream(t, "client"), packet.LocalAddr().String(), target, "anything")
+	command := exec.CommandContext(ctx, binary, packet.LocalAddr().String(), target, "anything")
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("upstream client: %v\n%s", err, output)
 	}
@@ -108,11 +111,11 @@ func TestUpstreamClientToGatewayServer(t *testing.T) {
 func TestGatewayClientToUpstreamServer(t *testing.T) {
 	target, closeTarget := echoTarget(t)
 	defer closeTarget()
+	cert, key := testutil.CertificateFiles(t)
+	binary := buildUpstream(t, "server")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	cert, _ := filepath.Abs("../../third_party/hysteria-core/internal/integration_tests/test.crt")
-	key, _ := filepath.Abs("../../third_party/hysteria-core/internal/integration_tests/test.key")
-	command := exec.CommandContext(ctx, buildUpstream(t, "server"), cert, key)
+	command := exec.CommandContext(ctx, binary, cert, key)
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)

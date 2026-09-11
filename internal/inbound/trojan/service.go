@@ -2,6 +2,7 @@ package trojan
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -37,7 +38,8 @@ var errTrafficRejected = errors.New("traffic policy rejected payload")
 var errAssociationIdle = errors.New("Trojan UDP association idle")
 
 // Service owns one Trojan TCP/TLS listener. It deliberately exposes only the
-// inbound lifecycle; authentication and every data-plane action use Kernel.
+// inbound lifecycle; authenticated proxy traffic uses Kernel. Optional anonymous
+// website connections use a separate, bounded relay.
 type Service struct {
 	name             string
 	listener         net.Listener
@@ -46,6 +48,7 @@ type Service struct {
 	handshakeTimeout time.Duration
 	udpIdleTimeout   time.Duration
 	pending          chan struct{}
+	fallback         *fallback
 	logger           *zap.Logger
 	ctx              context.Context
 	cancel           context.CancelFunc
@@ -62,10 +65,6 @@ func NewService(inbound config.Inbound, certificate tls.Certificate, kernel *pol
 	if kernel == nil {
 		return nil, fmt.Errorf("Trojan inbound %s requires a policy kernel", inbound.Name)
 	}
-	listener, err := net.Listen("tcp", inbound.Listen)
-	if err != nil {
-		return nil, fmt.Errorf("inbound %s listen: %w", inbound.Name, err)
-	}
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -73,6 +72,7 @@ func NewService(inbound config.Inbound, certificate tls.Certificate, kernel *pol
 	handshakeTimeout := defaultHandshakeTimeout
 	maxPending := defaultMaxPendingConnections
 	udpIdleTimeout := defaultUDPIdleTimeout
+	var website *fallback
 	if options != nil {
 		if options.HandshakeTimeout != 0 {
 			handshakeTimeout = options.HandshakeTimeout
@@ -83,14 +83,30 @@ func NewService(inbound config.Inbound, certificate tls.Certificate, kernel *pol
 		if options.UDPIdleTimeout != 0 {
 			udpIdleTimeout = options.UDPIdleTimeout
 		}
+		if options.Fallback != nil {
+			configured, err := options.Fallback.WithDefaults()
+			if err != nil {
+				return nil, fmt.Errorf("Trojan inbound %s: %w", inbound.Name, err)
+			}
+			website = &fallback{config: configured, slots: make(chan struct{}, configured.MaxConnections)}
+		}
+	}
+	listener, err := net.Listen("tcp", inbound.Listen)
+	if err != nil {
+		return nil, fmt.Errorf("inbound %s listen: %w", inbound.Name, err)
+	}
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
+	if website != nil {
+		// The fixed backend receives plaintext HTTP/1.1, never HTTP/2 frames.
+		tlsConfig.NextProtos = []string{"http/1.1"}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Service{
 		name: inbound.Name, listener: listener,
-		tlsConfig: (&tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}).Clone(),
+		tlsConfig: tlsConfig,
 		kernel:    kernel, handshakeTimeout: handshakeTimeout, udpIdleTimeout: udpIdleTimeout,
-		pending: make(chan struct{}, maxPending),
-		logger:  logger, ctx: ctx, cancel: cancel, connections: make(map[net.Conn]io.Closer),
+		pending: make(chan struct{}, maxPending), fallback: website,
+		logger: logger, ctx: ctx, cancel: cancel, connections: make(map[net.Conn]io.Closer),
 	}, nil
 }
 
@@ -180,12 +196,41 @@ func (s *Service) handle(rawClient net.Conn) {
 	if err != nil {
 		return
 	}
-	credential, err := ReadCredential(client)
-	if err != nil {
+	var prefix bytes.Buffer
+	var reader io.Reader = client
+	probeDeadline := deadline
+	if s.fallback != nil {
+		probeDeadline = time.Now().Add(s.fallback.config.ProbeTimeout)
+		if deadline.Before(probeDeadline) {
+			probeDeadline = deadline
+		}
+		if err := rawClient.SetReadDeadline(probeDeadline); err != nil {
+			return
+		}
+		// ReadCredential consumes at most 58 bytes. Preserve partial reads too,
+		// including data returned before EOF or the probe deadline.
+		reader = io.TeeReader(io.LimitReader(client, credentialLength+2), &prefix)
+	}
+	credential, err := ReadCredential(reader)
+	var session *policy.Session
+	var authenticated bool
+	if err == nil {
+		session, authenticated = s.kernel.AuthenticateTrojan(s.name, rawClient.RemoteAddr(), credential)
+	}
+	if !authenticated {
+		if s.fallback != nil && s.fallback.acquire() {
+			defer s.fallback.release()
+			<-s.pending
+			pending = false
+			s.serveFallback(client, rawClient, prefix.Bytes(), probeDeadline)
+		} else if s.fallback != nil {
+			s.logger.Debug("Trojan website connection limit reached", zap.String("inbound", s.name))
+		}
 		return
 	}
-	session, ok := s.kernel.AuthenticateTrojan(s.name, rawClient.RemoteAddr(), credential)
-	if !ok {
+	// A valid credential retains the original full handshake/request budget.
+	// Invalid commands from an authenticated client are never sent to the website.
+	if err := rawClient.SetReadDeadline(deadline); err != nil {
 		return
 	}
 	request, err := ReadRequest(client)
