@@ -1,32 +1,31 @@
-package router
+package outbound
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
 
 	hyClient "github.com/apernet/hysteria/core/v2/client"
-	hyServer "github.com/apernet/hysteria/core/v2/server"
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"go.uber.org/zap"
 )
 
 // Compile-time check.
-var _ hyServer.Outbound = (*Hysteria2Outbound)(nil)
-
 // Hysteria2Outbound is one established connection to a remote Hysteria2 node.
 // Reconnection and DNS refresh are owned by the node entry in factory.go.
 type Hysteria2Outbound struct {
 	cfg    *config.Hysteria2OutboundConfig
-	client hyClient.Client
+	client hyClient.ContextClient
 	logger *zap.Logger
 
 	mu     sync.Mutex
 	closed bool
 }
 
-func newHysteria2Outbound(cfg *config.Hysteria2OutboundConfig, serverAddr *net.UDPAddr, sni string, logger *zap.Logger) (*Hysteria2Outbound, error) {
-	client, info, err := hyClient.NewClient(&hyClient.Config{
+func newHysteria2OutboundContext(ctx context.Context, cfg *config.Hysteria2OutboundConfig, serverAddr *net.UDPAddr, sni string, logger *zap.Logger) (*Hysteria2Outbound, error) {
+	client, info, err := hyClient.NewClientContext(ctx, &hyClient.Config{
 		ServerAddr: serverAddr,
 		Auth:       cfg.Auth,
 		TLSConfig: hyClient.TLSConfig{
@@ -47,21 +46,22 @@ func newHysteria2Outbound(cfg *config.Hysteria2OutboundConfig, serverAddr *net.U
 	return &Hysteria2Outbound{cfg: cfg, client: client, logger: logger}, nil
 }
 
-// TCP implements server.Outbound.
-// Opens a new QUIC stream on the existing connection to the remote node
-// and sends a TCP proxy request.
-func (h *Hysteria2Outbound) TCP(reqAddr string) (net.Conn, error) {
+// TCPContext opens a new QUIC stream on the existing connection to the remote
+// node and sends a TCP proxy request.
+func (h *Hysteria2Outbound) TCPContext(ctx context.Context, reqAddr string) (net.Conn, error) {
 	h.logger.Debug("hy2 outbound TCP",
 		zap.String("remote", h.cfg.Addr),
 		zap.String("reqAddr", reqAddr),
 	)
-	return h.client.TCP(reqAddr)
+	return h.client.TCPContext(ctx, reqAddr)
 }
 
-// UDP implements server.Outbound.
-// Creates a new UDP session on the existing QUIC connection and wraps
-// the HyUDPConn into a server.UDPConn compatible interface.
-func (h *Hysteria2Outbound) UDP(reqAddr string) (hyServer.UDPConn, error) {
+// UDPContext creates a new UDP session on the existing QUIC connection and
+// wraps the HyUDPConn into the protocol-neutral UDP association interface.
+func (h *Hysteria2Outbound) UDPContext(ctx context.Context, reqAddr string) (UDPConn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	h.logger.Debug("hy2 outbound UDP",
 		zap.String("remote", h.cfg.Addr),
 		zap.String("reqAddr", reqAddr),
@@ -84,11 +84,12 @@ func (h *Hysteria2Outbound) Close() error {
 	}
 	h.closed = true
 	h.logger.Info("hy2 outbound closing", zap.String("addr", h.cfg.Addr))
-	return h.client.Close()
+	err := h.client.Close()
+	return errors.Join(err, h.client.Wait(context.Background()))
 }
 
 // hyUDPConnAdapter adapts hyClient.HyUDPConn (Send/Receive) to
-// hyServer.UDPConn (ReadFrom/WriteTo/Close).
+// the protocol-neutral UDP association contract (ReadFrom/WriteTo/Close).
 type hyUDPConnAdapter struct {
 	inner hyClient.HyUDPConn
 }

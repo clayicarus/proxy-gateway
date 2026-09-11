@@ -1,4 +1,4 @@
-package router
+package outbound
 
 import (
 	"context"
@@ -11,10 +11,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	coreErrors "github.com/apernet/hysteria/core/v2/errors"
-	hyServer "github.com/apernet/hysteria/core/v2/server"
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"go.uber.org/zap"
 )
@@ -43,7 +43,7 @@ type NodeStatus struct {
 }
 
 type connectedOutbound interface {
-	hyServer.Outbound
+	Outbound
 	Close() error
 }
 
@@ -74,7 +74,7 @@ func (c *hysteria2Connector) Connect(ctx context.Context, name string, cfg *conf
 		dial := c.dial
 		if dial == nil {
 			dial = func(cfg *config.Hysteria2OutboundConfig, addr *net.UDPAddr, sni string, logger *zap.Logger) (connectedOutbound, error) {
-				return newHysteria2Outbound(cfg, addr, sni, logger)
+				return newHysteria2OutboundContext(ctx, cfg, addr, sni, logger)
 			}
 		}
 		outbound, err := dial(cfg, addr, sni, c.logger)
@@ -265,24 +265,24 @@ func (e *nodeEntry) currentClient() (connectedOutbound, error) {
 	return client, nil
 }
 
-func (e *nodeEntry) TCP(reqAddr string) (net.Conn, error) {
+func (e *nodeEntry) TCPContext(ctx context.Context, reqAddr string) (net.Conn, error) {
 	client, err := e.currentClient()
 	if err != nil {
 		return nil, err
 	}
-	conn, err := client.TCP(reqAddr)
-	if isClosedConnection(err) {
+	conn, err := client.TCPContext(ctx, reqAddr)
+	if ctx.Err() == nil && isClosedConnection(err) {
 		e.markUnavailable(client, err)
 	}
 	return conn, err
 }
 
-func (e *nodeEntry) UDP(reqAddr string) (hyServer.UDPConn, error) {
+func (e *nodeEntry) UDPContext(ctx context.Context, reqAddr string) (UDPConn, error) {
 	client, err := e.currentClient()
 	if err != nil {
 		return nil, err
 	}
-	conn, err := client.UDP(reqAddr)
+	conn, err := client.UDPContext(ctx, reqAddr)
 	if err != nil {
 		if isClosedConnection(err) {
 			e.markUnavailable(client, err)
@@ -338,12 +338,16 @@ func isClosedConnection(err error) bool {
 }
 
 type nodeUDPConn struct {
-	hyServer.UDPConn
-	failed func(error)
+	UDPConn
+	failed      func(error)
+	localClosed atomic.Bool
 }
 
 func (c *nodeUDPConn) ReadFrom(b []byte) (int, string, error) {
 	n, addr, err := c.UDPConn.ReadFrom(b)
+	if c.localClosed.Load() {
+		return n, addr, err
+	}
 	if isClosedConnection(err) {
 		c.failed(err)
 	} else if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
@@ -354,10 +358,15 @@ func (c *nodeUDPConn) ReadFrom(b []byte) (int, string, error) {
 
 func (c *nodeUDPConn) WriteTo(b []byte, addr string) (int, error) {
 	n, err := c.UDPConn.WriteTo(b, addr)
-	if isClosedConnection(err) || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+	if !c.localClosed.Load() && (isClosedConnection(err) || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)) {
 		c.failed(err)
 	}
 	return n, err
+}
+
+func (c *nodeUDPConn) Close() error {
+	c.localClosed.Store(true)
+	return c.UDPConn.Close()
 }
 
 type OutboundFactory struct {
@@ -451,7 +460,7 @@ func (f *OutboundFactory) Warmup(ctx context.Context) error {
 	}
 }
 
-func (f *OutboundFactory) Get(name string) (hyServer.Outbound, error) {
+func (f *OutboundFactory) Get(name string) (Outbound, error) {
 	if name == "direct" {
 		return f.direct, nil
 	}

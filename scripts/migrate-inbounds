@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_dir=$(dirname -- "$script_dir")
+tool_tmp=$(mktemp -d "${TMPDIR:-/tmp}/migrate-inbounds.XXXXXX")
+trap 'rm -rf -- "$tool_tmp"' EXIT HUP INT TERM
+go -C "$repo_dir" build -o "$tool_tmp/migrate-inbounds" ./cmd/migrate-inbounds
+"$tool_tmp/migrate-inbounds" "$@"

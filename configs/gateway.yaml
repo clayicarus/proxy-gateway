@@ -1,61 +1,72 @@
-# Proxy Gateway 示例配置
+# Proxy Gateway example configuration
 
-# 监听地址
-listen: :8443
+# Named inbounds. Hysteria2 uses UDP and Trojan uses TCP; ports may match.
+inbounds:
+  - name: hy2-public
+    type: hysteria2
+    listen: :8443
+    # Optional QUIC tuning.
+    # quic:
+    #   maxIdleTimeout: 30s
+    #   maxIncomingStreams: 1024
+    # Optional website for unauthenticated HTTP/3 requests.
+    # Without masquerade, unauthenticated requests receive 404.
+    # masquerade:
+    #   type: proxy
+    #   proxy:
+    #     url: http://127.0.0.1:8080
+    #     rewriteHost: true
+  # - name: trojan-public
+  #   type: trojan
+  #   listen: :8443
+  #   trojan:
+  #     handshakeTimeout: 10s
+  #     maxPendingConnections: 256
+  #     # Reclaim UDP associations idle in both directions.
+  #     udpIdleTimeout: 60s
 
-# TLS 证书文件
+# TLS certificate files.
 tls:
   cert: ./cert.pem
   key: ./key.pem
 
-# 混淆（可选，需要客户端也配置相同密码）
-# obfs:
-#   type: salamander
-#   salamander:
-#     password: your_obfs_password
-
-# QUIC 参数调优（可选）
-# quic:
-#   maxIdleTimeout: 30s
-#   maxIncomingStreams: 1024
-
-# 伪装（可选，用于抗审查）
-# masquerade:
-#   type: proxy
-#   proxy:
-#     url: https://www.bing.com
-#     rewriteHost: true
+# obfs is unsupported. Configure masquerade per Hysteria2 inbound above.
 
 # ============================================================
-# 管理后台（必须只绑定 loopback）
+# Management panel (loopback only).
 # ============================================================
 admin:
   listen: "127.0.0.1:9090"
 
-# SQLite 数据库路径
+# SQLite database path.
 dbPath: ./traffic.db
 
-# 流量统计刷新间隔
+# Traffic flush interval.
 trafficFlushInterval: 10s
 
-# 自然月流量统计时区；SQLite 内部时间始终为 UTC
+# Calendar-month timezone; SQLite timestamps always use UTC.
 timezone: "Asia/Shanghai"
 
-# systemd 直接守护本进程。watchdog 仅在 unit 设置 WatchdogSec 时启用。
+# systemd supervises this process. Watchdog requires WatchdogSec in the unit.
 systemd:
   unit: "proxy-gateway.service"
   watchdog: true
 
 # ============================================================
-# 订阅服务（对用户公网开放，与本地管理后台分离）
+# Public subscriptions, separate from the local management panel.
 # ============================================================
 sub:
-  listen: "127.0.0.1:9091"        # 可由 Nginx 反向代理到公网
+  listen: "127.0.0.1:9091"        # Publish through an HTTPS reverse proxy.
   publicURL: "https://sub.example.com/sub/"
+  inbound: "hy2-public"
   serverAddr: "gateway.example.com:8443"
   sni: "gateway.example.com"
   insecure: false
 
-# 用户和节点均由 SQLite 管理。如需导入旧 YAML，请执行：
-# proxy-gateway migrate -c /etc/proxy-gateway/legacy-gateway.yaml
-# 迁移时使用 sub.secret（缺省时 api.secret）计算旧订阅链接。
+# For Trojan only, enable trojan-public above and select it in sub.inbound.
+# To publish both protocols, use configs/gateway-mixed.yaml and sub.endpoints.
+# Every published inbound needs its own explicit public address and TLS settings.
+
+# Users and nodes are managed in SQLite. To import legacy YAML, run:
+# migrate -c /etc/proxy-gateway/legacy-gateway.yaml
+# Migration uses sub.secret (or api.secret) to preserve legacy subscription URLs.

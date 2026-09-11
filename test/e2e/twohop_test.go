@@ -9,11 +9,9 @@ import (
 
 	hyClient "github.com/apernet/hysteria/core/v2/client"
 	hyServer "github.com/apernet/hysteria/core/v2/server"
-	"github.com/clayicarus/proxy-gateway/internal/auth"
 	"github.com/clayicarus/proxy-gateway/internal/config"
-	"github.com/clayicarus/proxy-gateway/internal/event"
-	"github.com/clayicarus/proxy-gateway/internal/router"
-	"github.com/clayicarus/proxy-gateway/internal/traffic"
+	hyInbound "github.com/clayicarus/proxy-gateway/internal/inbound/hysteria2"
+	"github.com/clayicarus/proxy-gateway/internal/policy"
 	"go.uber.org/zap"
 )
 
@@ -57,6 +55,21 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 
 	targetAddr := targetLn.Addr().String()
 	t.Logf("target server on %s", targetAddr)
+	udpTarget, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create UDP target: %v", err)
+	}
+	defer udpTarget.Close()
+	go func() {
+		buffer := make([]byte, 4096)
+		for {
+			n, addr, err := udpTarget.ReadFrom(buffer)
+			if err != nil {
+				return
+			}
+			_, _ = udpTarget.WriteTo(buffer[:n], addr)
+		}
+	}()
 
 	// --- 2. Generate TLS certs ---
 	nodeCert, err := generateSelfSignedCert()
@@ -107,19 +120,16 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 		},
 	}
 
-	authenticator := auth.NewAuthenticator(users, logger)
-	trafficLogger := traffic.NewTrafficLogger(users, nil, logger)
-	routerEngine := router.NewRouter(users, logger)
-	outboundFactory := router.NewOutboundFactory(nodes, logger)
+	kernel := policy.New(users, nodes, nil, logger, time.UTC)
+	trafficLogger := kernel.Traffic()
 	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := outboundFactory.Warmup(warmupCtx); err != nil {
+	if err := kernel.Warmup(warmupCtx); err != nil {
 		warmupCancel()
-		outboundFactory.Close()
+		kernel.CloseOutbounds()
 		t.Fatalf("failed to warm up node outbound: %v", err)
 	}
 	warmupCancel()
-	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
-	eventLogger := event.NewEventLogger(routingOutbound, logger)
+	adapter := hyInbound.New("two-hop", kernel)
 
 	gatewayUDP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
@@ -132,18 +142,18 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 		TLSConfig: hyServer.TLSConfig{
 			Certificates: []tls.Certificate{gatewayCert},
 		},
-		Conn:          gatewayUDP,
-		Authenticator: authenticator,
-		Outbound:      routingOutbound,
-		TrafficLogger: trafficLogger,
-		EventLogger:   eventLogger,
+		Conn:                 gatewayUDP,
+		SessionAuthenticator: adapter,
+		SessionOutbound:      adapter,
+		SessionTrafficLogger: adapter,
+		SessionEventLogger:   adapter,
 	})
 	if err != nil {
 		t.Fatalf("failed to create gateway server: %v", err)
 	}
 	go gatewayServer.Serve()
 	defer gatewayServer.Close()
-	defer outboundFactory.Close()
+	defer kernel.CloseOutbounds()
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -189,6 +199,58 @@ func TestTwoHop_ClientGatewayNode(t *testing.T) {
 		}
 
 		t.Logf("two-hop response: %s", response)
+	})
+
+	// Closing one UDP association must not close the shared client connection
+	// that the second association uses to reach the remote node.
+	t.Run("two_hop_udp_proxy_and_association_isolation", func(t *testing.T) {
+		sAddr, _ := net.ResolveUDPAddr("udp", gatewayAddr)
+		client, _, err := hyClient.NewClient(&hyClient.Config{
+			ServerAddr: sAddr,
+			Auth:       "alice:node1:alice_pass",
+			TLSConfig: hyClient.TLSConfig{
+				ServerName:         "localhost",
+				InsecureSkipVerify: true,
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create UDP client: %v", err)
+		}
+		defer client.Close()
+
+		first, err := client.UDP()
+		if err != nil {
+			t.Fatalf("first UDP association: %v", err)
+		}
+		second, err := client.UDP()
+		if err != nil {
+			_ = first.Close()
+			t.Fatalf("second UDP association: %v", err)
+		}
+		defer second.Close()
+
+		exchange := func(conn hyClient.HyUDPConn, payload string) {
+			t.Helper()
+			if err := conn.Send([]byte(payload), udpTarget.LocalAddr().String()); err != nil {
+				t.Fatalf("UDP send %q: %v", payload, err)
+			}
+			timeout := time.AfterFunc(5*time.Second, func() { _ = client.Close() })
+			response, address, err := conn.Receive()
+			timeout.Stop()
+			if err != nil {
+				t.Fatalf("UDP receive %q: %v", payload, err)
+			}
+			if address != udpTarget.LocalAddr().String() || string(response) != payload {
+				t.Fatalf("UDP response = %q from %q, want %q from %q", response, address, payload, udpTarget.LocalAddr())
+			}
+		}
+
+		exchange(first, "first association")
+		exchange(second, "second association")
+		if err := first.Close(); err != nil {
+			t.Fatalf("close first UDP association: %v", err)
+		}
+		exchange(second, "second remains usable")
 	})
 
 	// --- 6. Verify traffic was logged ---

@@ -2,8 +2,11 @@ module github.com/clayicarus/proxy-gateway
 
 go 1.24.0
 
+replace github.com/apernet/hysteria/core/v2 => ./third_party/hysteria-core
+
 require (
 	github.com/apernet/hysteria/core/v2 v2.8.1
+	github.com/apernet/quic-go v0.59.1-0.20260330051153-c402ee641eb6
 	github.com/godbus/dbus/v5 v5.1.0
 	github.com/mattn/go-sqlite3 v1.14.42
 	go.uber.org/zap v1.27.0
@@ -11,7 +14,6 @@ require (
 )
 
 require (
-	github.com/apernet/quic-go v0.59.1-0.20260330051153-c402ee641eb6 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect

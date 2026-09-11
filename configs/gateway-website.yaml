@@ -1,0 +1,51 @@
+# Serve one local website over HTTPS/TCP and HTTP/3/UDP on the same public port.
+# Start the fixed HTTP origin first; see configs/masquerade-nginx.conf.
+inbounds:
+  - name: hy2-public
+    type: hysteria2
+    listen: :443
+    masquerade:
+      type: proxy
+      proxy:
+        url: http://127.0.0.1:8080
+  - name: trojan-public
+    type: trojan
+    listen: :443
+    trojan:
+      handshakeTimeout: 10s
+      maxPendingConnections: 256
+      udpIdleTimeout: 60s
+      fallback:
+        # This is a plaintext HTTP/1.1 host:port, not an HTTPS URL.
+        addr: 127.0.0.1:8080
+        probeTimeout: 1s
+        dialTimeout: 3s
+        timeout: 30s
+        maxConnections: 32
+
+tls:
+  cert: ./cert.pem
+  key: ./key.pem
+
+admin:
+  listen: "127.0.0.1:9090"
+
+sub:
+  listen: "127.0.0.1:9091"
+  # The sample origin forwards /sub/ to this separate HTTP service.
+  publicURL: "https://gateway.example.com/sub/"
+  endpoints:
+    - inbound: hy2-public
+      serverAddr: "gateway.example.com:443"
+      sni: "gateway.example.com"
+    - inbound: trojan-public
+      serverAddr: "gateway.example.com:443"
+      sni: "gateway.example.com"
+
+dbPath: ./traffic.db
+trafficFlushInterval: 10s
+timezone: "Asia/Shanghai"
+
+systemd:
+  unit: "proxy-gateway.service"
+  watchdog: true

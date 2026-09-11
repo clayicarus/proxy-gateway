@@ -1,8 +1,10 @@
-package router
+package outbound
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"strings"
@@ -12,10 +14,92 @@ import (
 	"time"
 
 	coreErrors "github.com/apernet/hysteria/core/v2/errors"
-	hyServer "github.com/apernet/hysteria/core/v2/server"
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"go.uber.org/zap"
 )
+
+type closeAwareUDPConn struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newCloseAwareUDPConn() *closeAwareUDPConn {
+	return &closeAwareUDPConn{closed: make(chan struct{})}
+}
+
+func (c *closeAwareUDPConn) ReadFrom([]byte) (int, string, error) {
+	<-c.closed
+	return 0, "", io.EOF
+}
+
+func (c *closeAwareUDPConn) WriteTo([]byte, string) (int, error) {
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+		return 1, nil
+	}
+}
+
+func (c *closeAwareUDPConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func TestNodeUDPConnLocalCloseDoesNotFailSharedNode(t *testing.T) {
+	inner := newCloseAwareUDPConn()
+	var failures atomic.Int32
+	conn := &nodeUDPConn{
+		UDPConn: inner,
+		failed:  func(error) { failures.Add(1) },
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		_, _, err := conn.ReadFrom(nil)
+		readDone <- err
+	}()
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-readDone; !errors.Is(err, io.EOF) {
+		t.Fatalf("read error = %v, want EOF", err)
+	}
+	if failures.Load() != 0 {
+		t.Fatalf("local association close failed shared node %d times", failures.Load())
+	}
+	if _, err := conn.WriteTo([]byte("x"), "example.com:53"); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("write after close error = %v, want net.ErrClosed", err)
+	}
+	if failures.Load() != 0 {
+		t.Fatalf("write after local close failed shared node %d times", failures.Load())
+	}
+}
+
+type failingUDPConn struct{ err error }
+
+func (c failingUDPConn) ReadFrom([]byte) (int, string, error) { return 0, "", c.err }
+func (c failingUDPConn) WriteTo([]byte, string) (int, error)  { return 0, c.err }
+func (c failingUDPConn) Close() error                         { return nil }
+
+func TestNodeUDPConnConnectionFailureFailsSharedNode(t *testing.T) {
+	for _, operation := range []string{"read", "write"} {
+		t.Run(operation, func(t *testing.T) {
+			var failures atomic.Int32
+			conn := &nodeUDPConn{
+				UDPConn: failingUDPConn{err: io.EOF},
+				failed:  func(error) { failures.Add(1) },
+			}
+			if operation == "read" {
+				_, _, _ = conn.ReadFrom(nil)
+			} else {
+				_, _ = conn.WriteTo(nil, "example.com:53")
+			}
+			if failures.Load() != 1 {
+				t.Fatalf("connection failure callback count = %d, want 1", failures.Load())
+			}
+		})
+	}
+}
 
 func TestDirectOutbound_TCP(t *testing.T) {
 	if directDialer.Timeout != 10*time.Second {
@@ -38,7 +122,7 @@ func TestDirectOutbound_TCP(t *testing.T) {
 		}
 	}()
 
-	conn, err := d.TCP(ln.Addr().String())
+	conn, err := d.TCPContext(context.Background(), ln.Addr().String())
 	if err != nil {
 		t.Fatalf("direct TCP failed: %v", err)
 	}
@@ -59,8 +143,10 @@ type fakeConnectedOutbound struct {
 	closed atomic.Bool
 }
 
-func (f *fakeConnectedOutbound) TCP(string) (net.Conn, error) { return nil, f.tcpErr }
-func (f *fakeConnectedOutbound) UDP(string) (hyServer.UDPConn, error) {
+func (f *fakeConnectedOutbound) TCPContext(context.Context, string) (net.Conn, error) {
+	return nil, f.tcpErr
+}
+func (f *fakeConnectedOutbound) UDPContext(context.Context, string) (UDPConn, error) {
 	return nil, f.tcpErr
 }
 func (f *fakeConnectedOutbound) Close() error {
@@ -121,7 +207,7 @@ func TestOutboundFactory_NodeFailureIsIsolatedAndFailsFast(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := time.Now()
-	if _, err := bad.TCP("example.com:443"); err == nil || !strings.Contains(err.Error(), "unavailable") {
+	if _, err := bad.TCPContext(context.Background(), "example.com:443"); err == nil || !strings.Contains(err.Error(), "unavailable") {
 		t.Fatalf("bad node did not fail fast: %v", err)
 	}
 	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
@@ -149,7 +235,7 @@ func TestOutboundFactory_ClosedConnectionReconnectsInBackground(t *testing.T) {
 		t.Fatal(err)
 	}
 	node, _ := factory.Get("node")
-	if _, err := node.TCP("example.com:443"); !isClosedConnection(err) {
+	if _, err := node.TCPContext(context.Background(), "example.com:443"); !isClosedConnection(err) {
 		t.Fatalf("expected closed connection error, got %v", err)
 	}
 	waitFor(t, func() bool {
@@ -300,7 +386,7 @@ func TestDirectOutbound_UDP(t *testing.T) {
 		pc.WriteTo(buf[:n], addr)
 	}()
 
-	udpConn, err := d.UDP(targetAddr)
+	udpConn, err := d.UDPContext(context.Background(), targetAddr)
 	if err != nil {
 		t.Fatalf("direct UDP failed: %v", err)
 	}
@@ -343,98 +429,5 @@ func TestOutboundFactory_Unknown(t *testing.T) {
 	_, err := f.Get("nonexistent")
 	if err == nil {
 		t.Error("expected error for unknown node")
-	}
-}
-
-func TestRoutingOutbound_UserContext(t *testing.T) {
-	logger := zap.NewNop()
-	nodes := map[string]config.NodeConfig{}
-
-	r := NewRouter(map[string]config.UserConfig{
-		"alice": {Password: "p", Routes: []string{"direct"}},
-	}, logger)
-	f := NewOutboundFactory(nodes, logger)
-	ro := NewRoutingOutbound(r, f, logger)
-
-	addr := &net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 12345}
-
-	// Create a local listener for the test
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to create listener: %v", err)
-	}
-	defer ln.Close()
-
-	go func() {
-		conn, _ := ln.Accept()
-		if conn != nil {
-			conn.Close()
-		}
-	}()
-
-	// Set request context (simulating EventLogger.TCPRequest)
-	ro.SetRequestContext(addr, "alice:direct", "tcp", ln.Addr().String())
-
-	conn, err := ro.TCP(ln.Addr().String())
-	if err != nil {
-		t.Fatalf("routing TCP failed: %v", err)
-	}
-	conn.Close()
-
-}
-
-func TestRoutingOutbound_MissingOrMismatchedContextFailsClosed(t *testing.T) {
-	logger := zap.NewNop()
-	ro := NewRoutingOutbound(NewRouter(nil, logger), NewOutboundFactory(nil, logger), logger)
-
-	if _, err := ro.TCP("example.com:443"); err == nil || !strings.Contains(err.Error(), "context missing") {
-		t.Fatalf("TCP without context should fail closed, got %v", err)
-	}
-	if _, err := ro.UDP("example.com:443"); err == nil || !strings.Contains(err.Error(), "context missing") {
-		t.Fatalf("UDP without context should fail closed, got %v", err)
-	}
-
-	addr := &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 12345}
-	ro.SetRequestContext(addr, "alice:direct", "tcp", "expected.example:443")
-	if _, err := ro.TCP("other.example:443"); err == nil || !strings.Contains(err.Error(), "context mismatch") {
-		t.Fatalf("mismatched context should fail closed, got %v", err)
-	}
-
-	ro.SetRequestContext(addr, "alice", "tcp", "example.com:443")
-	if _, err := ro.TCP("example.com:443"); err == nil || !strings.Contains(err.Error(), "node is required") {
-		t.Fatalf("authenticated ID without an explicit node should fail closed, got %v", err)
-	}
-}
-
-func TestRoutingOutbound_ConcurrentSameTargetKeepsUserRoute(t *testing.T) {
-	logger := zap.NewNop()
-	const requests = 100
-	nodes := make(map[string]config.NodeConfig, requests)
-	for i := 0; i < requests; i++ {
-		route := fmt.Sprintf("route-%03d", i)
-		nodes[route] = config.NodeConfig{Type: "test-invalid"}
-	}
-	ro := NewRoutingOutbound(NewRouter(nil, logger), NewOutboundFactory(nodes, logger), logger)
-
-	var wg sync.WaitGroup
-	errors := make(chan error, requests)
-	for i := 0; i < requests; i++ {
-		i := i
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			route := fmt.Sprintf("route-%03d", i)
-			addr := &net.UDPAddr{IP: net.ParseIP("192.0.2.20"), Port: 20000 + i}
-			ro.SetRequestContext(addr, "user:"+route, "tcp", "same.example:443")
-			_, err := ro.TCP("same.example:443")
-			if err == nil || !strings.Contains(err.Error(), "node "+route+" unavailable:") {
-				errors <- fmt.Errorf("request %d used wrong route: %v", i, err)
-			}
-		}()
-	}
-	wg.Wait()
-	close(errors)
-	for err := range errors {
-		t.Error(err)
 	}
 }

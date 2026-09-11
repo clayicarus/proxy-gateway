@@ -4,16 +4,22 @@ import (
 	"fmt"
 	"os"
 	"time"
+	_ "time/tzdata" // Keep named zones available without an OS timezone database.
 
 	"gopkg.in/yaml.v3"
 )
 
 // Config is the top-level gateway configuration.
 type Config struct {
-	Listen string    `yaml:"listen"`
-	TLS    TLSConfig `yaml:"tls"`
+	// Inbounds is populated by LoadRuntime. Listen and QUIC remain a
+	// compatibility projection of the first/subscription-bound inbound for the
+	// existing management and subscription read models.
+	Inbounds []Inbound `yaml:"-"`
+	Listen   string    `yaml:"listen"`
+	TLS      TLSConfig `yaml:"tls"`
 
-	// Obfuscation (optional, must match client)
+	// Deprecated: retained only to reject a configuration that the data plane
+	// never implemented.
 	Obfs *ObfsConfig `yaml:"obfs,omitempty"`
 
 	// QUIC tuning
@@ -41,7 +47,9 @@ type Config struct {
 	// Subscription config for generating client configs
 	Sub *SubConfig `yaml:"sub,omitempty"`
 
-	// Masquerade (optional)
+	// Deprecated: legacy top-level field, read only by the management-data
+	// migration path. The runtime schema configures masquerade per inbound in
+	// Inbound.Masquerade; this field is not consulted by the data plane.
 	Masquerade *MasqueradeConfig `yaml:"masquerade,omitempty"`
 
 	// SQLite database path for traffic persistence
@@ -155,7 +163,71 @@ type SubConfig struct {
 	// SNI override for the generated client config (optional).
 	SNI string `yaml:"sni,omitempty"`
 	// Insecure skips TLS verification in generated client config (for self-signed certs).
-	Insecure bool `yaml:"insecure,omitempty"`
+	Insecure bool   `yaml:"insecure,omitempty"`
+	Inbound  string `yaml:"inbound,omitempty"`
+	// Endpoints publishes several named inbounds through one subscription.
+	Endpoints []SubscriptionEndpoint `yaml:"endpoints,omitempty"`
+}
+
+// ClientEndpoints returns the explicit endpoints advertised to clients. The
+// original single-inbound fields remain supported for existing configurations.
+func (s *SubConfig) ClientEndpoints() []SubscriptionEndpoint {
+	if s == nil {
+		return nil
+	}
+	if s.Endpoints != nil {
+		return append([]SubscriptionEndpoint(nil), s.Endpoints...)
+	}
+	return []SubscriptionEndpoint{{
+		Inbound: s.Inbound, ServerAddr: s.ServerAddr,
+		SNI: s.SNI, Insecure: s.Insecure,
+	}}
+}
+
+// LoadRuntime reads the only schema accepted by the gateway data plane.
+func LoadRuntime(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+	inbound, err := ParseInboundConfig(data)
+	if err != nil {
+		return nil, err
+	}
+	cfg := &Config{
+		Inbounds:             append([]Inbound(nil), inbound.Inbounds...),
+		TLS:                  inbound.TLS,
+		Admin:                inbound.Admin,
+		DBPath:               inbound.DBPath,
+		TrafficFlushInterval: inbound.TrafficFlushInterval,
+		Timezone:             inbound.Timezone,
+		Systemd:              inbound.Systemd,
+	}
+	if len(cfg.Inbounds) > 0 {
+		cfg.Listen = cfg.Inbounds[0].Listen
+		cfg.QUIC = cfg.Inbounds[0].QUIC
+	}
+	if inbound.Sub != nil {
+		single := SubscriptionEndpoint{}
+		if inbound.Sub.SubscriptionEndpoint != nil {
+			single = *inbound.Sub.SubscriptionEndpoint
+		}
+		cfg.Sub = &SubConfig{
+			Listen: inbound.Sub.Listen, PublicURL: inbound.Sub.PublicURL,
+			Inbound: single.Inbound, ServerAddr: single.ServerAddr,
+			SNI: single.SNI, Insecure: single.Insecure,
+			Endpoints: append([]SubscriptionEndpoint(nil), inbound.Sub.Endpoints...),
+		}
+		primaryInbound := cfg.Sub.ClientEndpoints()[0].Inbound
+		for i := range cfg.Inbounds {
+			if cfg.Inbounds[i].Name == primaryInbound {
+				cfg.Listen = cfg.Inbounds[i].Listen
+				cfg.QUIC = cfg.Inbounds[i].QUIC
+				break
+			}
+		}
+	}
+	return cfg, nil
 }
 
 // Load reads and parses the configuration file.
@@ -164,7 +236,13 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
-
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+	if hasTopLevelKey(&root, "obfs") {
+		return nil, fmt.Errorf("config validation failed: obfs is not supported by the Gateway data plane; remove obfs before starting")
+	}
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
@@ -178,6 +256,9 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) validate() error {
+	if c.Obfs != nil {
+		return fmt.Errorf("obfs is not supported by the Gateway data plane; remove obfs before starting")
+	}
 	if c.Listen == "" {
 		c.Listen = ":443"
 	}

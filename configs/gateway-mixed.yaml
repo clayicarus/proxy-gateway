@@ -1,0 +1,48 @@
+# A single Clash.Meta / Mihomo subscription publishing both protocols.
+# Replace public hostnames and certificate paths before deployment.
+inbounds:
+  - name: hy2-public
+    type: hysteria2
+    listen: :8443
+    # Optional: serve an existing website to unauthenticated HTTP/3 probes.
+    # masquerade:
+    #   type: proxy
+    #   proxy:
+    #     url: http://127.0.0.1:8080
+    #     rewriteHost: true
+  - name: trojan-public
+    type: trojan
+    listen: :8443
+    trojan:
+      handshakeTimeout: 10s
+      maxPendingConnections: 256
+      udpIdleTimeout: 60s
+
+tls:
+  cert: ./cert.pem
+  key: ./key.pem
+
+admin:
+  listen: "127.0.0.1:9090"
+
+sub:
+  listen: "127.0.0.1:9091"
+  publicURL: "https://sub.example.com/sub/"
+  # Each inbound appears once. Do not combine this list with sub.inbound.
+  endpoints:
+    - inbound: hy2-public
+      serverAddr: "gateway.example.com:8443"
+      sni: "gateway.example.com"
+      insecure: false
+    - inbound: trojan-public
+      serverAddr: "gateway.example.com:8443"
+      sni: "gateway.example.com"
+      insecure: false
+
+dbPath: ./traffic.db
+trafficFlushInterval: 10s
+timezone: "Asia/Shanghai"
+
+systemd:
+  unit: "proxy-gateway.service"
+  watchdog: true

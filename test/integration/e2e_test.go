@@ -1,13 +1,14 @@
 package integration
 
 import (
+	"context"
 	"net"
 	"os"
 	"testing"
 
 	"github.com/clayicarus/proxy-gateway/internal/auth"
 	"github.com/clayicarus/proxy-gateway/internal/config"
-	"github.com/clayicarus/proxy-gateway/internal/event"
+	"github.com/clayicarus/proxy-gateway/internal/outbound"
 	"github.com/clayicarus/proxy-gateway/internal/router"
 	"github.com/clayicarus/proxy-gateway/internal/storage"
 	"github.com/clayicarus/proxy-gateway/internal/traffic"
@@ -16,8 +17,8 @@ import (
 
 // TestE2E_FullPipeline simulates the full request lifecycle:
 //
-//	Client auth → EventLogger.Connect → EventLogger.TCPRequest →
-//	RoutingOutbound.TCP → TrafficLogger.LogTraffic → SQLite persistence
+//	Client auth → explicit policy route → TrafficLogger.LogTraffic → SQLite
+//	persistence.
 func TestE2E_FullPipeline(t *testing.T) {
 	logger := zap.NewNop()
 
@@ -62,9 +63,8 @@ func TestE2E_FullPipeline(t *testing.T) {
 	authenticator := auth.NewAuthenticator(users, logger)
 	trafficLogger := traffic.NewTrafficLogger(users, store, logger)
 	routerEngine := router.NewRouter(users, logger)
-	outboundFactory := router.NewOutboundFactory(nodes, logger)
-	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
-	eventLogger := event.NewEventLogger(routingOutbound, logger)
+	outboundFactory := outbound.NewOutboundFactory(nodes, logger)
+	routingService := router.NewService(routerEngine, outboundFactory, logger)
 
 	// --- Simulate client connection ---
 	clientAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 54321}
@@ -75,14 +75,8 @@ func TestE2E_FullPipeline(t *testing.T) {
 		t.Fatalf("auth failed: ok=%v id=%s", ok, id)
 	}
 
-	// Step 2: EventLogger.Connect (sets user context)
-	eventLogger.Connect(clientAddr, id, 1000000)
-
-	// Step 3: EventLogger.TCPRequest (sets request context)
-	eventLogger.TCPRequest(clientAddr, id, targetAddr)
-
-	// Step 4: Outbound.TCP (uses routing based on user context)
-	conn, err := routingOutbound.TCP(targetAddr)
+	// The authenticated identity is explicit at the policy boundary.
+	conn, err := routingService.TCPContext(context.Background(), id, targetAddr)
 	if err != nil {
 		t.Fatalf("routing TCP failed: %v", err)
 	}
@@ -128,9 +122,6 @@ func TestE2E_FullPipeline(t *testing.T) {
 	if rx != uint64(n) {
 		t.Errorf("sqlite rx: expected %d, got %d", n, rx)
 	}
-
-	// Step 10: Disconnect
-	eventLogger.Disconnect(clientAddr, id, nil)
 
 	t.Logf("E2E pipeline completed: alice:direct sent %d bytes, received %d bytes", tx, rx)
 }
@@ -190,16 +181,10 @@ func TestE2E_MultiUserRouting(t *testing.T) {
 		"bob":   {Password: "p", Routes: []string{"direct"}},
 	}
 	routerEngine := router.NewRouter(multiUsers, logger)
-	outboundFactory := router.NewOutboundFactory(nodes, logger)
-	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
-	eventLogger := event.NewEventLogger(routingOutbound, logger)
+	outboundFactory := outbound.NewOutboundFactory(nodes, logger)
+	routingService := router.NewService(routerEngine, outboundFactory, logger)
 
-	// Alice connects (id = "alice:direct") and requests target1
-	aliceAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 11111}
-	eventLogger.Connect(aliceAddr, "alice:direct", 0)
-	eventLogger.TCPRequest(aliceAddr, "alice:direct", target1Ln.Addr().String())
-
-	conn1, err := routingOutbound.TCP(target1Ln.Addr().String())
+	conn1, err := routingService.TCPContext(context.Background(), "alice:direct", target1Ln.Addr().String())
 	if err != nil {
 		t.Fatalf("alice TCP failed: %v", err)
 	}
@@ -210,12 +195,7 @@ func TestE2E_MultiUserRouting(t *testing.T) {
 	}
 	conn1.Close()
 
-	// Bob connects (id = "bob:direct") and requests target2
-	bobAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 22222}
-	eventLogger.Connect(bobAddr, "bob:direct", 0)
-	eventLogger.TCPRequest(bobAddr, "bob:direct", target2Ln.Addr().String())
-
-	conn2, err := routingOutbound.TCP(target2Ln.Addr().String())
+	conn2, err := routingService.TCPContext(context.Background(), "bob:direct", target2Ln.Addr().String())
 	if err != nil {
 		t.Fatalf("bob TCP failed: %v", err)
 	}
@@ -226,8 +206,6 @@ func TestE2E_MultiUserRouting(t *testing.T) {
 	}
 	conn2.Close()
 
-	eventLogger.Disconnect(aliceAddr, "alice:direct", nil)
-	eventLogger.Disconnect(bobAddr, "bob:direct", nil)
 }
 
 // TestE2E_NodeFailureIsReturned tests that Gateway does not substitute a
@@ -253,19 +231,12 @@ func TestE2E_NodeFailureIsReturned(t *testing.T) {
 	}
 
 	routerEngine := router.NewRouter(users, logger)
-	outboundFactory := router.NewOutboundFactory(nodes, logger)
-	routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
-	eventLogger := event.NewEventLogger(routingOutbound, logger)
-
-	clientAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 54321}
-	eventLogger.Connect(clientAddr, "alice:broken_node", 0)
-	eventLogger.TCPRequest(clientAddr, "alice:broken_node", "example.com:443")
-
-	_, err := routingOutbound.TCP("example.com:443")
+	outboundFactory := outbound.NewOutboundFactory(nodes, logger)
+	routingService := router.NewService(routerEngine, outboundFactory, logger)
+	_, err := routingService.TCPContext(context.Background(), "alice:broken_node", "example.com:443")
 	if err == nil {
 		t.Fatal("expected error when selected node is unreachable")
 	}
 	t.Logf("correctly got error: %v", err)
 
-	eventLogger.Disconnect(clientAddr, "alice:broken_node", nil)
 }

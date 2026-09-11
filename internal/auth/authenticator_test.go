@@ -1,7 +1,10 @@
 package auth
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/clayicarus/proxy-gateway/internal/config"
@@ -32,6 +35,31 @@ func TestAuthenticator_Success(t *testing.T) {
 	if !ok || id != "bob:node1" {
 		t.Errorf("expected (true, bob:node1), got (%v, %s)", ok, id)
 	}
+}
+
+func TestAuthenticatorTrojanCredentialAndRefresh(t *testing.T) {
+	a := NewAuthenticator(map[string]config.UserConfig{
+		"alice": {Password: "secret", Routes: []string{"direct"}},
+	}, zap.NewNop())
+	credential := trojanCredential("alice:direct:secret")
+	ok, id := a.AuthenticateTrojan(&net.TCPAddr{}, credential)
+	if !ok || id != "alice:direct" {
+		t.Fatalf("Trojan authentication = (%v, %q)", ok, id)
+	}
+	if ok, _ := a.AuthenticateTrojan(&net.TCPAddr{}, strings.ToUpper(credential)); ok {
+		t.Fatal("uppercase Trojan credential was accepted")
+	}
+	a.UpdateUsers(map[string]config.UserConfig{
+		"alice": {Password: "changed", Routes: []string{"direct"}},
+	})
+	if ok, _ := a.AuthenticateTrojan(&net.TCPAddr{}, credential); ok {
+		t.Fatal("old Trojan credential remained active after refresh")
+	}
+}
+
+func trojanCredential(raw string) string {
+	sum := sha256.Sum224([]byte(raw))
+	return hex.EncodeToString(sum[:])
 }
 
 func TestAuthenticator_WrongPassword(t *testing.T) {

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
@@ -40,6 +41,15 @@ type ManagedNode struct {
 type ConfigState struct {
 	Revision       int64
 	ActiveRevision int64
+}
+
+// RuntimeSnapshot is the restart-applied topology and the revision it was read
+// from. All fields are read in one SQLite transaction so the process never
+// labels a mixed users/nodes view as a single active revision.
+type RuntimeSnapshot struct {
+	Users    map[string]config.UserConfig
+	Nodes    map[string]config.NodeConfig
+	Revision int64
 }
 
 // UserMonthlyUsage is the user-level tx/rx total within a natural month.
@@ -318,11 +328,11 @@ func (s *SQLiteStore) ReplaceLegacyUsers(cfg *config.Config, legacyToken func(st
 				continue
 			}
 			var count int
-			if err := tx.QueryRow(`SELECT COUNT(*) FROM managed_nodes WHERE name = ?`, route).Scan(&count); err != nil {
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM managed_nodes WHERE name = ? AND enabled = 1`, route).Scan(&count); err != nil {
 				return err
 			}
 			if count == 0 {
-				return fmt.Errorf("cannot replace users: user %q references node %q missing from managed nodes", username, route)
+				return fmt.Errorf("cannot replace users: user %q references missing or disabled node %q", username, route)
 			}
 		}
 	}
@@ -416,8 +426,8 @@ func (s *SQLiteStore) LoadRuntimeUsers() (map[string]config.UserConfig, error) {
 	return users, routeRows.Err()
 }
 
-// LoadNodes loads all enabled and disabled nodes. The caller decides which
-// snapshot is active; node changes only apply after Gateway restart.
+// LoadNodes loads enabled nodes for the startup snapshot. Node changes only
+// apply after Gateway restart.
 func (s *SQLiteStore) LoadNodes() (map[string]config.NodeConfig, error) {
 	rows, err := s.db.Query(`SELECT name, config_json FROM managed_nodes WHERE enabled = 1 ORDER BY name`)
 	if err != nil {
@@ -569,7 +579,11 @@ func (s *SQLiteStore) SetActiveRevision(revision int64) error {
 // GetUserMonthlyUsage returns persisted traffic totals for the supplied UTC
 // boundaries. In-memory deltas are added by TrafficLogger before enforcement.
 func (s *SQLiteStore) GetUserMonthlyUsage(start, end time.Time) (map[string][2]uint64, error) {
-	rows, err := s.db.Query(`SELECT user_id, COALESCE(SUM(tx_bytes), 0), COALESCE(SUM(rx_bytes), 0) FROM traffic_logs WHERE created_at >= ? AND created_at < ? GROUP BY user_id`, start.UTC().Unix(), end.UTC().Unix())
+	return s.GetUserMonthlyUsageContext(context.Background(), start, end)
+}
+
+func (s *SQLiteStore) GetUserMonthlyUsageContext(ctx context.Context, start, end time.Time) (map[string][2]uint64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT user_id, COALESCE(SUM(tx_bytes), 0), COALESCE(SUM(rx_bytes), 0) FROM traffic_logs WHERE created_at >= ? AND created_at < ? GROUP BY user_id`, start.UTC().Unix(), end.UTC().Unix())
 	if err != nil {
 		return nil, err
 	}

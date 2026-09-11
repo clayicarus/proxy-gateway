@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Field Notes: a small journal of walks, books and everyday observations.">
+  <title>Field Notes — A journal of ordinary days</title>
+  <style>
+    :root { color-scheme: light; --paper: #f7f5ee; --ink: #29352d; --muted: #677067; --line: #d9ddd1; --accent: #526748; }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 17px/1.75 Georgia, "Times New Roman", serif; }
+    a { color: inherit; text-underline-offset: .25em; }
+    a:hover { color: var(--accent); }
+    a:focus-visible { outline: 2px solid var(--accent); outline-offset: 5px; }
+    .wrap { max-width: 960px; margin: auto; padding: 0 28px; }
+    header { display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; align-items: center; padding: 30px 0; border-bottom: 1px solid var(--line); }
+    .brand { font-size: 22px; font-weight: bold; text-decoration: none; }
+    nav { display: flex; gap: 26px; font: 14px/1.5 system-ui, sans-serif; }
+    nav a { text-decoration: none; }
+    .intro { max-width: 670px; padding: 70px 0 56px; }
+    .eyebrow, time, .number, footer { color: var(--muted); font: 12px/1.6 system-ui, sans-serif; }
+    .eyebrow { letter-spacing: .15em; text-transform: uppercase; }
+    h1 { font-size: clamp(36px, 6vw, 58px); line-height: 1.12; font-weight: normal; letter-spacing: -.035em; margin: 20px 0; }
+    .intro p { max-width: 570px; color: var(--muted); }
+    .section-title { font: 13px/1.6 system-ui, sans-serif; text-transform: uppercase; letter-spacing: .1em; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+    article { display: grid; grid-template-columns: 100px 1fr; gap: 24px; padding: 32px 0; border-bottom: 1px solid var(--line); }
+    .number { padding-top: 6px; }
+    h2 { font-size: 28px; line-height: 1.3; font-weight: normal; margin: 5px 0 12px; }
+    article p { margin: 12px 0; max-width: 660px; }
+    aside { padding: 40px 0 48px; max-width: 660px; }
+    aside h2 { font-size: 24px; }
+    footer { padding: 22px 0 36px; border-top: 1px solid var(--line); }
+    @media (max-width: 560px) { .wrap { padding: 0 20px; } .intro { padding: 42px 0 30px; } article { grid-template-columns: 1fr; gap: 8px; } }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <a class="brand" href="#home">Field Notes.</a>
+      <nav aria-label="Main navigation"><a href="#journal">Journal</a><a href="#about">About</a></nav>
+    </header>
+    <main id="home">
+      <section class="intro" aria-labelledby="welcome">
+        <span class="eyebrow">An occasional journal</span>
+        <h1 id="welcome">A little more time<br>to notice things.</h1>
+        <p>Notes from quiet walks, books left open on the table, and the small details that make an ordinary day worth remembering.</p>
+      </section>
+      <section id="journal" aria-labelledby="journal-title">
+        <h2 class="section-title" id="journal-title">Recent entries</h2>
+        <article>
+          <span class="number">No. 03 / Walking</span>
+          <div>
+            <time datetime="2026-09-06">September 6, 2026</time>
+            <h2>The path beside the water</h2>
+            <p>The best part of an early walk is the stretch before the town is fully awake. At the bend in the path, the trees lean over the water and the sound of traffic disappears for a minute.</p>
+            <p>I took the longer way home. There was nothing particular to find, just the pleasure of seeing a familiar place at a different hour.</p>
+          </div>
+        </article>
+        <article>
+          <span class="number">No. 02 / Reading</span>
+          <div>
+            <time datetime="2026-08-24">August 24, 2026</time>
+            <h2>A place for unfinished books</h2>
+            <p>There is a small stack by the window: an old collection of essays, a book about gardens, and a novel with a postcard marking the middle. I like moving between them without a schedule.</p>
+            <p>Sometimes a few pages are enough. The rest of the afternoon can belong to whatever those pages brought to mind.</p>
+          </div>
+        </article>
+        <article>
+          <span class="number">No. 01 / At home</span>
+          <div>
+            <time datetime="2026-08-10">August 10, 2026</time>
+            <h2>Rain at the open window</h2>
+            <p>A brief afternoon shower changed the light in the room. I moved the plants closer to the window, made a pot of tea, and left the list of things to do where it was.</p>
+            <p>By evening the pavement was dry again. The room still smelled faintly of rain.</p>
+          </div>
+        </article>
+      </section>
+      <aside id="about" aria-labelledby="about-title">
+        <h2 id="about-title">About this little corner</h2>
+        <p>Field Notes is a place to keep observations that might otherwise be forgotten. New entries arrive when there is something to share. There is no schedule; you are welcome to stop by again.</p>
+      </aside>
+    </main>
+    <footer>© 2026 Field Notes. Made for slow reading.</footer>
+  </div>
+</body>
+</html>

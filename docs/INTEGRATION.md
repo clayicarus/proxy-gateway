@@ -1,53 +1,33 @@
 # Hysteria2 核心库集成说明
 
-本文记录 proxy-gateway 与 `github.com/apernet/hysteria/core/v2` 的当前集成契约，重点是认证 ID、请求路由上下文和流量回调。实际装配入口位于 `cmd/gateway/main.go`。
+本文记录 proxy-gateway 与仓库内固定的 `github.com/apernet/hysteria/core/v2` v2.8.1 fork 的当前集成契约，重点是 session 身份、请求路由和流量回调。实际装配入口位于 `cmd/gateway/main.go`。
 
 ## 接口映射
 
 | Hysteria2 接口 | 实现 | 责任 |
 |---|---|---|
-| `server.Authenticator` | `auth.Authenticator` | 解析 `username:node:password`，返回 `username:node` |
-| `server.Outbound` | `router.RoutingOutbound` | 从认证 ID 选择客户端明确指定的节点 |
-| `server.TrafficLogger` | `traffic.TrafficLogger` | 统计、自然月额度、下载限速和 stream 追踪 |
-| `server.EventLogger` | `event.EventLogger` | 请求上下文交接和活跃连接追踪 |
+| `server.SessionAuthenticator` | `inbound/hysteria2.Adapter` | 认证并创建由 Policy Kernel 持有的私有 session |
+| `server.SessionOutbound` | `inbound/hysteria2.Adapter` | 将不透明 session 交给 Policy Kernel 开启授权出站 |
+| `server.SessionTrafficLogger` | `inbound/hysteria2.Adapter` | 在既有 TCP/UDP 计量边界调用共享账本 |
+| `server.SessionEventLogger` | `inbound/hysteria2.Adapter` | 按 session/request ID 更新活跃连接追踪 |
 
-这些类型直接实现上游接口，并在代码中有编译期断言，不需要额外 adapter。
+只有 Hy2 adapter 实现上游接口，并在代码中有编译期断言；认证、出站选择、账本和追踪由协议无关的 Policy Kernel 统一持有。listener 生命周期由 `inbound.Manager` 管理。
 
 ## 启动装配
 
 运行配置先从 SQLite 加载，而不是从静态 YAML 用户和节点字段加载：
 
 ```go
-users, err := store.LoadRuntimeUsers()
-nodes, err := store.LoadNodes()
-
-authenticator := auth.NewAuthenticator(users, logger)
-trafficLogger := traffic.NewTrafficLoggerWithLocation(users, store, logger, location)
-routerEngine := router.NewRouter(users, logger)
-outboundFactory := router.NewOutboundFactory(nodes, logger)
+snapshot, err := store.LoadRuntimeSnapshot(context.Background())
+kernel := policy.New(snapshot.Users, snapshot.Nodes, store, logger, location)
 warmupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-_ = outboundFactory.Warmup(warmupCtx)
+_ = kernel.Warmup(warmupCtx)
 cancel()
-routingOutbound := router.NewRoutingOutbound(routerEngine, outboundFactory, logger)
-connectionTracker := connection.NewTracker()
-eventLogger := event.NewEventLogger(routingOutbound, logger, connectionTracker)
+service, err := hysteria2.NewService(inbound, certificate, kernel)
+inboundManager.Add(service)
 ```
 
-然后把实现直接交给 Hysteria2 server：
-
-```go
-server, err := hyServer.NewServer(&hyServer.Config{
-    TLSConfig: hyServer.TLSConfig{
-        Certificates: []tls.Certificate{certificate},
-    },
-    QUICConfig:    buildQUICConfig(cfg),
-    Conn:          udpConn,
-    Authenticator: authenticator,
-    Outbound:      routingOutbound,
-    TrafficLogger: trafficLogger,
-    EventLogger:   eventLogger,
-})
-```
+`cmd/gateway` 不再直接构造或调用 Hy2 server；`hysteria2.Service` 在内部完成 UDP bind、QUIC 配置和 server 装配，Manager 负责 `Start`、`Close` 与有界 `Wait`。
 
 TLS 证书由 `tls.LoadX509KeyPair` 从 YAML 指定的 `tls.cert` 与 `tls.key` 文件加载。
 
@@ -65,35 +45,26 @@ alice:node_tokyo:a-password-that-may:contain-colons
 - 密码匹配。
 - 用户启动快照授权了所选节点。
 
-返回的 ID 是 `alice:node_tokyo`。TrafficLogger、EventLogger 和 Router 都使用这个 ID，不应退化为仅用户名。
+返回的内部 route ID 是 `alice:node_tokyo`。adapter 只持有 Kernel 创建的不透明 session，不能自行构造 route ID、选择 outbound 或向任意用户记账。
 
-## 请求上下文交接
+## Session 请求绑定
 
-上游 `server.Outbound` 的 `TCP(reqAddr)` 和 `UDP(reqAddr)` 没有 ID 参数。当前 Hysteria2 请求处理顺序会先调用 EventLogger，再调用 Outbound：
+认证成功后 fork 为该 QUIC transport 建立私有 session。TCP/UDP 回调均携带 session、稳定 request ID 和目标地址：
 
 ```text
-TCPRequest(addr, id, target) -> TCP(target)
-UDPRequest(addr, id, sessionID, target) -> UDP(target)
+TCPContext(session, request ID, target) -> PolicyKernel.OpenTCP(session, target)
+UDPContext(session, request ID, target) -> PolicyKernel.OpenUDP(session, target)
 ```
 
-EventLogger 调用 `RoutingOutbound.SetRequestContext`，把协议、认证 ID、客户端地址和目标放入容量为 1 的 channel。Outbound 非阻塞取出下一项，并核对协议与目标：
-
-- 缺少上下文：返回错误。
-- 协议或目标不一致：返回错误。
-- ID 缺少节点：返回错误。
-- 节点不存在或拨号失败：返回错误。
-
-不能在这些错误上隐式回退到 `direct` 或另一个节点，否则会绕过客户端选择和用户授权。容量为 1 的交接会短暂串行化事件回调到 Outbound 的临界段，避免相同目标的并发请求交换用户身份；拨号和 relay 不在该临界段内。
-
-这是与上游实现时序耦合最强的部分。升级 Hysteria2 依赖时，应运行路由并发测试和真实端到端测试，并复核上游 TCP/UDP handler 的调用顺序。
+adapter 会拒绝未知 session；Kernel 会拒绝跨 Kernel 的 session、缺少节点、未授权节点、未知节点和拨号失败。不能在这些错误上隐式回退到 `direct` 或另一个节点，否则会绕过客户端选择和用户授权。请求身份不依赖 callback 的相对时序，因此相同目标的并发请求可以独立路由。
 
 ## 出站适配
 
-`OutboundFactory` 只提供内建 Direct 与数据库中的 Hysteria2 节点。Direct TCP 使用带 10 秒超时的标准 `net.Dialer`。Hysteria2 outbound 使用上游 `client.NewClient`，Gateway 自己管理每个节点的 eager 连接状态和重试生命周期。
+`outbound.OutboundFactory` 只提供内建 Direct 与数据库中的 Hysteria2 节点。Direct TCP 使用带 10 秒超时的标准 `net.Dialer`。Hysteria2 outbound 使用 fork 的 `client.NewClientContext`，Gateway 自己管理每个节点的 eager 连接状态和重试生命周期。
 
 启动时最多同时预连接 8 个节点，首轮预热最多等待 10 秒；节点失败互相隔离。请求路径只使用 Ready client，不可用时立即报错；后台以最长 60 秒的指数退避重连。每次尝试都以 3 秒超时重新查询 DNS，并依次尝试 A/AAAA 地址；连接到解析 IP 时仍将配置域名作为默认 SNI。Hy2 握手保留上游默认 5 秒超时。当前每节点一条活动 client 连接，不是连接池。
 
-UDP client 的 `HyUDPConn` 通过轻量 wrapper 适配为 `server.UDPConn` 的 `ReadFrom`、`WriteTo` 和 `Close` 签名。
+UDP client 的 `HyUDPConn` 通过轻量 wrapper 适配为协议无关 UDP association 的 `ReadFrom`、`WriteTo` 和 `Close` 签名；仅 adapter 将它暴露给 Hy2 server。
 
 ## 流量回调
 
@@ -102,13 +73,11 @@ TrafficLogger 的关键方法包括：
 ```go
 LogTraffic(id string, tx, rx uint64) bool
 LogOnlineState(id string, online bool)
-TraceStream(stream HyStream, stats *StreamStats)
-UntraceStream(stream HyStream)
 ```
 
 `LogTraffic` 将 ID 拆成 username/node 并累计流量。返回 false 会让上游关闭整个客户端连接，用于停用、到期和月额度超限。用户下载限速只作用于 `rx`，但同一用户所有节点和连接共享限速状态。
 
-`TraceStream` 与 `UntraceStream` 不是空实现：它们提供实时 stream 计数和速度数据。EventLogger 另行记录客户端源地址、所选节点和 TCP/UDP 目标，供本地管理后台展示。
+adapter 的 session/request 回调记录客户端源地址、所选节点和 TCP/UDP 目标，供本地管理后台展示；共享账本不再实现 Hy2 stream hook。
 
 ## 热刷新边界
 

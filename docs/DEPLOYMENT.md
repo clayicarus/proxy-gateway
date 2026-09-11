@@ -38,22 +38,21 @@ openssl req -new -x509 -key key.pem -out cert.pem -days 365 \
 创建 `/etc/proxy-gateway/gateway.yaml`：
 
 ```yaml
-listen: :8443
+inbounds:
+  - name: hy2-public
+    type: hysteria2
+    listen: :8443
+    # Optional QUIC parameters.
+    # quic:
+    #   maxIdleTimeout: 30s
+    #   maxIncomingStreams: 1024
 
 tls:
   cert: /etc/proxy-gateway/cert.pem
   key: /etc/proxy-gateway/key.pem
 
-# 可选，客户端需配置同一密码
-# obfs:
-#   type: salamander
-#   salamander:
-#     password: change_me
-
-# 可选的 QUIC 参数
-# quic:
-#   maxIdleTimeout: 30s
-#   maxIncomingStreams: 1024
+# obfs is unsupported and rejected at startup.
+# Hysteria2 masquerade is optional; see the website section below.
 
 admin:
   listen: "127.0.0.1:9090"
@@ -61,6 +60,7 @@ admin:
 sub:
   listen: "127.0.0.1:9091"
   publicURL: "https://sub.example.com/sub/"
+  inbound: hy2-public
   serverAddr: "gateway.example.com:8443"
   sni: "gateway.example.com"
   insecure: false
@@ -78,13 +78,76 @@ systemd:
 
 | 配置 | 协议 | 用途 |
 |---|---|---|
-| `listen: :8443` | UDP/QUIC | Hysteria2 客户端流量入口 |
+| `inbounds[].listen: :8443` | UDP/QUIC | 具名 Hysteria2 客户端流量入口 |
 | `admin.listen: 127.0.0.1:9090` | HTTP/TCP | 本地管理后台 |
 | `sub.listen: 127.0.0.1:9091` | HTTP/TCP | 订阅内容服务 |
 
-`sub.publicURL` 是后台展示给用户的订阅链接前缀；`sub.serverAddr` 是生成配置里代理连接 Gateway 的公网地址。订阅服务不是 QUIC 网站，也不处理 Gateway UDP 端口上的 `/sub` 路径。
+`sub.publicURL` 是后台展示给用户的订阅链接前缀；`sub.serverAddr` 是生成配置里代理连接 Gateway 的公网地址。订阅服务自身是独立 HTTP listener；通过网站入口提供 `/sub/` 时，需要像下方完整示例那样由网站源站明确转发到订阅服务。
 
-用户、节点和授权都在首次启动后通过后台创建。正常运行 YAML 不应包含 `users`、`nodes` 或 `fallback`。
+用户、节点和授权都在首次启动后通过后台创建。正常运行 YAML 不应包含顶层 `users`、`nodes` 或 `fallback`；网站回退必须配置在 `inbounds[].trojan.fallback` 下。
+
+### 入站伪装
+
+不配置 `masquerade` 时，Hysteria2 入站对所有非认证的 HTTP/3 请求返回 404。配置后，这些请求会被转发到一个固定的 web 后端：
+
+```yaml
+inbounds:
+  - name: hy2-public
+    type: hysteria2
+    listen: ":8443"
+    masquerade:
+      type: proxy
+      proxy:
+        url: http://127.0.0.1:8080
+        rewriteHost: true
+```
+
+要点：
+
+- 目前只实现 `type: proxy`。`url` 是配置里的固定值，永远不受请求内容影响，因此入站不会变成开放代理。
+- 建议指向本机源站（例如 `http://127.0.0.1:8080`），而不是绕回自己的公网域名：后者每次探测都要多一次公网 TLS 往返，而且当该域名解析到本机时可能形成环路。
+- `rewriteHost: true` 时后端看到自己的 hostname，适合按虚拟主机分发的后端；默认保留探测者发来的 Host。
+- Gateway 不会发送 `X-Forwarded-For`、`X-Forwarded-Host`、`X-Forwarded-Proto` 或 `Forwarded`，因为一个普通网站不会暴露前面还有代理。后端不可用时返回空的 502，不含任何代理错误信息。
+- 此配置只覆盖 Hysteria2 UDP 端口上的 HTTP/3；普通 HTTPS 使用下面的 Trojan TCP 网站回退。
+
+### Trojan HTTPS 网站回退
+
+在 Trojan 入口下启用可选的 `fallback`：
+
+```yaml
+inbounds:
+  - name: trojan-public
+    type: trojan
+    listen: ":443"
+    trojan:
+      fallback:
+        addr: 127.0.0.1:8080
+        probeTimeout: 1s
+        dialTimeout: 3s
+        timeout: 30s
+        maxConnections: 32
+```
+
+Gateway 终止 TLS 后，将无有效 Trojan 凭据的字节流按原顺序送到 `addr`。后端必须提供明文 HTTP/1.1；不接受 URL，不向后端再发起 TLS，也不根据请求 Host、路径或 SNI 选择后端。Host 与其他请求字节保持原样，源站应为站点域名提供服务，或像示例那样使用默认虚拟主机。不要把 `addr` 指回公网 Trojan listener。
+
+| 配置 | 默认值 | 有效范围与含义 |
+|---|---|---|
+| `probeTimeout` | `1s` | `50ms`–`10s`，TLS 成功后等待完整初始首部（凭据和请求）的窗口，同时受原始握手 deadline 限制 |
+| `dialTimeout` | `3s` | `50ms`–`30s`，后端拨号上限 |
+| `timeout` | `30s` | `1s`–`10m`，判定结束后拨号与转发的总时长 |
+| `maxConnections` | `32` | `1`–`65535`，等待判定与连接后端的匿名连接总上限 |
+
+按 [Trojan 官方规则](https://github.com/trojan-gfw/trojan/blob/3e7bb9aecdc694f9bcae8d646fae395f773d60f8/docs/protocol.md#L49)，完整初始请求结构与凭据必须同时有效才进入代理路径。格式错误、未知凭据、截断和读取超时共用判定窗口；即使凭据前缀正确，后续命令、地址或 CRLF 非法也会回退。已消费的最多 320 字节首部完整回放一次，再转发未读流。
+
+每条网站 TLS 连接的首次响应默认延迟约一秒；有效 Trojan 客户端也必须在这个窗口内发送完整首部，正确凭据前缀不会延长窗口。这些时间和资源上限是本地配置，官方协议不规定其数值。并发上限耗尽或后端无法连接时关闭连接。完整结构与凭据通过后，本地目标限制、拨号失败、策略拒绝及后续 UDP 分帧错误只关闭代理连接，不再回退。
+
+启用后 TLS ALPN 只声明 `http/1.1`，生成的 Trojan 订阅自动带 `alpn: [http/1.1]`。手动客户端使用相同设置，或不发送 ALPN；只支持 `h2` 的客户端无法协商。网站访问不创建用户代理会话，不计入用户流量、额度或限速；独立资源上限和停机清理覆盖匿名连接。
+
+完整示例见 [gateway-website.yaml](../configs/gateway-website.yaml)、[静态页面](../configs/masquerade-site/index.html) 和 [Nginx 源站配置](../configs/masquerade-nginx.conf)。将页面复制到 `/var/www/field-notes/index.html`，在 Nginx 的 `http` 上下文中包含源站配置，确认 Nginx 监听 `127.0.0.1:8080`。Gateway 同时占用 TCP 与 UDP 443，两个入口指向同一源站。修改示例中的域名、证书和数据文件路径后再启动 Gateway。
+
+源站配置通过 `Alt-Svc` 声明 UDP 443 的 HTTP/3；若公网端口或 NAT 映射不同，需要同步修改该响应头及订阅中的 `serverAddr`。同一源站还把 `/sub/` 转到 `127.0.0.1:9091`，因此 `sub.publicURL` 可使用 `https://gateway.example.com/sub/`。管理后台继续使用 loopback 和 SSH 转发。
+
+先用 `curl https://gateway.example.com/` 检查证书和网站；支持 HTTP/3 的 curl 可用 `curl --http3-only https://gateway.example.com/` 验证 UDP。随后从后台获取 token 订阅并测试 Trojan TCP/UDP。仓库内测试已覆盖使用受信任测试证书访问同一网站、经 HTTPS 获取订阅，以及按订阅建立代理连接。
 
 ## 4. systemd 部署
 
@@ -213,25 +276,56 @@ server {
 
 订阅 URL 形如 `https://sub.example.com/sub/<token>`。token 本身就是 bearer credential，不要记录在公共日志或页面。重置 token 后旧 URL 立即失效。
 
+同一 URL 可以同时发布 Hysteria2 与 Trojan。启用两个具名入站后，将单入口的 `sub.inbound/serverAddr/sni/insecure` 替换为以下列表；每项地址必须是客户端实际可达的地址，端口可与监听端口不同：
+
+```yaml
+sub:
+  listen: "127.0.0.1:9091"
+  publicURL: "https://sub.example.com/sub/"
+  endpoints:
+    - inbound: hy2-public
+      serverAddr: "gateway.example.com:8443"
+      sni: "gateway.example.com"
+    - inbound: trojan-public
+      serverAddr: "gateway.example.com:8443"
+      sni: "gateway.example.com"
+```
+
+完整配置见 [gateway-mixed.yaml](../configs/gateway-mixed.yaml)。仅发布 Trojan 时可使用 `sub.inbound: trojan-public` 和原有单入口字段；两种写法不能混用。入口名称、地址和 TLS 参数在重启时应用。Trojan 条目使用原始 `username:node:password` 并启用 UDP；不要将 SHA-224 填入客户端的 password 字段。
+
+Hysteria2 需要放行入口的 UDP 端口，Trojan 需要放行 TCP 端口，两者可共用数值端口。若 Trojan 占用 TCP 443，Nginx 不能再绑定同一地址的 TCP 443。可以为独立订阅 HTTPS 服务选择其他端口或 IP，也可采用上面的完整网站示例：由 Trojan 终止 TLS，Nginx 只监听 loopback HTTP，再把 `/sub/` 转发到订阅服务。
+
 ## 8. 旧配置迁移
 
 迁移前备份 YAML 和数据库，并停止 Gateway，确保命令使用与 service 完全相同的 `dbPath`：
 
 ```bash
 systemctl stop proxy-gateway.service
-sudo -u proxygateway /usr/local/bin/proxy-gateway migrate \
+sudo -u proxygateway /usr/local/bin/migrate \
   -c /etc/proxy-gateway/legacy-gateway.yaml
 systemctl start proxy-gateway.service
 ```
 
-旧 YAML 必须包含用户、节点，以及 `sub.secret` 或回退使用的 `api.secret`。迁移在一个事务中导入用户、节点、授权，并保存旧 HMAC token 的哈希。数据库已有管理用户或已迁移时会拒绝覆盖。
+旧 YAML 必须包含用户、节点，以及 `sub.secret` 或回退使用的 `api.secret`。该命令只迁移管理数据：在一个事务中导入用户、节点、授权，并保存旧 HMAC token 的哈希。数据库已有管理用户或已迁移时会拒绝覆盖。
+
+随后从不含管理数据和 secret 的旧运行参数生成唯一运行时 schema，输出路径必须不存在：
+
+```bash
+sudo -u proxygateway /usr/local/bin/migrate-inbounds \
+  --input /etc/proxy-gateway/legacy-runtime.yaml \
+  --output /etc/proxy-gateway/gateway.yaml
+sudo -u proxygateway /usr/local/bin/validate-inbounds \
+  --input /etc/proxy-gateway/gateway.yaml
+```
+
+新运行时只接受具名 `inbounds`；旧顶层 `listen/quic/api` 和管理字段会明确拒绝。`obfs` 无数据面实现，迁移与运行时都拒绝。旧顶层 `masquerade` 的 `type: proxy` 会被迁移到 `inbounds[].masquerade`，迁移输出会提示它升级后开始生效；其他 masquerade 模式仍未实现，迁移会报错。
 
 如果数据库用户表已错误，需要以旧 YAML 完整重建用户和授权：
 
 ```bash
 systemctl stop proxy-gateway.service
 cp /var/lib/proxy-gateway/traffic.db /var/lib/proxy-gateway/traffic.db.backup
-sudo -u proxygateway /usr/local/bin/proxy-gateway migrate --replace-users \
+sudo -u proxygateway /usr/local/bin/migrate --replace-users \
   -c /etc/proxy-gateway/legacy-gateway.yaml
 systemctl start proxy-gateway.service
 ```

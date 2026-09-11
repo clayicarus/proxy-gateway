@@ -23,6 +23,8 @@
 
 ## 近期候选
 
+- [ ] 入站协议与策略内核重构：从 master 将 Hysteria2 封装为 adapter，统一 session、策略拨号、计量和生命周期；详见 [重构提案](INBOUND_POLICY_REFACTOR.md)
+- [ ] 在策略内核稳定后，以独立 adapter 交付 Trojan TCP/UDP；`9b93d10` 仅作为实现和测试参考
 - [ ] 流量明细保留策略：把历史 `traffic_logs` 聚合为日桶并删除过细记录
 - [ ] 数据库备份、恢复和完整性检查操作手册
 - [ ] 审计日志：记录管理员写操作，不记录用户明文密码或订阅 token

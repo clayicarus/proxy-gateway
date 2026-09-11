@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -142,16 +143,20 @@ func (s *SQLiteStore) migrateTrafficTimestamps() error {
 // FlushTraffic writes a batch of traffic deltas to the database.
 // It updates both the incremental log and the cumulative summary.
 func (s *SQLiteStore) FlushTraffic(records []TrafficRecord) error {
+	return s.FlushTrafficContext(context.Background(), records)
+}
+
+func (s *SQLiteStore) FlushTrafficContext(ctx context.Context, records []TrafficRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	insertLog, err := tx.Prepare(`
+	insertLog, err := tx.PrepareContext(ctx, `
 		INSERT INTO traffic_logs (user_id, node_id, tx_bytes, rx_bytes, created_at)
 		VALUES (?, ?, ?, ?, ?)
 	`)
@@ -160,13 +165,13 @@ func (s *SQLiteStore) FlushTraffic(records []TrafficRecord) error {
 	}
 	defer insertLog.Close()
 
-	upsertSummary, err := tx.Prepare(`
+	upsertSummary, err := tx.PrepareContext(ctx, `
 		INSERT INTO traffic_summary (user_id, node_id, tx_total, rx_total, updated_at)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(user_id, node_id) DO UPDATE SET
 			tx_total = tx_total + excluded.tx_total,
 			rx_total = rx_total + excluded.rx_total,
-			updated_at = excluded.updated_at
+			updated_at = MAX(updated_at, excluded.updated_at)
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare upsert summary: %w", err)
@@ -184,10 +189,10 @@ func (s *SQLiteStore) FlushTraffic(records []TrafficRecord) error {
 		}
 		ts = ts.UTC()
 		unixTime := ts.Unix()
-		if _, err := insertLog.Exec(r.UserID, r.NodeID, r.TxBytes, r.RxBytes, unixTime); err != nil {
+		if _, err := insertLog.ExecContext(ctx, r.UserID, r.NodeID, r.TxBytes, r.RxBytes, unixTime); err != nil {
 			return fmt.Errorf("insert log for %s/%s: %w", r.UserID, r.NodeID, err)
 		}
-		if _, err := upsertSummary.Exec(r.UserID, r.NodeID, r.TxBytes, r.RxBytes, unixTime); err != nil {
+		if _, err := upsertSummary.ExecContext(ctx, r.UserID, r.NodeID, r.TxBytes, r.RxBytes, unixTime); err != nil {
 			return fmt.Errorf("upsert summary for %s/%s: %w", r.UserID, r.NodeID, err)
 		}
 	}

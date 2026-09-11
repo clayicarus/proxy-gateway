@@ -17,7 +17,7 @@ import (
 
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"github.com/clayicarus/proxy-gateway/internal/connection"
-	"github.com/clayicarus/proxy-gateway/internal/router"
+	"github.com/clayicarus/proxy-gateway/internal/outbound"
 	"github.com/clayicarus/proxy-gateway/internal/storage"
 	"github.com/clayicarus/proxy-gateway/internal/subtoken"
 	"github.com/clayicarus/proxy-gateway/internal/systemd"
@@ -70,7 +70,7 @@ type dashboardData struct {
 
 // NodeStatusProvider supplies the runtime state of the restart-applied node snapshot.
 type NodeStatusProvider interface {
-	NodeStatuses() map[string]router.NodeStatus
+	NodeStatuses() map[string]outbound.NodeStatus
 }
 
 type managedNodeView struct {
@@ -86,6 +86,17 @@ type liveTraffic struct {
 	TxBytes uint64 `json:"txBytes"`
 	RxBytes uint64 `json:"rxBytes"`
 	Online  int32  `json:"online"`
+}
+
+func gatewayListenDisplay(cfg *config.Config) string {
+	if len(cfg.Inbounds) == 0 {
+		return cfg.Listen
+	}
+	values := make([]string, 0, len(cfg.Inbounds))
+	for _, inbound := range cfg.Inbounds {
+		values = append(values, inbound.Name+"="+inbound.Listen)
+	}
+	return strings.Join(values, ", ")
 }
 
 type liveStatus struct {
@@ -503,7 +514,7 @@ func (m *Manager) dashboard(w http.ResponseWriter, r *http.Request) {
 		MonthlyTotal:       monthlyTotal,
 		NodeEgressTotal:    nodeEgressTotal,
 		OnlineCount:        onlineCount,
-		GatewayListen:      m.cfg.Listen,
+		GatewayListen:      gatewayListenDisplay(m.cfg),
 		AdminListen:        adminListen,
 		SubscriptionListen: subscriptionListen,
 		DBPath:             m.cfg.DBPath,
@@ -521,7 +532,7 @@ func (m *Manager) dashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) nodeViews(nodes []storage.ManagedNode) []managedNodeView {
-	statuses := map[string]router.NodeStatus{}
+	statuses := map[string]outbound.NodeStatus{}
 	if m.nodeStatuses != nil {
 		statuses = m.nodeStatuses.NodeStatuses()
 	}
