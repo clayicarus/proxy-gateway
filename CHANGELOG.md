@@ -17,10 +17,15 @@
 ### Features
 
 - Trojan inbounds accept optional `trojan.fallback` to serve an HTTP/1.1 website
-  over the same TLS listener. Unknown, malformed and short credentials share a
-  configurable decision window, with lossless prefix replay, a fixed plaintext
-  backend and independent connection/time limits. Authenticated invalid commands
-  still close. Anonymous website traffic bypasses user policy and accounting.
+  over the same TLS listener, following official initial-request classification.
+  Both the complete request structure and credentials must pass before a proxy
+  session is issued. Malformed or incomplete headers fall back even with correct
+  credential prefixes, with lossless replay of up to 320 consumed header bytes
+  and the unread stream. The configurable probe window covers the entire header.
+  A fixed plaintext backend and independent connection/time limits bound website
+  traffic, which bypasses user policy, accounting and request tracking. Local
+  target rejection, dial failure, policy rejection and later UDP framing errors
+  after valid request classification close the proxy connection without fallback.
 - Fallback-enabled Trojan subscriptions advertise `alpn: [http/1.1]`. A complete
   website configuration, static page and loopback Nginx origin example serve
   ordinary HTTPS and Hysteria2 HTTP/3, with subscriptions available at `/sub/`.

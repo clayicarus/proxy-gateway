@@ -161,7 +161,7 @@ flowchart LR
 
 运行时 YAML 只接受唯一的 `inbounds` schema，保存启动前必须知道的参数：UDP/TLS/QUIC、每个入站的协议选项（Hysteria2 的 `masquerade`、Trojan 的握手与 UDP 上限及可选 `fallback`）、管理和订阅监听、SQLite 路径、自然月时区、流量 flush 周期和 systemd 设置。顶层旧字段 `listen`、`quic`、`api`、`users`、`nodes`、`obfs` 和 `masquerade` 不属于运行时 schema，会被严格解析拒绝；`masquerade` 已改为 `inbounds[].masquerade`。TLS 使用已有的证书和私钥文件，证书签发与续期由外部工具完成。
 
-可选的网站路径独立于用户代理路径：Hy2 将未认证 HTTP/3 请求交给固定网站反向代理；Trojan 在 TLS 后用统一窗口判定凭据失败，再向固定明文 HTTP/1.1 后端回放已消费的最多 58 字节并转发剩余流。Trojan 网站连接有独立并发、拨号和总时长限制，只声明 HTTP/1.1 ALPN，并由 `Close`/`Wait` 覆盖。匿名访问不取得用户 session，不进入路由、账本、额度或限速路径；已认证但命令非法仍关闭。
+可选的网站路径独立于用户代理路径：Hy2 将未认证 HTTP/3 请求交给固定网站反向代理；Trojan 在 TLS 后按官方规则校验完整初始请求结构和凭据，仅当两者均有效才进入代理路径。未知凭据、非法或不完整首部在统一窗口后回退，包括正确凭据后出现的格式错误；向固定明文 HTTP/1.1 后端回放已消费的最多 320 字节首部并转发剩余流。Trojan 网站连接有独立并发、拨号和总时长限制，只声明 HTTP/1.1 ALPN，并由 `Close`/`Wait` 覆盖。匿名访问不取得用户 session，不进入路由、账本、额度、限速或请求追踪；完整结构与凭据通过后的目标限制、拨号失败、策略拒绝及后续 UDP 分帧错误只关闭代理连接。
 
 SQLite 保存：
 

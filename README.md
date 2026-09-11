@@ -178,7 +178,7 @@ masquerade:
 - Gateway does not send `X-Forwarded-*` or `Forwarded`. An unavailable backend produces an empty 502 response.
 - This setting covers HTTP/3 on the Hysteria2 UDP port. Configure the separate Trojan fallback below for ordinary HTTPS over TCP.
 
-On a Trojan inbound, `trojan.fallback` forwards connections without valid credentials to a fixed plaintext HTTP/1.1 backend after TLS succeeds:
+On a Trojan inbound, `trojan.fallback` follows the [official Trojan classification rule](https://github.com/trojan-gfw/trojan/blob/3e7bb9aecdc694f9bcae8d646fae395f773d60f8/docs/protocol.md#L49): after TLS succeeds, only a complete, structurally valid request with valid credentials enters the proxy path. Other traffic goes to a fixed plaintext HTTP/1.1 backend:
 
 ```yaml
 trojan:
@@ -191,10 +191,11 @@ trojan:
 ```
 
 - `addr` is a fixed `host:port`, not a URL or TLS backend. Request bytes, including Host, are preserved; the client cannot select the destination. Point it at an HTTP origin, not Gateway's public TLS listener.
-- After TLS, credentials must arrive within `probeTimeout`, also bounded by the original handshake deadline. Unknown, malformed and short credentials share this decision window. Website visitors therefore wait about this long before the first response on each TLS connection; the default is one second. Already authenticated clients retain their original request deadline.
+- After TLS, the complete initial header, including credentials and request, must arrive within `probeTimeout`, also bounded by the original handshake deadline. Unknown credentials, malformed requests and incomplete headers share this decision window. Website visitors therefore wait about this long before the first response on each TLS connection; the default is one second. A matching credential prefix does not extend the window. These timing and resource limits are local configuration choices.
 - Gateway advertises only `http/1.1` through TLS ALPN. Generated Trojan subscriptions include `alpn: [http/1.1]` for this inbound. Manually configured clients should use the same setting; clients without ALPN also work. HTTP/2 translation is not provided.
 - `maxConnections` bounds anonymous connections, including the decision wait. `timeout` bounds the total backend dial and relay lifetime after that wait; `dialTimeout` additionally limits dialing. Defaults are shown above. Website traffic has no proxy user, quota or download limiter and is excluded from per-user accounting. Shutdown closes both sides and waits for relay completion.
-- Consumed credential bytes, including partial reads and timeouts, are replayed once and in order. Authenticated clients with invalid commands still close; backend failure also closes without a Gateway response. Omitting `fallback` retains the previous close-on-authentication-failure behavior.
+- All consumed initial-header bytes, at most 320, are replayed once and in order, followed by the unread stream. Invalid commands, addresses or CRLF, and truncated or timed-out headers also fall back when the credential prefix is correct.
+- Once the complete structure and credentials pass validation, local target rejection, dial failure, policy rejection or later UDP framing errors close the proxy connection. An unavailable website backend closes without a Gateway response. Omitting `fallback` retains close-on-failure behavior.
 
 The complete [website configuration](configs/gateway-website.yaml) serves the bundled [Field Notes page](configs/masquerade-site/index.html) on TCP and UDP port 443. For a local page demo, run this from the repository root:
 

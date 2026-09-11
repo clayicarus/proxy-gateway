@@ -178,7 +178,7 @@ masquerade:
 - Gateway 不发送 `X-Forwarded-*` 和 `Forwarded`，后端不可用时返回空的 502。
 - 此设置覆盖 Hysteria2 UDP 端口上的 HTTP/3。普通 HTTPS 使用 TCP，需要另行配置下面的 Trojan 回退。
 
-Trojan 入站的 `trojan.fallback` 会在 TLS 成功后，将无有效凭据的连接转交给固定的明文 HTTP/1.1 后端：
+Trojan 入站的 `trojan.fallback` 遵循 [Trojan 官方判定规则](https://github.com/trojan-gfw/trojan/blob/3e7bb9aecdc694f9bcae8d646fae395f773d60f8/docs/protocol.md#L49)：TLS 成功后，只有完整请求结构合法且凭据有效才进入代理路径，其他流量转交给固定的明文 HTTP/1.1 后端：
 
 ```yaml
 trojan:
@@ -191,10 +191,11 @@ trojan:
 ```
 
 - `addr` 是固定的 `host:port`，不能填写 URL 或 TLS 后端。包括 Host 在内的请求字节原样保留，客户端不能选择后端目标；应指向 HTTP 源站，不能指回 Gateway 的公网 TLS 入口。
-- TLS 成功后，凭据必须在 `probeTimeout` 内到达，且不能超过原有握手 deadline。未知凭据、格式错误和短首包共用这个判定窗口，因此网站每条 TLS 连接的首次响应会等待约一个窗口，默认一秒。已认证客户端仍可使用原有的请求解析时限。
+- TLS 成功后，包含凭据和请求的完整初始首部必须在 `probeTimeout` 内到达，且不能超过原有握手 deadline。未知凭据、非法请求和不完整首部共用这个判定窗口，因此网站每条 TLS 连接的首次响应会等待约一个窗口，默认一秒。正确的凭据前缀不会延长窗口。这些时限和资源上限属于本地配置选择。
 - TLS ALPN 只声明 `http/1.1`，该入口生成的 Trojan 订阅包含 `alpn: [http/1.1]`。手动配置客户端时应使用相同设置；不发送 ALPN 的客户端也可连接。不提供 HTTP/2 转换。
 - `maxConnections` 限制匿名连接数，包括等待判定的连接；`timeout` 限制判定结束后拨号与转发的总时长，`dialTimeout` 另行限制拨号耗时，默认值如上。网站流量不归属代理用户，不进入用户额度、下载限速和计费统计。停机关闭两端，并等待转发结束。
-- 已读取的凭据字节按顺序回放一次，部分读取和超时也不丢失数据。已认证但命令非法的连接仍会关闭；后端故障时关闭连接，不生成 Gateway 响应。省略 `fallback` 时保留认证失败即关闭的行为。
+- 已消费的全部初始首部最多 320 字节，按顺序回放一次，再转发未读流。错误命令、地址或 CRLF，以及截断或超时的首部，即使凭据前缀正确也会回退。
+- 完整结构与凭据校验通过后，本地目标拒绝、拨号失败、策略拒绝或后续 UDP 分帧错误只关闭代理连接。网站后端不可用时关闭连接，不生成 Gateway 响应。省略 `fallback` 时保留失败即关闭的行为。
 
 完整的[网站配置](configs/gateway-website.yaml)在 TCP 和 UDP 443 上提供同一份 [Field Notes 示例页面](configs/masquerade-site/index.html)。本地试用页面时，在仓库根目录运行：
 

@@ -526,7 +526,7 @@ S0 的能力实验与迁移工具可以单独交付；独立共享缺陷修复�
 
 本次仅登记 TODO，不修改当前账务、额度或限速实现；S0–S5 的 UDP 兼容事件和既有失败计量规则继续作为当前基线，后续通过独立变更实现本项。
 
-- [ ] **TODO-PROBE-01：严格遵循官方 Trojan 的初始请求判定规则，实现可选网站 fallback。**
+- [x] **TODO-PROBE-01：严格遵循官方 Trojan 的初始请求判定规则，实现可选网站 fallback。**
 
 约定修订（2026-09-11）：以 [Trojan 官方协议](https://github.com/trojan-gfw/trojan/blob/3e7bb9aecdc694f9bcae8d646fae395f773d60f8/docs/protocol.md#L49) 的 Valid Trojan Protocol / Other Protocols 规则为准。TLS 成功后，只有完整初始请求结构合法且凭据有效时才进入 Trojan 代理路径；否则启用 `inbounds[].trojan.fallback` 时将解密后的原始字节流交给固定后端。凭据正确不豁免请求格式校验，错误命令、地址、分隔符、截断或读取超时也必须回退。TLS 失败仍关闭；未配置 fallback 时保留关闭行为。
 
@@ -545,3 +545,5 @@ S0 的能力实验与迁移工具可以单独交付；独立共享缺陷修复�
 本约定同时限定 TODO-TRAFFIC-01 的归属边界：Trojan 初始请求必须通过完整结构和凭据校验才建立用户代理归属；被判为 Other Protocols 的流量不能仅因凭据片段命中而记入用户。
 
 部署参数、默认值和可替换的静态网站示例见 [DEPLOYMENT.md](DEPLOYMENT.md)。本项不改变认证代理请求的用户授权、出站选择和计量口径。
+
+验收（2026-09-11）：新增完整首部分类、最长首部及部分读取回放、完整首部 deadline、代理失败不回退和匿名流量不签发 session 的回归测试；`go test -race -count=1 -timeout=3m ./...`、`go vet ./...`、三个命令构建及双语 README/配置校验通过。

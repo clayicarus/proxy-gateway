@@ -31,7 +31,7 @@ func (f *fallback) release() { <-f.slots }
 // identity, route grant, traffic account or user quota. The backend is fixed by
 // configuration, and the slot is held during both classification and relay.
 func (s *Service) serveFallback(client, rawClient net.Conn, prefix []byte, probeDeadline time.Time) {
-	// Format errors, unknown credentials and incomplete headers share one
+	// Initial format errors, unknown credentials and incomplete headers share one
 	// decision deadline. The authentication lookup is not exposed as a distinct
 	// immediate error response or a separate gateway-generated response body.
 	if delay := time.Until(probeDeadline); delay > 0 {

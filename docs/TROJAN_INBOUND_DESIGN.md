@@ -11,7 +11,7 @@
 - Hysteria2 继续监听 UDP；Trojan 监听 TCP。因此两个入站可同用数值端口，例如 UDP `:443` 与 TCP `:443`。Trojan UDP ASSOCIATE 同样在这条 TCP/TLS 连接内传输，不额外监听 UDP。
 - Trojan 在 TLS 内只提交固定的 `SHA224(password)`，服务端不能从哈希中反解用户或节点。
 - 每条 Trojan 凭据绑定一个确定的 `username:node`。一个用户有多个授权节点时，客户端需要使用多个 Trojan 代理条目选择节点。
-- 默认认证失败即关闭；配置 `trojan.fallback` 后，TLS 成功但无有效凭据的连接会回退到固定 HTTP/1.1 源站。已认证但命令不支持时仍关闭。Hysteria2 的 `masquerade` 独立覆盖 UDP 上的 HTTP/3，两者可使用同一网站后端。
+- 默认无效初始请求关闭；配置 `trojan.fallback` 后，TLS 成功但完整请求结构或凭据无效的连接会回退到固定 HTTP/1.1 源站，包括正确凭据后出现的非法命令、地址、分隔符和截断。Hysteria2 的 `masquerade` 独立覆盖 UDP 上的 HTTP/3，两者可使用同一网站后端。
 - 现有节点和授权仍以启动快照为准，保存后必须重启；密码、停用、到期、额度和限速仍在约两秒内刷新。
 
 ## 配置契约
@@ -141,9 +141,13 @@ UDP association 使用同一账本，按 datagram 而不是按 chunk 准入：�
 
 `trojan.fallback.addr` 指向固定明文 HTTP/1.1 源站。TLS 在 Trojan listener 终止，只声明 `http/1.1` ALPN；不选择客户端请求中的 Host/SNI 作为目标，不建立用户代理 session，也不进入用户账本、额度和限速路径。
 
-凭据读取通过有界 tee 保留最多 58 字节，包括 EOF 和超时前的部分读取。未知凭据、格式错误与短首包统一等到 `probeTimeout` 窗口结束，再通过 `io.MultiReader` 回放已消费字节并继续转发未读流。有效凭据恢复原有的请求解析 deadline，非法命令仍关闭。网站回放保留客户端的写半关闭，以允许源站在请求发送完毕后返回响应。
+判定遵循 [Trojan 官方协议](https://github.com/trojan-gfw/trojan/blob/3e7bb9aecdc694f9bcae8d646fae395f773d60f8/docs/protocol.md#L49)：只有完整请求结构与凭据同时有效才进入用户代理路径。凭据和请求读取共用有界 tee，保留最多 320 字节，包括 EOF 和超时前的部分读取。未知凭据、非法初始请求和不完整首部统一等到 `probeTimeout` 窗口结束，再通过 `io.MultiReader` 回放已消费字节并继续转发未读流。窗口覆盖完整首部，并受原有握手总 deadline 限制；正确凭据前缀不延长窗口。网站回放保留客户端的写半关闭，以允许源站在请求发送完毕后返回响应。
+
+官方地址解析器将非空域名字节和任意 16 位端口视为结构合法。本地继续拒绝 CONNECT 零端口及不安全的域名字符，但将这些目标限制与首部结构错误分开：完整结构与凭据通过后只关闭代理路径。目标拨号失败、策略拒绝和后续 UDP 分帧错误也不转入网站；未通过完整结构校验的请求不调用用户认证、不创建代理 session。
 
 独立 `maxConnections` 覆盖分类等待与后端 relay；在释放握手槽位前取得网站槽位，防止创建无界等待连接。`dialTimeout` 限制拨号，`timeout` 限制判定结束后拨号与转发的总时长；根 context 取消立即中断等待和连接。后端登记到现有 registry，双向 relay 完全退出后才释放 handler。诊断仅记录事件与入口名，不记录首包、疑似凭据、请求路径或原始 TLS 错误。
+
+默认一秒判定窗口及上述资源上限是本地实现配置；官方协议不规定这些数值或相同的响应时延。
 
 默认值和部署方式见 [部署指南](DEPLOYMENT.md)。配置与单元测试覆盖短请求、超时后续读、错误凭据、准确回放、固定目标、半关闭、容量限制、有效客户端隔离、后端故障和停机。端到端测试使用完整运行时配置，验证 HTTPS/HTTP3 网站、通过网站入口取得订阅，以及按订阅配置完成 Hysteria2 TCP、Trojan TCP/UDP。
 

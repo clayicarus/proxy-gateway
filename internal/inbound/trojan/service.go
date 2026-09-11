@@ -207,11 +207,21 @@ func (s *Service) handle(rawClient net.Conn) {
 		if err := rawClient.SetReadDeadline(probeDeadline); err != nil {
 			return
 		}
-		// ReadCredential consumes at most 58 bytes. Preserve partial reads too,
-		// including data returned before EOF or the probe deadline.
-		reader = io.TeeReader(io.LimitReader(client, credentialLength+2), &prefix)
+		// Preserve every byte consumed by both initial-header parsers, including
+		// partial reads before EOF or the probe deadline, without reading payload.
+		reader = io.TeeReader(io.LimitReader(client, maxInitialHeaderSize), &prefix)
 	}
 	credential, err := ReadCredential(reader)
+	var request Request
+	var requestErr error
+	if err == nil && s.fallback != nil {
+		request, requestErr = ReadRequest(reader)
+		// Both the complete wire structure and credentials must be valid before
+		// issuing a proxy session. Local target restrictions are proxy failures.
+		if requestErr != nil && !errors.Is(requestErr, errInvalidTarget) {
+			err = requestErr
+		}
+	}
 	var session *policy.Session
 	var authenticated bool
 	if err == nil {
@@ -228,13 +238,10 @@ func (s *Service) handle(rawClient net.Conn) {
 		}
 		return
 	}
-	// A valid credential retains the original full handshake/request budget.
-	// Invalid commands from an authenticated client are never sent to the website.
-	if err := rawClient.SetReadDeadline(deadline); err != nil {
-		return
+	if s.fallback == nil {
+		request, requestErr = ReadRequest(reader)
 	}
-	request, err := ReadRequest(client)
-	if err != nil {
+	if requestErr != nil {
 		return
 	}
 	if err := rawClient.SetDeadline(time.Time{}); err != nil {

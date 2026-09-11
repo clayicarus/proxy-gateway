@@ -10,7 +10,8 @@ import (
 // TrojanFallbackConfig describes a fixed plaintext HTTP/1.1 backend. TLS is
 // terminated by the Trojan listener, which advertises http/1.1 when enabled.
 type TrojanFallbackConfig struct {
-	Addr           string        `yaml:"addr"`
+	Addr string `yaml:"addr"`
+	// ProbeTimeout bounds the entire initial Trojan header after TLS succeeds.
 	ProbeTimeout   time.Duration `yaml:"probeTimeout,omitempty"`
 	DialTimeout    time.Duration `yaml:"dialTimeout,omitempty"`
 	Timeout        time.Duration `yaml:"timeout,omitempty"`

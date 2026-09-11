@@ -105,6 +105,35 @@ func TestReadRequestAcceptsNominalUDPAssociate(t *testing.T) {
 	}
 }
 
+func TestReadRequestSeparatesStructureFromTargetValidation(t *testing.T) {
+	cases := []struct {
+		name   string
+		header []byte
+		want   error
+	}{
+		{"zero port", []byte{commandConnect, addressIPv4, 127, 0, 0, 1, 0, 0, '\r', '\n'}, ErrInvalidPort},
+		{"domain with colon", []byte{commandConnect, addressDomain, 3, 'a', ':', 'b', 0, 80, '\r', '\n'}, ErrInvalidAddress},
+		{"domain with NUL", []byte{commandConnect, addressDomain, 3, 'a', 0, 'b', 0, 80, '\r', '\n'}, ErrInvalidAddress},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := ReadRequest(bytes.NewReader(test.header))
+			if !errors.Is(err, errInvalidTarget) || !errors.Is(err, test.want) {
+				t.Fatalf("complete header error = %v, want a target validation error", err)
+			}
+			for _, malformed := range [][]byte{
+				test.header[:len(test.header)-1],
+				append(append([]byte{}, test.header[:len(test.header)-2]...), '\n', '\n'),
+			} {
+				_, err := ReadRequest(bytes.NewReader(malformed))
+				if err == nil || errors.Is(err, errInvalidTarget) {
+					t.Fatalf("malformed header error = %v, want a structural error", err)
+				}
+			}
+		})
+	}
+}
+
 func TestUDPPacketRoundTrip(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -174,6 +203,8 @@ func TestReadPacketRejectsInvalidPackets(t *testing.T) {
 		{name: "truncated payload", data: []byte{addressIPv4, 127, 0, 0, 1, 0, 53, 0, 4, '\r', '\n', 'a'}},
 		{name: "truncated header", data: []byte{addressIPv4, 127, 0, 0, 1, 0}},
 		{name: "empty domain", data: []byte{addressDomain, 0, 0, 53, 0, 1, '\r', '\n', 'a'}},
+		{name: "domain with colon", data: []byte{addressDomain, 3, 'a', ':', 'b', 0, 53, 0, 1, '\r', '\n', 'a'}},
+		{name: "domain with NUL", data: []byte{addressDomain, 3, 'a', 0, 'b', 0, 53, 0, 1, '\r', '\n', 'a'}},
 	}
 	buffer := make([]byte, MaxUDPPayloadSize)
 	for _, test := range tests {

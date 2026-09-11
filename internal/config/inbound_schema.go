@@ -64,7 +64,7 @@ type TrojanInboundConfig struct {
 	// UDPIdleTimeout reclaims a UDP association that saw no datagram in either
 	// direction. It is not a TCP CONNECT idle timeout.
 	UDPIdleTimeout time.Duration `yaml:"udpIdleTimeout,omitempty"`
-	// Fallback serves unauthenticated TLS connections through a fixed HTTP/1.1 backend.
+	// Fallback serves other TLS protocols through a fixed HTTP/1.1 backend.
 	Fallback *TrojanFallbackConfig `yaml:"fallback,omitempty"`
 }
 
