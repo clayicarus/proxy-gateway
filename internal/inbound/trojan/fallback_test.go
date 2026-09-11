@@ -26,7 +26,7 @@ import (
 func websiteOptions(address string) *config.TrojanInboundConfig {
 	return &config.TrojanInboundConfig{Fallback: &config.TrojanFallbackConfig{
 		Addr: address, ProbeTimeout: 100 * time.Millisecond,
-		DialTimeout: 100 * time.Millisecond, Timeout: 2 * time.Second, MaxConnections: 4,
+		DialTimeout: 100 * time.Millisecond, IdleTimeout: 2 * time.Second, MaxConnections: 4,
 	}}
 }
 
@@ -108,7 +108,6 @@ func TestFallbackServesShortHTTPRequestAndNegotiatesHTTP1(t *testing.T) {
 	if client.ConnectionState().NegotiatedProtocol != "http/1.1" {
 		t.Fatal("browser ALPN does not match the plaintext HTTP/1.1 backend")
 	}
-	started := time.Now()
 	// This complete HTTP/1.0 request is shorter than the Trojan credential.
 	if _, err := io.WriteString(client, "GET / HTTP/1.0\r\n\r\n"); err != nil {
 		t.Fatal(err)
@@ -117,8 +116,42 @@ func TestFallbackServesShortHTTPRequestAndNegotiatesHTTP1(t *testing.T) {
 	if status != http.StatusOK || body != "<html>Field Notes</html>" {
 		t.Fatal("short HTTP request did not receive the configured website")
 	}
-	if time.Since(started) < 70*time.Millisecond {
-		t.Fatal("incomplete credential did not use the common probe decision window")
+	assertNoProxyActivity(t, kernel)
+}
+
+// Once a first flight is long enough to classify, the gateway must forward it
+// without waiting out the probe window: every outcome is answered by the origin,
+// so a gateway-side delay would only add latency to real page loads. An ordinary
+// browser request exceeds the credential length, so it is classified on arrival.
+// The probe timeout here is far larger than the assertion window, so a
+// reintroduced wait fails the test instead of merely slowing it down.
+func TestFallbackForwardsClassifiedRequestWithoutProbeWindowDelay(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "<html>Field Notes</html>")
+	}))
+	defer backend.Close()
+	options := websiteOptions(backend.Listener.Addr().String())
+	options.HandshakeTimeout = 30 * time.Second
+	options.Fallback.ProbeTimeout = 10 * time.Second
+	service, kernel := startService(t, options)
+	client := dialService(t, service)
+	if err := client.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	request := "GET / HTTP/1.1\r\nHost: example.com\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+	if len(request) <= credentialLength {
+		t.Fatalf("test request of %d bytes cannot be classified on arrival", len(request))
+	}
+	started := time.Now()
+	if _, err := io.WriteString(client, request); err != nil {
+		t.Fatal(err)
+	}
+	status, body := readWebsiteResponse(t, client)
+	if status != http.StatusOK || body != "<html>Field Notes</html>" {
+		t.Fatal("website request was not served")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("website response took %v; the gateway added a probe-window delay", elapsed)
 	}
 	assertNoProxyActivity(t, kernel)
 }
@@ -154,14 +187,10 @@ func assertFallbackReplay(t *testing.T, payload []byte) {
 	if err := client.SetDeadline(time.Now().Add(4 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	started := time.Now()
 	if _, err := client.Write(payload); err != nil {
 		t.Fatal(err)
 	}
 	assertOriginReplay(t, client, received, payload)
-	if time.Since(started) < 70*time.Millisecond {
-		t.Fatal("invalid initial request bypassed the common probe decision window")
-	}
 	if err := service.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -518,8 +547,14 @@ func TestFallbackCapacityIsSeparateFromAuthenticatedConnections(t *testing.T) {
 	if err := second.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := second.Read(make([]byte, 1)); err == nil {
-		t.Fatal("website connection limit was ignored")
+	// Exhaustion must not close in silence: that is the fingerprint the fallback
+	// removes, and a probe can cause exhaustion on demand.
+	status, body := readWebsiteResponse(t, second)
+	if status != http.StatusNotFound {
+		t.Fatalf("over-capacity status = %d, want 404", status)
+	}
+	if body != "" {
+		t.Fatalf("over-capacity body = %q, want no body", body)
 	}
 	valid := dialService(t, service)
 	payload := []byte("authenticated traffic")
@@ -544,8 +579,101 @@ func TestFallbackCapacityIsSeparateFromAuthenticatedConnections(t *testing.T) {
 	}
 }
 
+// A TLS connection that never sends a request must not cost a website slot or an
+// origin connection. Otherwise one handshake buys the full relay lifetime of
+// both, and a handful of silent connections locks real visitors out.
+func TestFallbackSilentConnectionCostsNoSlotOrOrigin(t *testing.T) {
+	accepted := make(chan struct{}, 4)
+	address := startRawWebsite(t, func(connection net.Conn) {
+		accepted <- struct{}{}
+		_, _ = io.Copy(io.Discard, connection)
+	})
+	options := websiteOptions(address)
+	options.Fallback.MaxConnections = 1
+	options.Fallback.IdleTimeout = 10 * time.Second
+	service, kernel := startService(t, options)
+
+	silent := dialService(t, service)
+	if err := silent.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	if err := silent.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// The gateway closes it once the probe window expires without a request.
+	if _, err := silent.Read(make([]byte, 1)); err == nil {
+		t.Fatal("silent probe was served instead of closed")
+	}
+	select {
+	case <-accepted:
+		t.Fatal("silent probe reached the origin")
+	default:
+	}
+	if occupied := len(service.fallback.slots); occupied != 0 {
+		t.Fatalf("silent probe held %d website slots", occupied)
+	}
+
+	// The single slot is still free for a real visitor.
+	visitor := dialService(t, service)
+	if _, err := io.WriteString(visitor, strings.Repeat("x", credentialLength)+"\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("website capacity was consumed by the silent probe")
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertNoProxyActivity(t, kernel)
+}
+
+// The website lifetime bound is idle, not absolute: a visitor that keeps
+// transferring must never be cut off. The transfer here lasts several times the
+// idle bound while no single gap approaches it, so an absolute deadline would
+// truncate the stream.
+func TestFallbackIdleTimeoutExtendsWithTransfers(t *testing.T) {
+	const chunks = 8
+	const chunk = "chunk"
+	address := startRawWebsite(t, func(connection net.Conn) {
+		_, _ = connection.Read(make([]byte, maxInitialHeaderSize))
+		for i := 0; i < chunks; i++ {
+			time.Sleep(200 * time.Millisecond)
+			if _, err := io.WriteString(connection, chunk); err != nil {
+				return
+			}
+		}
+	})
+	options := websiteOptions(address)
+	options.Fallback.IdleTimeout = time.Second
+	service, kernel := startService(t, options)
+	client := dialService(t, service)
+	if err := client.SetDeadline(time.Now().Add(20 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if _, err := io.WriteString(client, strings.Repeat("x", credentialLength)+"\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	body := make([]byte, chunks*len(chunk))
+	if _, err := io.ReadFull(client, body); err != nil {
+		t.Fatalf("idle deadline interrupted an active transfer: %v", err)
+	}
+	if string(body) != strings.Repeat(chunk, chunks) {
+		t.Fatalf("transfer = %q", body)
+	}
+	if elapsed := time.Since(started); elapsed <= options.Fallback.IdleTimeout {
+		t.Fatalf("transfer finished in %v, which does not outlive the idle bound", elapsed)
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertNoProxyActivity(t, kernel)
+}
+
 func TestFallbackLifetimeAndShutdown(t *testing.T) {
-	for _, mode := range []string{"timeout", "shutdown", "pending probe shutdown"} {
+	for _, mode := range []string{"timeout", "shutdown", "shutdown during classification"} {
 		t.Run(mode, func(t *testing.T) {
 			accepted, closed := make(chan struct{}), make(chan struct{})
 			address := startRawWebsite(t, func(connection net.Conn) {
@@ -554,22 +682,31 @@ func TestFallbackLifetimeAndShutdown(t *testing.T) {
 				close(closed)
 			})
 			options := websiteOptions(address)
-			options.Fallback.Timeout = time.Second
-			if mode == "pending probe shutdown" {
+			options.Fallback.IdleTimeout = time.Second
+			classifying := mode == "shutdown during classification"
+			if classifying {
+				// Keep the header read blocked so shutdown lands before the
+				// connection is ever classified.
+				options.HandshakeTimeout = 30 * time.Second
 				options.Fallback.ProbeTimeout = 10 * time.Second
 			}
 			service, _ := startService(t, options)
 			client := dialService(t, service)
-			if _, err := io.WriteString(client, strings.Repeat("x", credentialLength)+"\r\n"); err != nil {
+			header := strings.Repeat("x", credentialLength) + "\r\n"
+			if classifying {
+				header = "abc123"
+			}
+			if _, err := io.WriteString(client, header); err != nil {
 				t.Fatal(err)
 			}
-			if mode == "pending probe shutdown" {
-				deadline := time.Now().Add(time.Second)
-				for len(service.fallback.slots) == 0 && time.Now().Before(deadline) {
-					time.Sleep(time.Millisecond)
-				}
-				if len(service.fallback.slots) == 0 {
-					t.Fatal("probe did not enter the bounded classification wait")
+			if classifying {
+				// No observable signal exists mid-read; a short settle is enough
+				// because the assertions below hold wherever the handler is.
+				time.Sleep(50 * time.Millisecond)
+				select {
+				case <-accepted:
+					t.Fatal("an unclassified connection reached the origin")
+				default:
 				}
 			} else {
 				select {
@@ -601,12 +738,18 @@ func TestFallbackLifetimeAndShutdown(t *testing.T) {
 			if err := service.Wait(ctx); err != nil {
 				t.Fatalf("website handler did not drain: %v", err)
 			}
-			if mode != "pending probe shutdown" {
+			if classifying {
 				select {
-				case <-closed:
-				case <-time.After(time.Second):
-					t.Fatal("website backend connection was left open")
+				case <-accepted:
+					t.Fatal("shutdown during classification still dialed the origin")
+				default:
 				}
+				return
+			}
+			select {
+			case <-closed:
+			case <-time.After(time.Second):
+				t.Fatal("website backend connection was left open")
 			}
 		})
 	}
