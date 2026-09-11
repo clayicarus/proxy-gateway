@@ -526,18 +526,22 @@ S0 的能力实验与迁移工具可以单独交付；独立共享缺陷修复�
 
 本次仅登记 TODO，不修改当前账务、额度或限速实现；S0–S5 的 UDP 兼容事件和既有失败计量规则继续作为当前基线，后续通过独立变更实现本项。
 
-- [x] **TODO-PROBE-01：为 Trojan TCP 入站实现可选 fallback，使认证失败的连接交由固定网站处理。**
+- [ ] **TODO-PROBE-01：严格遵循官方 Trojan 的初始请求判定规则，实现可选网站 fallback。**
 
-实现记录（2026-09-11）：`inbounds[].trojan.fallback` 显式启用 TCP 网站回退；默认行为仍是认证失败即关闭。TLS 成功后，凭据读取失败或不匹配的连接可进入固定 HTTP/1.1 源站。TLS 失败，以及已认证但命令非法的连接仍关闭。
+约定修订（2026-09-11）：以 [Trojan 官方协议](https://github.com/trojan-gfw/trojan/blob/3e7bb9aecdc694f9bcae8d646fae395f773d60f8/docs/protocol.md#L49) 的 Valid Trojan Protocol / Other Protocols 规则为准。TLS 成功后，只有完整初始请求结构合法且凭据有效时才进入 Trojan 代理路径；否则启用 `inbounds[].trojan.fallback` 时将解密后的原始字节流交给固定后端。凭据正确不豁免请求格式校验，错误命令、地址、分隔符、截断或读取超时也必须回退。TLS 失败仍关闭；未配置 fallback 时保留关闭行为。
 
-已实现的契约与验收：
+实施契约与验收：
 
-- 有界 tee 保留 `ReadCredential` 消费的最多 58 字节，包括 EOF/超时前的部分读取；`io.MultiReader` 按顺序回放一次，再转发未读取的流。测试比较完整首包和后续大块数据，并验证客户端写半关闭后仍能收到源站响应。
-- 短于 58 字节的完整 HTTP 请求、部分 HTTP 请求读取超时后再继续发送，均有真实 TLS 回归测试。有效凭据恢复原有命令解析 deadline；已认证但命令非法不会送入网站。
-- 格式非法、凭据不匹配和长度不足均等到同一个 `probeTimeout` deadline 再拨号，Gateway 不为不同失败生成不同响应。凭据索引使用散列查找，没有新增逐字符密码比较；失败查询在共同等待窗口内完成。默认一秒判定窗口会增加网站首响应时延，实际调度、源站响应、容量耗尽和 TLS 失败不承诺恒定时延。
+- 有界 tee 保留凭据和请求解析器消费的全部首部，最长为 320 字节：56 字节哈希、CRLF、CMD、ATYP、最长域名地址、端口及末尾 CRLF。EOF/超时前的部分读取也要保留；按顺序回放一次，再转发未读流。验证正确凭据后的非法命令、各类地址、末尾分隔符和最长首部均不丢失字节，并保留写半关闭后的源站响应。
+- `probeTimeout` 约束完整初始首部，同时受原有 TLS/握手总 deadline 限制；不能仅凭凭据前缀正确就延长该窗口。覆盖窗口内分段到达的有效请求、短 HTTP 请求、凭据或请求头截断/超时，以及超时后继续发送的剩余字节。
+- 请求结构校验通过后才验证凭据并取得用户代理 session。未知凭据和非法初始请求均按 Other Protocols 处理，使用相同判定窗口，不产生不同的 Gateway 响应。默认一秒窗口及并发、拨号和连接寿命上限属于资源配置，官方协议不规定其数值；不将它们宣称为官方实现的时延复刻。
+- 按官方 [SOCKS5 地址解析器](https://github.com/trojan-gfw/trojan/blob/3e7bb9aecdc694f9bcae8d646fae395f773d60f8/src/proto/socks5address.cpp) 区分结构校验与目标限制：CONNECT 零端口及非空域名中的特殊字符不属于首部结构错误。本地可继续拒绝这些目标，但必须先验证完整结构与凭据；凭据有效时关闭代理路径，不能回退到网站，凭据无效时仍原样回退。
 - TLS 仅声明 `http/1.1`，固定后端必须提供明文 HTTP/1.1。生成的 Trojan 订阅同步输出 `alpn: [http/1.1]`，普通入口保持原有 ALPN 行为；不实现 HTTP/2 转换或按 SNI 选择后端。
-- 无归属流量不取得用户代理 session，不进入路由、账本、额度或限速。独立 `maxConnections` 覆盖等待和 relay，在释放握手槽位前取得网站槽位；`dialTimeout` 与 `timeout` 限制后端拨号及连接总时长。后端登记到现有 registry，`Close`/`Wait` 等待双向 relay 结束。日志仅记录固定事件与入口名。
+- 回退流量不取得用户代理 session，不进入路由、账本、额度、限速、在线状态或请求追踪。独立 `maxConnections` 覆盖等待和 relay，在释放握手槽位前取得网站槽位；`dialTimeout` 与 `timeout` 限制后端拨号及连接总时长。后端登记到现有 registry，`Close`/`Wait` 等待双向 relay 结束。日志仅记录固定事件与入口名。
+- 完整首部与凭据校验成功后，目标拨号失败、策略拒绝或后续 UDP 分帧错误属于已建立代理路径的失败，只关闭代理连接，不把代理首部或有效负载改送网站。
 - 后端只使用配置中的固定 `addr`，请求 Host、绝对 URL 或 SNI 不能改变目标。测试覆盖后端不可用、日志脱敏、并发上限、有效客户端与匿名容量隔离、超时及判定/转发期间停机。
-- `test/e2e/subscription_test.go` 使用运行时 YAML、SQLite token 和受信任测试证书，验证同一静态网站的 HTTPS 与 HTTP/3 访问、通过 HTTPS 网站入口下载订阅，以及启用/关闭回退时按订阅完成 Hysteria2 TCP 和 Trojan TCP/UDP。全仓库 `go test -race ./...` 通过。
+- 保留 `test/e2e/subscription_test.go` 对运行时 YAML、SQLite token、受信任证书、HTTPS/HTTP3 网站、订阅下载以及 Hysteria2 TCP 和 Trojan TCP/UDP 的验证，并补充上述官方判定边界回归；实现完成后重新执行全仓库竞态测试。
+
+本约定同时限定 TODO-TRAFFIC-01 的归属边界：Trojan 初始请求必须通过完整结构和凭据校验才建立用户代理归属；被判为 Other Protocols 的流量不能仅因凭据片段命中而记入用户。
 
 部署参数、默认值和可替换的静态网站示例见 [DEPLOYMENT.md](DEPLOYMENT.md)。本项不改变认证代理请求的用户授权、出站选择和计量口径。
