@@ -2,13 +2,16 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"maps"
+	"math"
 	"mime"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"github.com/clayicarus/proxy-gateway/internal/storage"
@@ -24,15 +27,32 @@ type DatabaseSubscriptionHandler struct {
 	activeRoutes map[string][]string
 	nodes        map[string]config.NodeConfig
 	logger       *zap.Logger
+	traffic      subscriptionTrafficFlusher
+	now          func() time.Time
+	location     *time.Location
+}
+
+type subscriptionTrafficFlusher interface {
+	FlushContext(context.Context) error
 }
 
 // NewDatabaseSubscriptionHandler serves the restart-applied node and route
 // snapshot. User lifecycle fields and credentials are intentionally looked up
 // live, so a password reset, expiry, or soft delete does not need a restart.
-func NewDatabaseSubscriptionHandler(cfg *config.Config, store *storage.SQLiteStore, users map[string]config.UserConfig, nodes map[string]config.NodeConfig, logger *zap.Logger) *DatabaseSubscriptionHandler {
+func NewDatabaseSubscriptionHandler(cfg *config.Config, store *storage.SQLiteStore, users map[string]config.UserConfig, nodes map[string]config.NodeConfig, logger *zap.Logger, traffic ...subscriptionTrafficFlusher) *DatabaseSubscriptionHandler {
 	activeRoutes := make(map[string][]string, len(users))
 	for username, user := range users {
 		activeRoutes[username] = append([]string(nil), user.Routes...)
+	}
+	location := time.UTC
+	if cfg.Timezone != "" {
+		if configured, err := time.LoadLocation(cfg.Timezone); err == nil {
+			location = configured
+		}
+	}
+	var trafficFlusher subscriptionTrafficFlusher
+	if len(traffic) > 0 {
+		trafficFlusher = traffic[0]
 	}
 	return &DatabaseSubscriptionHandler{
 		cfg:          cfg,
@@ -40,6 +60,9 @@ func NewDatabaseSubscriptionHandler(cfg *config.Config, store *storage.SQLiteSto
 		activeRoutes: activeRoutes,
 		nodes:        maps.Clone(nodes),
 		logger:       logger,
+		traffic:      trafficFlusher,
+		now:          time.Now,
+		location:     location,
 	}
 }
 
@@ -129,6 +152,27 @@ func (h *DatabaseSubscriptionHandler) handle(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "subscription has no active routes", http.StatusServiceUnavailable)
 		return
 	}
+	if h.traffic != nil {
+		if err := h.traffic.FlushContext(r.Context()); err != nil {
+			h.logger.Error("subscription traffic flush failed", zap.Error(err))
+			http.Error(w, "subscription usage is unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	}
+	now := h.now()
+	start, end := subscriptionMonthRange(now, h.location)
+	tx, rx, err := h.store.GetUserMonthlyProxyUsage(user.Username, start, end)
+	if err != nil {
+		h.logger.Error("subscription usage lookup failed", zap.String("user", user.Username), zap.Error(err))
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	templateProxy := data.Proxies[0]
+	expiryProxy := templateProxy
+	expiryProxy.Name = uniqueProxyName(subscriptionExpiryLabel(user.ExpiresAt, now), usedNames)
+	usageProxy := templateProxy
+	usageProxy.Name = uniqueProxyName("本月已用流量："+formatSubscriptionBytes(tx+rx), usedNames)
+	data.Proxies = append(data.Proxies, expiryProxy, usageProxy)
 	body, err := renderManagedSubscription(data)
 	if err != nil {
 		h.logger.Error("render managed subscription", zap.Error(err))
@@ -138,11 +182,14 @@ func (h *DatabaseSubscriptionHandler) handle(w http.ResponseWriter, r *http.Requ
 	w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": user.Username + ".yaml"}))
 	w.Header().Set("Profile-Update-Interval", "24")
-	// The standard header has no tx+rx notion. It is supplied as an advisory
-	// total while Gateway remains the enforcement authority.
+	userinfo := []string{fmt.Sprintf("upload=%d", tx), fmt.Sprintf("download=%d", rx)}
 	if user.MonthlyBytes > 0 {
-		w.Header().Set("Subscription-Userinfo", fmt.Sprintf("upload=0; download=0; total=%d", user.MonthlyBytes))
+		userinfo = append(userinfo, fmt.Sprintf("total=%d", user.MonthlyBytes))
 	}
+	if user.ExpiresAt != nil {
+		userinfo = append(userinfo, fmt.Sprintf("expire=%d", user.ExpiresAt.Unix()))
+	}
+	w.Header().Set("Subscription-Userinfo", strings.Join(userinfo, "; "))
 	_, _ = w.Write(body)
 }
 
@@ -152,6 +199,41 @@ type subscriptionEndpoint struct {
 	Server string
 	Port   int
 	ALPN   []string
+}
+
+func subscriptionMonthRange(now time.Time, location *time.Location) (time.Time, time.Time) {
+	local := now.In(location)
+	start := time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, location)
+	return start.UTC(), start.AddDate(0, 1, 0).UTC()
+}
+
+func subscriptionExpiryLabel(expiresAt *time.Time, now time.Time) string {
+	if expiresAt == nil {
+		return "有效期剩余：长期有效"
+	}
+	if !expiresAt.After(now) {
+		return "有效期剩余：已到期"
+	}
+	days := int(math.Ceil(expiresAt.Sub(now).Hours() / 24))
+	if days < 1 {
+		days = 1
+	}
+	return fmt.Sprintf("有效期剩余：%d 天", days)
+}
+
+func formatSubscriptionBytes(bytes uint64) string {
+	if bytes < 1024 {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	value := float64(bytes)
+	units := []string{"KB", "MB", "GB", "TB", "PB"}
+	for _, unit := range units {
+		value /= 1024
+		if value < 1024 || unit == units[len(units)-1] {
+			return fmt.Sprintf("%.2f %s", value, unit)
+		}
+	}
+	return fmt.Sprintf("%d B", bytes)
 }
 
 func (h *DatabaseSubscriptionHandler) subscriptionEndpoints() ([]subscriptionEndpoint, error) {

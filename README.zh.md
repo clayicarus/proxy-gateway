@@ -132,6 +132,8 @@ tls:
 
 ### Clash.Meta / Mihomo 订阅
 
+“规则代理”组追加“有效期剩余”和“本月已用流量”两个信息节点，沿用首个已授权代理的连接参数；不足一天按一天显示，无到期时间则显示“长期有效”。数值在客户端更新订阅时刷新，并非实时计数器。用量按 `timezone` 的自然月汇总上传与下载，排除 Gateway 的 `direct` 路由；客户端规则命中 `DIRECT` 的流量不会到达 Gateway，也不计入。标准 `Subscription-Userinfo` 响应头返回相同用量与到期时间，以及有限额时的套餐额度；服务器额度执行仍统计所有 Gateway 路由。
+
 同一订阅为每个已授权节点与每个公开入口生成独立条目。上例同时提供 Hysteria2 和 Trojan，完整文件见 [configs/gateway-mixed.yaml](configs/gateway-mixed.yaml)；仅需单入口时，也可以保留原有写法并选择 Trojan：
 
 ```yaml

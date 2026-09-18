@@ -134,7 +134,7 @@ func runGatewayContext(runCtx context.Context, args []string) error {
 		httpServices = append(httpServices, httpService{name: "management web", server: httpServer, listener: listener})
 	}
 	if cfg.Sub != nil && cfg.Sub.Listen != "" {
-		httpServer := &http.Server{Addr: cfg.Sub.Listen, Handler: api.NewDatabaseSubscriptionHandler(cfg, store, users, nodes, logger).Handler(), ReadHeaderTimeout: 10 * time.Second}
+		httpServer := &http.Server{Addr: cfg.Sub.Listen, Handler: api.NewDatabaseSubscriptionHandler(cfg, store, users, nodes, logger, kernel.Traffic()).Handler(), ReadHeaderTimeout: 10 * time.Second}
 		listener, err := net.Listen("tcp", cfg.Sub.Listen)
 		if err != nil {
 			cleanupConstructed()

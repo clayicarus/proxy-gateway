@@ -600,6 +600,13 @@ func (s *SQLiteStore) GetUserMonthlyUsageContext(ctx context.Context, start, end
 	return result, rows.Err()
 }
 
+// GetUserMonthlyProxyUsage returns one user's effective-payload traffic for
+// non-direct routes within the supplied UTC boundaries.
+func (s *SQLiteStore) GetUserMonthlyProxyUsage(username string, start, end time.Time) (tx, rx uint64, err error) {
+	err = s.db.QueryRow(`SELECT COALESCE(SUM(tx_bytes), 0), COALESCE(SUM(rx_bytes), 0) FROM traffic_logs WHERE user_id = ? AND node_id <> 'direct' AND created_at >= ? AND created_at < ?`, username, start.UTC().Unix(), end.UTC().Unix()).Scan(&tx, &rx)
+	return tx, rx, err
+}
+
 // GetNodeMonthlyUsage returns effective-payload tx/rx by selected route for a
 // natural-month window. The UI uses tx+rx to show separate Gateway and Node
 // egress estimates.
