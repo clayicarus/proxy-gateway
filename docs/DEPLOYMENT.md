@@ -303,6 +303,8 @@ sub:
 
 Hysteria2 需要放行入口的 UDP 端口，Trojan 需要放行 TCP 端口，两者可共用数值端口。若 Trojan 占用 TCP 443，Nginx 不能再绑定同一地址的 TCP 443。可以为独立订阅 HTTPS 服务选择其他端口或 IP，也可采用上面的完整网站示例：由 Trojan 终止 TLS，Nginx 只监听 loopback HTTP，再把 `/sub/` 转发到订阅服务。
 
+Wi-Fi 下仅 Trojan TCP 6800 无法使用时，可按 [Trojan TCP 443 入口迁移](TROJAN_443_MIGRATION.md) 新增入口，保留原入口作对照，并处理现有 HTTPS 网站的端口占用。
+
 ## 8. 旧配置迁移
 
 迁移前备份 YAML 和数据库，并停止 Gateway，确保命令使用与 service 完全相同的 `dbPath`：

@@ -1,0 +1,55 @@
+# Add a TCP 443 alternative while retaining the existing TCP 6800 entry.
+# Merge the new inbound and subscription endpoint into the live configuration;
+# do not replace an existing deployment's paths, users, topology or TLS settings.
+# Deployment and TCP 443 website coexistence: docs/TROJAN_443_MIGRATION.md
+inbounds:
+  - name: hy2-public
+    type: hysteria2
+    listen: :443
+  - name: trojan-public
+    type: trojan
+    listen: :6800
+    trojan:
+      handshakeTimeout: 10s
+      maxPendingConnections: 256
+      udpIdleTimeout: 60s
+  - name: trojan-443
+    type: trojan
+    listen: :443
+    trojan:
+      handshakeTimeout: 10s
+      maxPendingConnections: 256
+      udpIdleTimeout: 60s
+      # If Gateway also terminates the existing website's TLS, prepare its
+      # plaintext HTTP origin first, then enable this block. See the guide.
+      # fallback:
+      #   addr: 127.0.0.1:8080
+      #   probeTimeout: 1s
+      #   dialTimeout: 3s
+      #   idleTimeout: 30s
+      #   maxConnections: 32
+
+tls:
+  cert: /etc/proxy-gateway/cert.pem
+  key: /etc/proxy-gateway/key.pem
+admin:
+  listen: 127.0.0.1:9090
+sub:
+  listen: 127.0.0.1:9091
+  publicURL: https://sub.example.com/sub/
+  endpoints:
+    - inbound: hy2-public
+      serverAddr: gateway.example.com:443
+      sni: gateway.example.com
+    - inbound: trojan-443
+      serverAddr: gateway.example.com:443
+      sni: gateway.example.com
+    - inbound: trojan-public
+      serverAddr: gateway.example.com:6800
+      sni: gateway.example.com
+dbPath: /var/lib/proxy-gateway/traffic.db
+trafficFlushInterval: 10s
+timezone: Asia/Shanghai
+systemd:
+  unit: proxy-gateway.service
+  watchdog: true
