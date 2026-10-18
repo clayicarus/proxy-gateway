@@ -142,22 +142,24 @@ func (h *DatabaseSubscriptionHandler) handle(w http.ResponseWriter, r *http.Requ
 	}
 	now := h.now()
 	start, end, _ := monthRange(now, h.location)
-	monthly, err := h.store.GetUserMonthlyUsage(start, end)
+	tx, rx, err := h.store.GetMonthlyUsageForUserContext(r.Context(), user.Username, start, end)
 	if err != nil {
 		h.logger.Error("subscription usage lookup failed", zap.String("user", user.Username), zap.Error(err))
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
-	usage := monthly[user.Username]
 	expiry := "到期时间：长期有效"
 	if user.ExpiresAt != nil {
 		expiry = "到期时间：" + user.ExpiresAt.In(h.location).Format("2006-01-02")
+		if !user.ExpiresAt.After(now) {
+			expiry += "（已到期）"
+		}
 	}
 	templateProxy := data.Proxies[0]
 	expiryProxy := templateProxy
 	expiryProxy.Name = uniqueProxyName(expiry, usedNames)
 	usageProxy := templateProxy
-	usageProxy.Name = uniqueProxyName("本月已用流量："+formatBytes(usage[0]+usage[1]), usedNames)
+	usageProxy.Name = uniqueProxyName("本月已用流量："+formatBytes(tx+rx), usedNames)
 	data.Proxies = append(data.Proxies, expiryProxy, usageProxy)
 	body, err := renderManagedSubscription(data)
 	if err != nil {
@@ -168,11 +170,14 @@ func (h *DatabaseSubscriptionHandler) handle(w http.ResponseWriter, r *http.Requ
 	w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": user.Username + ".yaml"}))
 	w.Header().Set("Profile-Update-Interval", "24")
-	// The standard header has no tx+rx notion. It is supplied as an advisory
-	// total while Gateway remains the enforcement authority.
+	userinfo := []string{fmt.Sprintf("upload=%d", tx), fmt.Sprintf("download=%d", rx)}
 	if user.MonthlyBytes > 0 {
-		w.Header().Set("Subscription-Userinfo", fmt.Sprintf("upload=0; download=0; total=%d", user.MonthlyBytes))
+		userinfo = append(userinfo, fmt.Sprintf("total=%d", user.MonthlyBytes))
 	}
+	if user.ExpiresAt != nil {
+		userinfo = append(userinfo, fmt.Sprintf("expire=%d", user.ExpiresAt.Unix()))
+	}
+	w.Header().Set("Subscription-Userinfo", strings.Join(userinfo, "; "))
 	_, _ = w.Write(body)
 }
 

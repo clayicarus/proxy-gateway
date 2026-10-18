@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -73,7 +75,7 @@ func testDatabaseSubscriptionUsesRestartAppliedRoutes(t *testing.T, protocol str
 	}
 }
 
-func TestDatabaseSubscriptionRejectsInactiveUser(t *testing.T) {
+func TestDatabaseSubscriptionDeletedAndExpiredUsers(t *testing.T) {
 	store, err := storage.NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
 	if err != nil {
 		t.Fatal(err)
@@ -101,9 +103,21 @@ func TestDatabaseSubscriptionRejectsInactiveUser(t *testing.T) {
 	}
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://sub.example/sub/subscription-token", nil))
-	if response.Code != http.StatusForbidden {
-		t.Fatalf("expired user status = %d", response.Code)
+	decoded := decodeClientSubscription(t, response)
+	if !strings.Contains(decoded.Proxies[1]["name"].(string), "已到期") {
+		t.Fatalf("expired user information = %v", decoded.Proxies[1]["name"])
 	}
+	wantUserinfo := "upload=0; download=0; expire=" + strconv.FormatInt(expired.Unix(), 10)
+	if got := response.Header().Get("Subscription-Userinfo"); got != wantUserinfo {
+		t.Fatalf("expired user header = %q, want %q", got, wantUserinfo)
+	}
+	// Expired users must retain subscription access after a Gateway restart.
+	snapshot, err := store.LoadRuntimeSnapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler = NewDatabaseSubscriptionHandler(subscriptionTestConfig(config.TrojanInboundType), store, snapshot.Users, snapshot.Nodes, zap.NewNop()).Handler()
+	decodeClientSubscription(t, requestTestSubscription(handler, "subscription-token"))
 }
 
 func TestDatabaseSubscriptionRejectsTokenOutsideSubPath(t *testing.T) {
@@ -187,11 +201,17 @@ func TestSubscriptionMonthlyWindowAndUserIsolation(t *testing.T) {
 	if decoded.Proxies[2]["name"] != "本月已用流量：4.23 KiB" {
 		t.Fatal("card usage did not include all persisted user routes")
 	}
+	if got := response.Header().Get("Subscription-Userinfo"); got != "upload=4110; download=220" {
+		t.Fatalf("current-month user usage header = %q", got)
+	}
 	h.now = func() time.Time { return end }
 	response = requestTestSubscription(h.Handler(), "subscription-token")
 	decoded = decodeClientSubscription(t, response)
 	if decoded.Proxies[2]["name"] != "本月已用流量：1.95 KiB" {
 		t.Fatalf("new-month user usage = %v", decoded.Proxies[2]["name"])
+	}
+	if got := response.Header().Get("Subscription-Userinfo"); got != "upload=2000; download=0" {
+		t.Fatalf("new-month user usage header = %q", got)
 	}
 }
 
@@ -213,6 +233,18 @@ func TestSubscriptionInformationNamesCannotCollide(t *testing.T) {
 	}
 }
 
+func TestSubscriptionUsageQueryHonorsRequestCancellation(t *testing.T) {
+	_, handler := newSubscriptionFixture(t, subscriptionTestConfig(config.Hysteria2InboundType), []string{"direct"}, nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	request := httptest.NewRequest(http.MethodGet, "/sub/subscription-token", nil).WithContext(ctx)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code == http.StatusOK || strings.Contains(response.Body.String(), "test:password") || response.Header().Get("Subscription-Userinfo") != "" {
+		t.Fatal("canceled usage lookup published subscription data")
+	}
+}
+
 func TestSubscriptionExpiryDate(t *testing.T) {
 	cfg := subscriptionTestConfig(config.Hysteria2InboundType)
 	cfg.Timezone = "Asia/Shanghai"
@@ -221,13 +253,17 @@ func TestSubscriptionExpiryDate(t *testing.T) {
 	if err := store.UpdateUser(storage.ManagedUserInput{Username: "alice", Password: "test:password", ExpiresAt: &expires, MonthlyBytes: 1024, Routes: []string{"direct"}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.FlushTraffic([]storage.TrafficRecord{{UserID: "alice", NodeID: "direct", TxBytes: 100, RxBytes: 200, Timestamp: time.Now()}}); err != nil {
+		t.Fatal(err)
+	}
 	h := NewDatabaseSubscriptionHandler(cfg, store, map[string]config.UserConfig{"alice": {Routes: []string{"direct"}}}, nil, zap.NewNop())
 	response := requestTestSubscription(h.Handler(), "subscription-token")
 	decoded := decodeClientSubscription(t, response)
 	if decoded.Proxies[1]["name"] != "到期时间：2099-01-02" {
 		t.Fatalf("expiry date = %v", decoded.Proxies[1]["name"])
 	}
-	if got := response.Header().Get("Subscription-Userinfo"); got != "upload=0; download=0; total=1024" {
+	wantUserinfo := "upload=100; download=200; total=1024; expire=" + strconv.FormatInt(expires.Unix(), 10)
+	if got := response.Header().Get("Subscription-Userinfo"); got != wantUserinfo {
 		t.Fatalf("Subscription-Userinfo = %q", got)
 	}
 }

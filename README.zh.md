@@ -138,6 +138,8 @@ tls:
 
 ### Clash.Meta / Mihomo 订阅
 
+订阅包含到期日期和本月已用流量两个信息节点；`Subscription-Userinfo` 响应头返回相同用量、到期时间，以及有限额时的套餐额度。用量按配置时区的自然月汇总所有 Gateway 路由的上传与下载，包含 `direct`；客户端本地 `DIRECT` 不经过 Gateway，不计入。统计读取周期落库的数据，最多通常滞后一个 `trafficFlushInterval`，拉取订阅不会触发落库。到期用户的有效 token 仍可获取订阅并显示“已到期”，代理认证和流量转发继续拒绝到期用户；已停用用户或无效 token 返回 403。
+
 同一订阅为每个已授权节点与每个公开入口生成独立条目。上例同时提供 Hysteria2 和 Trojan，完整文件见 [configs/gateway-mixed.yaml](configs/gateway-mixed.yaml)；仅需单入口时，也可以保留原有写法并选择 Trojan：
 
 ```yaml

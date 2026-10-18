@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"go.uber.org/zap"
@@ -60,6 +61,19 @@ func TestAuthenticatorTrojanCredentialAndRefresh(t *testing.T) {
 func trojanCredential(raw string) string {
 	sum := sha256.Sum224([]byte(raw))
 	return hex.EncodeToString(sum[:])
+}
+
+func TestAuthenticatorRejectsExpiredUsersForBothProtocols(t *testing.T) {
+	expired := time.Now().Add(-time.Hour)
+	a := NewAuthenticator(map[string]config.UserConfig{
+		"alice": {Password: "secret", Routes: []string{"direct"}, ExpiresAt: &expired},
+	}, zap.NewNop())
+	if ok, _ := a.Authenticate(&net.UDPAddr{}, "alice:direct:secret", 0); ok {
+		t.Fatal("expired Hysteria2 user was authenticated")
+	}
+	if ok, _ := a.AuthenticateTrojan(&net.TCPAddr{}, trojanCredential("alice:direct:secret")); ok {
+		t.Fatal("expired Trojan user was authenticated")
+	}
 }
 
 func TestAuthenticator_WrongPassword(t *testing.T) {

@@ -518,7 +518,9 @@ func (s *SQLiteStore) populateUserRoutes(users []ManagedUser) error {
 	return rows.Err()
 }
 
-// FindUserByToken returns an active user matched by its bearer token.
+// FindUserByToken returns a non-deleted user matched by its bearer token.
+// Expired users may still read subscription metadata; proxy authentication
+// and traffic admission enforce expiry independently.
 func (s *SQLiteStore) FindUserByToken(token string) (*ManagedUser, error) {
 	var u ManagedUser
 	var deletedAt, expiresAt sql.NullInt64
@@ -534,7 +536,7 @@ func (s *SQLiteStore) FindUserByToken(token string) (*ManagedUser, error) {
 	u.ExpiresAt = unixTime(expiresAt.Int64)
 	u.CreatedAt = time.Unix(createdAt, 0).UTC()
 	u.UpdatedAt = time.Unix(updatedAt, 0).UTC()
-	if u.DeletedAt != nil || (u.ExpiresAt != nil && !u.ExpiresAt.After(time.Now())) {
+	if u.DeletedAt != nil {
 		return nil, nil
 	}
 	routes, err := s.userRoutes(u.Username)
@@ -598,6 +600,13 @@ func (s *SQLiteStore) GetUserMonthlyUsageContext(ctx context.Context, start, end
 		result[username] = [2]uint64{tx, rx}
 	}
 	return result, rows.Err()
+}
+
+// GetMonthlyUsageForUserContext returns one user's persisted effective-payload
+// traffic across all routes, including direct, within the UTC boundaries.
+func (s *SQLiteStore) GetMonthlyUsageForUserContext(ctx context.Context, username string, start, end time.Time) (tx, rx uint64, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(tx_bytes), 0), COALESCE(SUM(rx_bytes), 0) FROM traffic_logs WHERE user_id = ? AND created_at >= ? AND created_at < ?`, username, start.UTC().Unix(), end.UTC().Unix()).Scan(&tx, &rx)
+	return tx, rx, err
 }
 
 // GetNodeMonthlyUsage returns effective-payload tx/rx by selected route for a
