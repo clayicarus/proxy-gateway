@@ -51,6 +51,16 @@ CGO_ENABLED=1 go test ./...
 
 首次检出后，运行网关测试前需执行 `(cd test/interop/upstream && go mod download all)`，提前下载上游互通测试模块的依赖；互通测试构建该模块时使用 `GOPROXY=off`。
 
+推送 `v*` 标签后，所有 CI 检查通过才会自动构建并发布 GitHub Release：
+
+```bash
+git tag -a v0.1.0 -m "Proxy Gateway v0.1.0"
+git push origin master
+git push origin v0.1.0
+```
+
+发布包含 Linux amd64、arm64 静态压缩包，其中提供网关二进制及示例配置，另附 `SHA256SUMS` 校验文件。构建保留 SQLite 所需的 CGO，运行无需 Go 或动态 C 运行库；主机仍需 CA 证书和时区数据。含连字符的标签（例如 `v0.1.0-rc.1`）会发布为预发布版本。流程使用内置的 `GITHUB_TOKEN`，无需额外配置密钥。
+
 ## 快速开始
 
 ### 1. 配置启动参数

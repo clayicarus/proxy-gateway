@@ -51,6 +51,16 @@ Cross-compilation requires a suitable C cross-compiler. You can also build direc
 
 Before running gateway tests on a fresh checkout, download the upstream interop fixture's dependencies with `(cd test/interop/upstream && go mod download all)`. The interop tests build that module with `GOPROXY=off`.
 
+Pushing a `v*` tag also builds and publishes a GitHub Release after all CI checks pass:
+
+```bash
+git tag -a v0.1.0 -m "Proxy Gateway v0.1.0"
+git push origin master
+git push origin v0.1.0
+```
+
+Releases contain static Linux amd64 and arm64 archives with the gateway binary and example configurations, plus a `SHA256SUMS` file. CGO remains enabled for SQLite; the binary does not require Go or a shared C runtime. The host still needs CA certificates and timezone data. Tags containing a hyphen (for example, `v0.1.0-rc.1`) produce prereleases. The workflow uses the built-in `GITHUB_TOKEN`; no extra secret is required.
+
 ## Quick start
 
 ### 1. Configure startup settings

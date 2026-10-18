@@ -87,3 +87,86 @@ jobs:
       - name: Build gateway and migration tools
         if: matrix.module == '.'
         run: make build
+
+  release-build:
+    name: Release build (linux/${{ matrix.arch }})
+    needs: check
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      CC: gcc
+      GOFLAGS: -mod=readonly -trimpath -tags=netgo,osusergo,sqlite_omit_load_extension
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: go.sum
+
+      - name: Test SQLite with static linking
+        run: go test -count=1 -ldflags='-linkmode external -extldflags=-static' ./internal/storage
+
+      - name: Build and package
+        run: |
+          package="proxy-gateway-${RELEASE_TAG}-linux-$(go env GOARCH)"
+          mkdir -p "$package/configs" dist
+          go build -ldflags='-s -w -linkmode external -extldflags=-static' \
+            -o "$package/proxy-gateway" ./cmd/gateway
+          file "$package/proxy-gateway"
+          "$package/proxy-gateway" -h
+          cp README.md README.zh.md "$package/"
+          cp configs/gateway.yaml configs/gateway-mixed.yaml configs/gateway-website.yaml "$package/configs/"
+          cp third_party/hysteria-core/LICENSE.md "$package/HYSTERIA-LICENSE.md"
+          tar -czf "dist/$package.tar.gz" "$package"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    name: Publish GitHub Release
+    needs: release-build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-linux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Publish release
+        run: |
+          args=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes \
+            --title "Proxy Gateway $RELEASE_TAG" "${args[@]}"
