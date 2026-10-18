@@ -45,6 +45,12 @@ CGO_ENABLED=1 go test ./...
 
 Cross-compilation requires a suitable C cross-compiler. You can also build directly on the target Linux machine.
 
+## Continuous integration
+
+[GitHub Actions](.github/workflows/ci.yml) runs on pushes, pull requests and manual triggers using Go 1.25 and CGO on Ubuntu. It checks Go formatting, verifies dependencies, runs `go vet` and tests with the race detector for both the gateway and the patched Hysteria core, and builds all four commands with `make build`. The two upstream TCP/UDP stress tests are excluded from routine checks; enable the `stress` option when triggering the workflow manually to run them separately without the race detector.
+
+Before running gateway tests on a fresh checkout, download the upstream interop fixture's dependencies with `(cd test/interop/upstream && go mod download all)`. The interop tests build that module with `GOPROXY=off`.
+
 ## Quick start
 
 ### 1. Configure startup settings

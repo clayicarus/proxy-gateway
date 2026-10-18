@@ -45,6 +45,12 @@ CGO_ENABLED=1 go test ./...
 
 跨平台构建需要相应的 C 交叉编译器；也可以直接在目标 Linux 机器上构建。
 
+## 持续集成
+
+[GitHub Actions](.github/workflows/ci.yml) 在推送、Pull Request 和手动触发时运行，使用 Ubuntu、Go 1.25 和 CGO。流程检查 Go 格式、校验依赖，对网关和补丁版 Hysteria core 分别执行 `go vet` 和启用竞态检测的测试，并通过 `make build` 构建全部四个命令。两项上游 TCP/UDP 压力测试不参与常规检查；手动触发时勾选 `stress`，可单独运行这两项测试且不启用竞态检测。
+
+首次检出后，运行网关测试前需执行 `(cd test/interop/upstream && go mod download all)`，提前下载上游互通测试模块的依赖；互通测试构建该模块时使用 `GOPROXY=off`。
+
 ## 快速开始
 
 ### 1. 配置启动参数
