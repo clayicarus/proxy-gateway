@@ -1,27 +1,45 @@
 package integration_tests
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"io"
+	"math/big"
 	"net"
+	"time"
 
 	"github.com/apernet/hysteria/core/v2/server"
 )
 
 // This file provides utilities for the integration tests.
 
-const (
-	testCertFile = "test.crt"
-	testKeyFile  = "test.key"
-)
-
 func serverTLSConfig() server.TLSConfig {
-	cert, err := tls.LoadX509KeyPair(testCertFile, testKeyFile)
+	// Generate a short-lived certificate so clean checkouts need no fixture files.
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "localhost"},
+		NotBefore:    now.Add(-time.Minute),
+		NotAfter:     now.Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
 		panic(err)
 	}
 	return server.TLSConfig{
-		Certificates: []tls.Certificate{cert},
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
 	}
 }
 

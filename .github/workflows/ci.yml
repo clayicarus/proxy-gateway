@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      stress:
+        description: Run upstream TCP/UDP stress tests as well
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: '1'
+  GOFLAGS: -mod=readonly
+
+jobs:
+  check:
+    name: Check (${{ matrix.module }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - .
+          - third_party/hysteria-core
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: |
+            go.sum
+            third_party/hysteria-core/go.sum
+            test/interop/upstream/go.sum
+
+      - name: Check Go formatting
+        if: matrix.module == '.'
+        run: |
+          unformatted=$(git ls-files -z '*.go' | xargs -0 gofmt -l)
+          if [[ -n "$unformatted" ]]; then
+            echo 'Run gofmt on these files:'
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Download and verify dependencies
+        run: |
+          go mod download all
+          go mod verify
+
+      # Interop tests build a separate upstream module with GOPROXY=off.
+      - name: Prepare upstream interop dependencies
+        if: matrix.module == '.'
+        working-directory: test/interop/upstream
+        run: |
+          go mod download all
+          go mod verify
+
+      - name: Run static analysis
+        run: go vet ./...
+
+      - name: Run tests with race detector
+        # Upstream stress tests transfer gigabytes and create up to 1000 streams.
+        # Run them separately on request, without race detector memory overhead.
+        run: go test -race -count=1 -timeout=10m -skip '^TestClientServer(TCP|UDP)Stress$' ./...
+
+      - name: Run upstream stress tests
+        if: matrix.module == 'third_party/hysteria-core' && github.event_name == 'workflow_dispatch' && inputs.stress
+        run: go test -count=1 -timeout=15m -run '^TestClientServer(TCP|UDP)Stress$' ./internal/integration_tests
+
+      - name: Build gateway and migration tools
+        if: matrix.module == '.'
+        run: make build
