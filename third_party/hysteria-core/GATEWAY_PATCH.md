@@ -12,5 +12,8 @@ remain unchanged. Gateway-specific additions are limited to:
 - explicit close plus context-bounded wait for server/client workers;
 - UDP callbacks at the existing per-fragment/per-send-attempt accounting points.
 
+Integration tests generate short-lived TLS certificates in memory so they run
+from a clean checkout without local certificate or private-key files.
+
 `LICENSE.md` is the original MIT license. Changes must remain reviewable against
 the tagged v2.8.1 source and must pass both legacy and Gateway capability tests.
