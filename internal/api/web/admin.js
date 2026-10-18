@@ -94,6 +94,14 @@ confirmDialog?.addEventListener("close", () => {
   pendingConfirmForm = undefined;
 });
 
+document.querySelectorAll("[data-select-routes]").forEach((button) => {
+  button.addEventListener("click", () => {
+    button.closest("fieldset")?.querySelectorAll('input[name="routes"]:not(:disabled)').forEach((checkbox) => {
+      checkbox.checked = true;
+    });
+  });
+});
+
 function formatRate(bytes) {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B/s";
   const units = ["B/s", "KiB/s", "MiB/s", "GiB/s"];

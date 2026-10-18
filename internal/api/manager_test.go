@@ -133,7 +133,7 @@ func TestManagerRendersDashboard(t *testing.T) {
 			t.Fatalf("dashboard section %q missing", section)
 		}
 	}
-	if !strings.Contains(response.Body.String(), "/assets/admin.js?v=4") || !strings.Contains(response.Body.String(), "/assets/admin.css?v=4") {
+	if !strings.Contains(response.Body.String(), "/assets/admin.js?v=6") || !strings.Contains(response.Body.String(), "/assets/admin.css?v=4") {
 		t.Fatal("dashboard live script missing")
 	}
 	for _, content := range []string{
