@@ -192,10 +192,10 @@ sub:
 	if err := yaml.NewDecoder(response.Body).Decode(&subscription); err != nil {
 		t.Fatal(err)
 	}
-	if len(subscription.Proxies) != 4 || subscription.Proxies[0].Type != "hysteria2" || subscription.Proxies[1].Type != "trojan" {
+	if len(subscription.Proxies) != 4 || subscription.Proxies[2].Type != "hysteria2" || subscription.Proxies[3].Type != "trojan" {
 		t.Fatal("subscription must publish both configured protocols")
 	}
-	for _, proxy := range subscription.Proxies {
+	for _, proxy := range subscription.Proxies[2:] {
 		if proxy.SNI != "localhost" || proxy.SkipVerify {
 			t.Fatal("subscription lost the explicit TLS name or enabled insecure verification")
 		}
@@ -238,7 +238,7 @@ sub:
 	payload := []byte("subscription client payload")
 
 	t.Run("hysteria2_tcp", func(t *testing.T) {
-		proxy := subscription.Proxies[0]
+		proxy := subscription.Proxies[2]
 		address, err := net.ResolveUDPAddr("udp", proxy.address())
 		if err != nil {
 			t.Fatal(err)
@@ -267,7 +267,7 @@ sub:
 		assertSubscriptionEcho(t, connection, payload)
 	})
 
-	trojanProxy := subscription.Proxies[1]
+	trojanProxy := subscription.Proxies[3]
 	if website {
 		if len(trojanProxy.ALPN) != 1 || trojanProxy.ALPN[0] != "http/1.1" {
 			t.Fatal("website-enabled Trojan subscription is missing its ALPN policy")

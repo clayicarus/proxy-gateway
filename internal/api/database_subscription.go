@@ -105,7 +105,33 @@ func (h *DatabaseSubscriptionHandler) handle(w http.ResponseWriter, r *http.Requ
 		"DIRECT": true, "REJECT": true, "REJECT-DROP": true,
 		"PASS": true, "COMPATIBLE": true, "GLOBAL": true, "规则代理": true,
 	}
-	data := managedSubscriptionData{}
+	now := h.now()
+	start, end, _ := monthRange(now, h.location)
+	tx, rx, err := h.store.GetMonthlyUsageForUserContext(r.Context(), user.Username, start, end)
+	if err != nil {
+		h.logger.Error("subscription usage lookup failed", zap.String("user", user.Username), zap.Error(err))
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	quota := "不限"
+	if user.MonthlyBytes > 0 {
+		quota = formatSubscriptionBytes(user.MonthlyBytes)
+	}
+	usage := "流量: " + formatSubscriptionBytes(tx+rx) + " / " + quota
+	expiry := "到期: 长期有效"
+	if user.ExpiresAt != nil {
+		prefix := "到期: "
+		if !user.ExpiresAt.After(now) {
+			prefix = "已到期: "
+		}
+		expiry = prefix + user.ExpiresAt.In(h.location).Format("2006-01-02")
+	}
+	// Reserve information names first so aliases receive collision suffixes,
+	// keeping both fixed-width cards short and at the top of client lists.
+	data := managedSubscriptionData{Proxies: []managedProxy{
+		{Name: uniqueProxyName(usage, usedNames), Type: "reject"},
+		{Name: uniqueProxyName(expiry, usedNames), Type: "reject"},
+	}}
 	for _, route := range routes {
 		alias := route
 		if route != "direct" {
@@ -131,36 +157,15 @@ func (h *DatabaseSubscriptionHandler) handle(w http.ResponseWriter, r *http.Requ
 				Name: uniqueProxyName(name, usedNames), Type: endpoint.Type,
 				Server: endpoint.Server, Port: endpoint.Port,
 				Auth: fmt.Sprintf("%s:%s:%s", user.Username, route, user.Password),
-				SNI:  endpoint.SNI, Insecure: endpoint.Insecure,
+				SNI:  endpoint.SNI, Insecure: &endpoint.Insecure,
 				UDP: endpoint.Type == config.TrojanInboundType, ALPN: endpoint.ALPN,
 			})
 		}
 	}
-	if len(data.Proxies) == 0 {
+	if len(data.Proxies) == 2 {
 		http.Error(w, "subscription has no active routes", http.StatusServiceUnavailable)
 		return
 	}
-	now := h.now()
-	start, end, _ := monthRange(now, h.location)
-	tx, rx, err := h.store.GetMonthlyUsageForUserContext(r.Context(), user.Username, start, end)
-	if err != nil {
-		h.logger.Error("subscription usage lookup failed", zap.String("user", user.Username), zap.Error(err))
-		http.Error(w, "internal server error", http.StatusInternalServerError)
-		return
-	}
-	expiry := "到期时间：长期有效"
-	if user.ExpiresAt != nil {
-		expiry = "到期时间：" + user.ExpiresAt.In(h.location).Format("2006-01-02")
-		if !user.ExpiresAt.After(now) {
-			expiry += "（已到期）"
-		}
-	}
-	templateProxy := data.Proxies[0]
-	expiryProxy := templateProxy
-	expiryProxy.Name = uniqueProxyName(expiry, usedNames)
-	usageProxy := templateProxy
-	usageProxy.Name = uniqueProxyName("本月已用流量："+formatBytes(tx+rx), usedNames)
-	data.Proxies = append(data.Proxies, expiryProxy, usageProxy)
 	body, err := renderManagedSubscription(data)
 	if err != nil {
 		h.logger.Error("render managed subscription", zap.Error(err))
@@ -223,6 +228,34 @@ func (h *DatabaseSubscriptionHandler) subscriptionEndpoints() ([]subscriptionEnd
 	return endpoints, nil
 }
 
+// formatSubscriptionBytes uses binary units and at most four numeric
+// characters, including the decimal point, to fit narrow client lists.
+func formatSubscriptionBytes(value uint64) string {
+	units := []string{"B", "KB", "MB", "GB", "TB", "PB", "EB"}
+	current := float64(value)
+	unit := 0
+	for current >= 1024 && unit < len(units)-1 {
+		current /= 1024
+		unit++
+	}
+	for {
+		precision := 0
+		if unit > 0 && current < 100 {
+			precision = 1
+		}
+		number := strconv.FormatFloat(current, 'f', precision, 64)
+		if precision > 0 {
+			number = strings.TrimSuffix(number, ".0")
+		}
+		if number == "1024" && unit < len(units)-1 {
+			current /= 1024
+			unit++
+			continue
+		}
+		return number + units[unit]
+	}
+}
+
 func uniqueProxyName(base string, used map[string]bool) string {
 	name := base
 	for suffix := 2; used[name]; suffix++ {
@@ -235,11 +268,11 @@ func uniqueProxyName(base string, used map[string]bool) string {
 type managedProxy struct {
 	Name     string   `yaml:"name"`
 	Type     string   `yaml:"type"`
-	Server   string   `yaml:"server"`
-	Port     int      `yaml:"port"`
-	Auth     string   `yaml:"password"`
+	Server   string   `yaml:"server,omitempty"`
+	Port     int      `yaml:"port,omitempty"`
+	Auth     string   `yaml:"password,omitempty"`
 	SNI      string   `yaml:"sni,omitempty"`
-	Insecure bool     `yaml:"skip-cert-verify"`
+	Insecure *bool    `yaml:"skip-cert-verify,omitempty"`
 	UDP      bool     `yaml:"udp,omitempty"`
 	ALPN     []string `yaml:"alpn,omitempty"`
 }
@@ -249,9 +282,10 @@ type managedSubscriptionData struct {
 }
 
 type managedProxyGroup struct {
-	Name    string   `yaml:"name"`
-	Type    string   `yaml:"type"`
-	Proxies []string `yaml:"proxies"`
+	Name            string   `yaml:"name"`
+	Type            string   `yaml:"type"`
+	Proxies         []string `yaml:"proxies"`
+	DefaultSelected string   `yaml:"default-selected,omitempty"`
 }
 
 type managedClashConfig struct {
@@ -266,8 +300,12 @@ type managedClashConfig struct {
 
 func renderManagedSubscription(data managedSubscriptionData) ([]byte, error) {
 	names := make([]string, 0, len(data.Proxies)+1)
+	var defaultSelected string
 	for i := range data.Proxies {
 		names = append(names, data.Proxies[i].Name)
+		if defaultSelected == "" && data.Proxies[i].Type != "reject" {
+			defaultSelected = data.Proxies[i].Name
+		}
 	}
 	names = append(names, "DIRECT")
 	cfg := managedClashConfig{
@@ -277,9 +315,10 @@ func renderManagedSubscription(data managedSubscriptionData) ([]byte, error) {
 		MixedPort: 7890,
 		Proxies:   data.Proxies,
 		ProxyGroups: []managedProxyGroup{{
-			Name:    "规则代理",
-			Type:    "select",
-			Proxies: names,
+			Name:            "规则代理",
+			Type:            "select",
+			Proxies:         names,
+			DefaultSelected: defaultSelected,
 		}},
 		Rules: []string{"GEOIP,CN,DIRECT", "MATCH,规则代理"},
 	}

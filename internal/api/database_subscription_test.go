@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -49,14 +48,8 @@ func testDatabaseSubscriptionUsesRestartAppliedRoutes(t *testing.T, protocol str
 		t.Fatalf("subscription omitted applied node or live password: %s", response.Body.String())
 	}
 	proxies := decodeClientSubscription(t, response).Proxies
-	if len(proxies) != 3 || proxies[0]["type"] != protocol || proxies[0]["password"] != "alice:node1:gateway-password" {
+	if len(proxies) != 3 || proxies[2]["type"] != protocol || proxies[2]["password"] != "alice:node1:gateway-password" {
 		t.Fatal("subscription did not publish the selected protocol and node credential")
-	}
-	for _, proxy := range proxies[1:] {
-		proxy["name"] = proxies[0]["name"]
-		if !reflect.DeepEqual(proxy, proxies[0]) {
-			t.Fatal("information entry lost the authorized proxy transport or credentials")
-		}
 	}
 
 	if err := store.SaveNode("node2", config.NodeConfig{Type: "hysteria2", Alias: "Node Two", Hysteria2: &config.Hysteria2OutboundConfig{Addr: "node2.example:443", Auth: "node-password"}}, true); err != nil {
@@ -168,11 +161,11 @@ func TestDatabaseSubscriptionEscapesYAMLSpecialCharacters(t *testing.T) {
 	if err := yaml.Unmarshal(response.Body.Bytes(), &decoded); err != nil {
 		t.Fatalf("generated subscription is invalid YAML: %v\n%s", err, response.Body.String())
 	}
-	if len(decoded.Proxies) != 3 || decoded.Proxies[0].Name != node.Alias || decoded.Proxies[0].Auth != "alice:node1:"+password {
+	if len(decoded.Proxies) != 3 || decoded.Proxies[2].Name != node.Alias || decoded.Proxies[2].Auth != "alice:node1:"+password {
 		t.Fatalf("special characters did not round trip: %#v", decoded.Proxies)
 	}
-	if decoded.Proxies[1].Name != "到期时间：长期有效" || decoded.Proxies[2].Name != "本月已用流量：0 B" {
-		t.Fatalf("subscription information proxies = %#v", decoded.Proxies[1:])
+	if decoded.Proxies[1].Name != "到期: 长期有效" || decoded.Proxies[0].Name != "流量: 0B / 不限" {
+		t.Fatalf("subscription information proxies = %#v", decoded.Proxies[:2])
 	}
 }
 
@@ -198,7 +191,7 @@ func TestSubscriptionMonthlyWindowAndUserIsolation(t *testing.T) {
 	h.now = func() time.Time { return now }
 	response := requestTestSubscription(h.Handler(), "subscription-token")
 	decoded := decodeClientSubscription(t, response)
-	if decoded.Proxies[2]["name"] != "本月已用流量：4.23 KiB" {
+	if decoded.Proxies[0]["name"] != "流量: 4.2KB / 不限" {
 		t.Fatal("card usage did not include all persisted user routes")
 	}
 	if got := response.Header().Get("Subscription-Userinfo"); got != "upload=4110; download=220" {
@@ -207,8 +200,8 @@ func TestSubscriptionMonthlyWindowAndUserIsolation(t *testing.T) {
 	h.now = func() time.Time { return end }
 	response = requestTestSubscription(h.Handler(), "subscription-token")
 	decoded = decodeClientSubscription(t, response)
-	if decoded.Proxies[2]["name"] != "本月已用流量：1.95 KiB" {
-		t.Fatalf("new-month user usage = %v", decoded.Proxies[2]["name"])
+	if decoded.Proxies[0]["name"] != "流量: 2KB / 不限" {
+		t.Fatalf("new-month user usage = %v", decoded.Proxies[0]["name"])
 	}
 	if got := response.Header().Get("Subscription-Userinfo"); got != "upload=2000; download=0" {
 		t.Fatalf("new-month user usage header = %q", got)
@@ -216,7 +209,7 @@ func TestSubscriptionMonthlyWindowAndUserIsolation(t *testing.T) {
 }
 
 func TestSubscriptionInformationNamesCannotCollide(t *testing.T) {
-	for _, alias := range []string{"到期时间：长期有效", "本月已用流量：0 B"} {
+	for _, alias := range []string{"到期: 长期有效", "流量: 0B / 不限"} {
 		nodes := map[string]config.NodeConfig{"node": {
 			Type: "hysteria2", Alias: alias,
 			Hysteria2: &config.Hysteria2OutboundConfig{Addr: "node.example:443", Auth: "secret"},
@@ -229,6 +222,45 @@ func TestSubscriptionInformationNamesCannotCollide(t *testing.T) {
 				t.Fatalf("duplicate proxy name: %s", proxy["name"])
 			}
 			seen[proxy["name"]] = true
+		}
+	}
+}
+
+func TestSubscriptionTrafficNumberWidth(t *testing.T) {
+	for _, tc := range []struct {
+		bytes uint64
+		want  string
+	}{
+		{0, "0B"},
+		{1023, "1023B"},
+		{1024, "1KB"},
+		{123 * (1 << 30) / 10, "12.3GB"},
+		{100 * (1 << 30), "100GB"},
+		{9999 * (1 << 30) / 100, "100GB"},
+		{9999 * (1 << 30) / 10, "1000GB"},
+		{10239 * (1 << 30) / 10, "1TB"},
+		{^uint64(0), "16EB"},
+	} {
+		if got := formatSubscriptionBytes(tc.bytes); got != tc.want {
+			t.Errorf("formatSubscriptionBytes(%d) = %q, want %q", tc.bytes, got, tc.want)
+		}
+	}
+	// Cover values on both sides of every unit transition, including rounding.
+	values := []uint64{0, 1, ^uint64(0)}
+	for shift := uint(10); shift <= 60; shift += 10 {
+		boundary := uint64(1) << shift
+		values = append(values, boundary-1, boundary, boundary-boundary/10000)
+	}
+	for _, value := range values {
+		formatted := formatSubscriptionBytes(value)
+		number := strings.TrimRight(formatted, "BKMGTPE")
+		if len(number) > 4 {
+			t.Errorf("numeric part exceeds four characters: %q", formatted)
+		}
+		// Chinese characters occupy two English columns: two four-digit
+		// quantities with units and spaces still fit the client's 22 columns.
+		if width := 6 + 2*len(formatted) + 3; width > 22 {
+			t.Errorf("paired usage/quota exceeds 22 columns: %q", formatted)
 		}
 	}
 }
@@ -259,8 +291,11 @@ func TestSubscriptionExpiryDate(t *testing.T) {
 	h := NewDatabaseSubscriptionHandler(cfg, store, map[string]config.UserConfig{"alice": {Routes: []string{"direct"}}}, nil, zap.NewNop())
 	response := requestTestSubscription(h.Handler(), "subscription-token")
 	decoded := decodeClientSubscription(t, response)
-	if decoded.Proxies[1]["name"] != "到期时间：2099-01-02" {
+	if decoded.Proxies[1]["name"] != "到期: 2099-01-02" {
 		t.Fatalf("expiry date = %v", decoded.Proxies[1]["name"])
+	}
+	if decoded.Proxies[0]["name"] != "流量: 300B / 1KB" {
+		t.Fatalf("monthly usage and quota = %v", decoded.Proxies[0]["name"])
 	}
 	wantUserinfo := "upload=100; download=200; total=1024; expire=" + strconv.FormatInt(expires.Unix(), 10)
 	if got := response.Header().Get("Subscription-Userinfo"); got != wantUserinfo {
@@ -278,8 +313,9 @@ func subscriptionTestConfig(protocol string) *config.Config {
 type clientSubscription struct {
 	Proxies     []map[string]any `yaml:"proxies"`
 	ProxyGroups []struct {
-		Name    string   `yaml:"name"`
-		Proxies []string `yaml:"proxies"`
+		Name            string   `yaml:"name"`
+		Proxies         []string `yaml:"proxies"`
+		DefaultSelected string   `yaml:"default-selected"`
 	} `yaml:"proxy-groups"`
 }
 
@@ -294,6 +330,28 @@ func decodeClientSubscription(t *testing.T, response *httptest.ResponseRecorder)
 	var decoded clientSubscription
 	if err := yaml.Unmarshal(response.Body.Bytes(), &decoded); err != nil {
 		t.Fatalf("invalid Clash YAML: %v", err)
+	}
+	if len(decoded.Proxies) < 3 || len(decoded.ProxyGroups) != 1 || len(decoded.ProxyGroups[0].Proxies) != len(decoded.Proxies)+1 {
+		t.Fatal("subscription must contain two information cards, real proxies and a selection group")
+	}
+	for i, card := range decoded.Proxies[:2] {
+		if card["type"] != "reject" || len(card) != 2 {
+			t.Fatalf("information card must only contain a name and reject type: %v", card)
+		}
+		name := card["name"].(string)
+		width := 0
+		for _, r := range name {
+			width++
+			if r > 127 {
+				width++
+			}
+		}
+		if width > 22 || decoded.ProxyGroups[0].Proxies[i] != name {
+			t.Fatalf("information card exceeds 22 columns or is not pinned at the top: %q", name)
+		}
+	}
+	if decoded.ProxyGroups[0].DefaultSelected != decoded.Proxies[2]["name"] {
+		t.Fatal("selection group must default to a real proxy rather than a reject card")
 	}
 	return decoded
 }
@@ -345,7 +403,7 @@ func TestDatabaseSubscriptionMixedInbounds(t *testing.T) {
 	if len(decoded.Proxies) != 6 {
 		t.Fatalf("proxy count = %d, want four route entries and two information entries", len(decoded.Proxies))
 	}
-	for i, proxy := range decoded.Proxies[:4] {
+	for i, proxy := range decoded.Proxies[2:] {
 		route, alias := "node1", "Node One"
 		if i >= 2 {
 			route, alias = "direct", "direct"
@@ -412,7 +470,7 @@ func TestDatabaseSubscriptionUniqueNamesAndSnapshot(t *testing.T) {
 	seen := map[string]bool{}
 	for i, proxy := range decoded.Proxies {
 		name := proxy["name"].(string)
-		if seen[name] || (i < 4 && !strings.Contains(name, "-trojan-")) {
+		if seen[name] || (i >= 2 && !strings.Contains(name, "-trojan-")) {
 			t.Fatalf("proxy name %q does not distinguish protocol and inbound", name)
 		}
 		seen[name] = true
@@ -433,7 +491,7 @@ func TestDatabaseSubscriptionReservedAliases(t *testing.T) {
 			}
 			_, handler := newSubscriptionFixture(t, subscriptionTestConfig(config.Hysteria2InboundType), []string{"node"}, nodes)
 			decoded := decodeClientSubscription(t, requestTestSubscription(handler, "subscription-token"))
-			if len(decoded.Proxies) != 3 || decoded.Proxies[0]["name"] == alias || decoded.ProxyGroups[0].Proxies[0] != decoded.Proxies[0]["name"] {
+			if len(decoded.Proxies) != 3 || decoded.Proxies[2]["name"] == alias || decoded.ProxyGroups[0].Proxies[2] != decoded.Proxies[2]["name"] {
 				t.Fatal("node alias shadows a built-in outbound or selection group")
 			}
 		})
@@ -489,7 +547,7 @@ func TestDatabaseSubscriptionMatchesWebsiteALPN(t *testing.T) {
 	}
 	for i, proxy := range proxies {
 		alpn, present := proxy["alpn"]
-		if i != 2 {
+		if i != 4 {
 			if present {
 				t.Fatal("website ALPN affected another inbound")
 			}
