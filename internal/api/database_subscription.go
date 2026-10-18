@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"github.com/clayicarus/proxy-gateway/internal/storage"
@@ -24,6 +25,8 @@ type DatabaseSubscriptionHandler struct {
 	activeRoutes map[string][]string
 	nodes        map[string]config.NodeConfig
 	logger       *zap.Logger
+	now          func() time.Time
+	location     *time.Location
 }
 
 // NewDatabaseSubscriptionHandler serves the restart-applied node and route
@@ -34,12 +37,20 @@ func NewDatabaseSubscriptionHandler(cfg *config.Config, store *storage.SQLiteSto
 	for username, user := range users {
 		activeRoutes[username] = append([]string(nil), user.Routes...)
 	}
+	location := time.UTC
+	if cfg.Timezone != "" {
+		if configured, err := time.LoadLocation(cfg.Timezone); err == nil {
+			location = configured
+		}
+	}
 	return &DatabaseSubscriptionHandler{
 		cfg:          cfg,
 		store:        store,
 		activeRoutes: activeRoutes,
 		nodes:        maps.Clone(nodes),
 		logger:       logger,
+		now:          time.Now,
+		location:     location,
 	}
 }
 
@@ -129,6 +140,27 @@ func (h *DatabaseSubscriptionHandler) handle(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "subscription has no active routes", http.StatusServiceUnavailable)
 		return
 	}
+	now := h.now()
+	start, end, _ := monthRange(now, h.location)
+	tx, rx, err := h.store.GetMonthlyUsageForUserContext(r.Context(), user.Username, start, end)
+	if err != nil {
+		h.logger.Error("subscription usage lookup failed", zap.String("user", user.Username), zap.Error(err))
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	expiry := "到期时间：长期有效"
+	if user.ExpiresAt != nil {
+		expiry = "到期时间：" + user.ExpiresAt.In(h.location).Format("2006-01-02")
+		if !user.ExpiresAt.After(now) {
+			expiry += "（已到期）"
+		}
+	}
+	templateProxy := data.Proxies[0]
+	expiryProxy := templateProxy
+	expiryProxy.Name = uniqueProxyName(expiry, usedNames)
+	usageProxy := templateProxy
+	usageProxy.Name = uniqueProxyName("本月已用流量："+formatBytes(tx+rx), usedNames)
+	data.Proxies = append(data.Proxies, expiryProxy, usageProxy)
 	body, err := renderManagedSubscription(data)
 	if err != nil {
 		h.logger.Error("render managed subscription", zap.Error(err))
@@ -138,11 +170,14 @@ func (h *DatabaseSubscriptionHandler) handle(w http.ResponseWriter, r *http.Requ
 	w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": user.Username + ".yaml"}))
 	w.Header().Set("Profile-Update-Interval", "24")
-	// The standard header has no tx+rx notion. It is supplied as an advisory
-	// total while Gateway remains the enforcement authority.
+	userinfo := []string{fmt.Sprintf("upload=%d", tx), fmt.Sprintf("download=%d", rx)}
 	if user.MonthlyBytes > 0 {
-		w.Header().Set("Subscription-Userinfo", fmt.Sprintf("upload=0; download=0; total=%d", user.MonthlyBytes))
+		userinfo = append(userinfo, fmt.Sprintf("total=%d", user.MonthlyBytes))
 	}
+	if user.ExpiresAt != nil {
+		userinfo = append(userinfo, fmt.Sprintf("expire=%d", user.ExpiresAt.Unix()))
+	}
+	w.Header().Set("Subscription-Userinfo", strings.Join(userinfo, "; "))
 	_, _ = w.Write(body)
 }
 

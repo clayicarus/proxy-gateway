@@ -95,6 +95,7 @@ func (s *SQLiteStore) migrate() error {
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_traffic_logs_user_node ON traffic_logs(user_id, node_id);
+	CREATE INDEX IF NOT EXISTS idx_traffic_logs_user_created_at ON traffic_logs(user_id, created_at);
 	CREATE INDEX IF NOT EXISTS idx_traffic_logs_created_at ON traffic_logs(created_at);
 
 	CREATE TABLE IF NOT EXISTS traffic_summary (

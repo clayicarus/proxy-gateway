@@ -192,7 +192,7 @@ sub:
 	if err := yaml.NewDecoder(response.Body).Decode(&subscription); err != nil {
 		t.Fatal(err)
 	}
-	if len(subscription.Proxies) != 2 || subscription.Proxies[0].Type != "hysteria2" || subscription.Proxies[1].Type != "trojan" {
+	if len(subscription.Proxies) != 4 || subscription.Proxies[0].Type != "hysteria2" || subscription.Proxies[1].Type != "trojan" {
 		t.Fatal("subscription must publish both configured protocols")
 	}
 	for _, proxy := range subscription.Proxies {

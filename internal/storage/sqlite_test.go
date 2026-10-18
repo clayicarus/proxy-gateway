@@ -3,7 +3,9 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +13,63 @@ import (
 	"github.com/clayicarus/proxy-gateway/internal/subtoken"
 	"go.uber.org/zap"
 )
+
+func TestSQLiteStoreMonthlyUsageForUser(t *testing.T) {
+	store, err := NewSQLiteStore(t.TempDir()+"/usage.db", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	start := time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(0, 1, 0)
+	if err := store.FlushTraffic([]TrafficRecord{
+		{UserID: "alice", NodeID: "direct", TxBytes: 10, RxBytes: 20, Timestamp: start},
+		{UserID: "alice", NodeID: "node1", TxBytes: 100, RxBytes: 200, Timestamp: end.Add(-time.Second)},
+		{UserID: "alice", NodeID: "direct", TxBytes: 1000, Timestamp: start.Add(-time.Second)},
+		{UserID: "alice", NodeID: "node1", TxBytes: 2000, Timestamp: end},
+		{UserID: "bob", NodeID: "node1", TxBytes: 4000, Timestamp: start},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tx, rx, err := store.GetMonthlyUsageForUserContext(t.Context(), "alice", start, end)
+	if err != nil || tx != 110 || rx != 220 {
+		t.Fatalf("user monthly usage = %d/%d, err=%v", tx, rx, err)
+	}
+	tx, rx, err = store.GetMonthlyUsageForUserContext(t.Context(), "missing", start, end)
+	if err != nil || tx != 0 || rx != 0 {
+		t.Fatalf("missing user usage = %d/%d, err=%v", tx, rx, err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, _, err := store.GetMonthlyUsageForUserContext(ctx, "alice", start, end); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled query error = %v", err)
+	}
+}
+
+func TestSQLiteStoreUpgradesMonthlyUserQueryIndex(t *testing.T) {
+	dbPath := t.TempDir() + "/usage.db"
+	store, err := NewSQLiteStore(dbPath, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a database created before the per-user time index existed.
+	_, dropErr := store.db.Exec(`DROP INDEX idx_traffic_logs_user_created_at`)
+	closeErr := store.Close()
+	if dropErr != nil || closeErr != nil {
+		t.Fatalf("prepare old database: drop=%v close=%v", dropErr, closeErr)
+	}
+	store, err = NewSQLiteStore(dbPath, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var id, parent, unused int
+	var detail string
+	err = store.db.QueryRow(`EXPLAIN QUERY PLAN SELECT COALESCE(SUM(tx_bytes), 0), COALESCE(SUM(rx_bytes), 0) FROM traffic_logs WHERE user_id = ? AND created_at >= ? AND created_at < ?`, "alice", 1, 2).Scan(&id, &parent, &unused, &detail)
+	if err != nil || !strings.Contains(detail, "idx_traffic_logs_user_created_at") {
+		t.Fatalf("monthly query must use the user/time index after upgrade: %q, err=%v", detail, err)
+	}
+}
 
 func TestSQLiteStore_FlushAndQuery(t *testing.T) {
 	dbPath := t.TempDir() + "/test.db"

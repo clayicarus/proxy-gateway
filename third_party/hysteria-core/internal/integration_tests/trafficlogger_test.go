@@ -1,6 +1,7 @@
 package integration_tests
 
 import (
+	"context"
 	"io"
 	"sync"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 
 	"github.com/apernet/hysteria/core/v2/client"
 	"github.com/apernet/hysteria/core/v2/internal/integration_tests/mocks"
@@ -32,7 +34,13 @@ func TestClientServerTrafficLoggerTCP(t *testing.T) {
 		TrafficLogger: trafficLogger,
 	})
 	assert.NoError(t, err)
-	defer s.Close()
+	defer func() {
+		assert.NoError(t, s.Close())
+		// Close initiates shutdown; Wait includes the final offline callback.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		assert.NoError(t, s.Wait(ctx))
+	}()
 	go s.Serve()
 
 	// Create client
@@ -77,12 +85,19 @@ func TestClientServerTrafficLoggerTCP(t *testing.T) {
 	assert.Equal(t, "knock knock", string(buf[:n]))
 
 	// Client writes to server
-	trafficLogger.EXPECT().LogTraffic("nobody", uint64(12), uint64(0)).Return(true).Once()
+	uploadLogged := make(chan struct{})
+	trafficLogger.EXPECT().LogTraffic("nobody", uint64(12), uint64(0)).Run(func(string, uint64, uint64) {
+		close(uploadLogged)
+	}).Return(true).Once()
 	sobConn.EXPECT().Write([]byte("who is there")).Return(12, nil).Once()
 	n, err = conn.Write([]byte("who is there"))
 	assert.NoError(t, err)
 	assert.Equal(t, 12, n)
-	time.Sleep(1 * time.Second) // Need some time for the server to receive the data
+	select {
+	case <-uploadLogged:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "server did not log the client upload")
+	}
 
 	// Client reads from server again but blocked
 	trafficLogger.EXPECT().UntraceStream(mock.Anything).Return().Once()
@@ -116,7 +131,13 @@ func TestClientServerTrafficLoggerUDP(t *testing.T) {
 		TrafficLogger: trafficLogger,
 	})
 	assert.NoError(t, err)
-	defer s.Close()
+	defer func() {
+		assert.NoError(t, s.Close())
+		// Close initiates shutdown; Wait includes the final offline callback.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		assert.NoError(t, s.Wait(ctx))
+	}()
 	go s.Serve()
 
 	// Create client
@@ -151,11 +172,18 @@ func TestClientServerTrafficLoggerUDP(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Client writes to server
-	trafficLogger.EXPECT().LogTraffic("nobody", uint64(9), uint64(0)).Return(true).Once()
+	uploadLogged := make(chan struct{})
+	trafficLogger.EXPECT().LogTraffic("nobody", uint64(9), uint64(0)).Run(func(string, uint64, uint64) {
+		close(uploadLogged)
+	}).Return(true).Once()
 	sobConn.EXPECT().WriteTo([]byte("small sad"), addr).Return(9, nil).Once()
 	err = conn.Send([]byte("small sad"), addr)
 	assert.NoError(t, err)
-	time.Sleep(1 * time.Second) // Need some time for the server to receive the data
+	select {
+	case <-uploadLogged:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "server did not log the client upload")
+	}
 
 	// Client reads from server
 	trafficLogger.EXPECT().LogTraffic("nobody", uint64(0), uint64(7)).Return(true).Once()

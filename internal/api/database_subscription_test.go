@@ -1,8 +1,11 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -46,8 +49,14 @@ func testDatabaseSubscriptionUsesRestartAppliedRoutes(t *testing.T, protocol str
 		t.Fatalf("subscription omitted applied node or live password: %s", response.Body.String())
 	}
 	proxies := decodeClientSubscription(t, response).Proxies
-	if len(proxies) != 1 || proxies[0]["type"] != protocol || proxies[0]["password"] != "alice:node1:gateway-password" {
+	if len(proxies) != 3 || proxies[0]["type"] != protocol || proxies[0]["password"] != "alice:node1:gateway-password" {
 		t.Fatal("subscription did not publish the selected protocol and node credential")
+	}
+	for _, proxy := range proxies[1:] {
+		proxy["name"] = proxies[0]["name"]
+		if !reflect.DeepEqual(proxy, proxies[0]) {
+			t.Fatal("information entry lost the authorized proxy transport or credentials")
+		}
 	}
 
 	if err := store.SaveNode("node2", config.NodeConfig{Type: "hysteria2", Alias: "Node Two", Hysteria2: &config.Hysteria2OutboundConfig{Addr: "node2.example:443", Auth: "node-password"}}, true); err != nil {
@@ -66,7 +75,7 @@ func testDatabaseSubscriptionUsesRestartAppliedRoutes(t *testing.T, protocol str
 	}
 }
 
-func TestDatabaseSubscriptionRejectsInactiveUser(t *testing.T) {
+func TestDatabaseSubscriptionDeletedAndExpiredUsers(t *testing.T) {
 	store, err := storage.NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
 	if err != nil {
 		t.Fatal(err)
@@ -94,9 +103,21 @@ func TestDatabaseSubscriptionRejectsInactiveUser(t *testing.T) {
 	}
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://sub.example/sub/subscription-token", nil))
-	if response.Code != http.StatusForbidden {
-		t.Fatalf("expired user status = %d", response.Code)
+	decoded := decodeClientSubscription(t, response)
+	if !strings.Contains(decoded.Proxies[1]["name"].(string), "已到期") {
+		t.Fatalf("expired user information = %v", decoded.Proxies[1]["name"])
 	}
+	wantUserinfo := "upload=0; download=0; expire=" + strconv.FormatInt(expired.Unix(), 10)
+	if got := response.Header().Get("Subscription-Userinfo"); got != wantUserinfo {
+		t.Fatalf("expired user header = %q, want %q", got, wantUserinfo)
+	}
+	// Expired users must retain subscription access after a Gateway restart.
+	snapshot, err := store.LoadRuntimeSnapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler = NewDatabaseSubscriptionHandler(subscriptionTestConfig(config.TrojanInboundType), store, snapshot.Users, snapshot.Nodes, zap.NewNop()).Handler()
+	decodeClientSubscription(t, requestTestSubscription(handler, "subscription-token"))
 }
 
 func TestDatabaseSubscriptionRejectsTokenOutsideSubPath(t *testing.T) {
@@ -147,8 +168,103 @@ func TestDatabaseSubscriptionEscapesYAMLSpecialCharacters(t *testing.T) {
 	if err := yaml.Unmarshal(response.Body.Bytes(), &decoded); err != nil {
 		t.Fatalf("generated subscription is invalid YAML: %v\n%s", err, response.Body.String())
 	}
-	if len(decoded.Proxies) != 1 || decoded.Proxies[0].Name != node.Alias || decoded.Proxies[0].Auth != "alice:node1:"+password {
+	if len(decoded.Proxies) != 3 || decoded.Proxies[0].Name != node.Alias || decoded.Proxies[0].Auth != "alice:node1:"+password {
 		t.Fatalf("special characters did not round trip: %#v", decoded.Proxies)
+	}
+	if decoded.Proxies[1].Name != "到期时间：长期有效" || decoded.Proxies[2].Name != "本月已用流量：0 B" {
+		t.Fatalf("subscription information proxies = %#v", decoded.Proxies[1:])
+	}
+}
+
+func TestSubscriptionMonthlyWindowAndUserIsolation(t *testing.T) {
+	cfg := subscriptionTestConfig(config.Hysteria2InboundType)
+	cfg.Timezone = "Asia/Shanghai"
+	store, _ := newSubscriptionFixture(t, cfg, []string{"direct"}, nil)
+	now := time.Date(2026, time.September, 15, 12, 0, 0, 0, time.UTC)
+	// September in UTC+8 starts on August 31 at 16:00 UTC.
+	start := time.Date(2026, time.August, 31, 16, 0, 0, 0, time.UTC)
+	end := time.Date(2026, time.September, 30, 16, 0, 0, 0, time.UTC)
+	if err := store.FlushTraffic([]storage.TrafficRecord{
+		{UserID: "alice", NodeID: "old-node", TxBytes: 100, RxBytes: 200, Timestamp: start},
+		{UserID: "alice", NodeID: "other-node", TxBytes: 10, RxBytes: 20, Timestamp: end.Add(-time.Second)},
+		{UserID: "alice", NodeID: "old-node", TxBytes: 1000, Timestamp: start.Add(-time.Second)},
+		{UserID: "alice", NodeID: "old-node", TxBytes: 2000, Timestamp: end},
+		{UserID: "alice", NodeID: "direct", TxBytes: 4000, Timestamp: now},
+		{UserID: "bob", NodeID: "old-node", TxBytes: 8000, Timestamp: now},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := NewDatabaseSubscriptionHandler(cfg, store, map[string]config.UserConfig{"alice": {Routes: []string{"direct"}}}, nil, zap.NewNop())
+	h.now = func() time.Time { return now }
+	response := requestTestSubscription(h.Handler(), "subscription-token")
+	decoded := decodeClientSubscription(t, response)
+	if decoded.Proxies[2]["name"] != "本月已用流量：4.23 KiB" {
+		t.Fatal("card usage did not include all persisted user routes")
+	}
+	if got := response.Header().Get("Subscription-Userinfo"); got != "upload=4110; download=220" {
+		t.Fatalf("current-month user usage header = %q", got)
+	}
+	h.now = func() time.Time { return end }
+	response = requestTestSubscription(h.Handler(), "subscription-token")
+	decoded = decodeClientSubscription(t, response)
+	if decoded.Proxies[2]["name"] != "本月已用流量：1.95 KiB" {
+		t.Fatalf("new-month user usage = %v", decoded.Proxies[2]["name"])
+	}
+	if got := response.Header().Get("Subscription-Userinfo"); got != "upload=2000; download=0" {
+		t.Fatalf("new-month user usage header = %q", got)
+	}
+}
+
+func TestSubscriptionInformationNamesCannotCollide(t *testing.T) {
+	for _, alias := range []string{"到期时间：长期有效", "本月已用流量：0 B"} {
+		nodes := map[string]config.NodeConfig{"node": {
+			Type: "hysteria2", Alias: alias,
+			Hysteria2: &config.Hysteria2OutboundConfig{Addr: "node.example:443", Auth: "secret"},
+		}}
+		_, handler := newSubscriptionFixture(t, subscriptionTestConfig(config.Hysteria2InboundType), []string{"node"}, nodes)
+		decoded := decodeClientSubscription(t, requestTestSubscription(handler, "subscription-token"))
+		seen := map[any]bool{}
+		for _, proxy := range decoded.Proxies {
+			if seen[proxy["name"]] {
+				t.Fatalf("duplicate proxy name: %s", proxy["name"])
+			}
+			seen[proxy["name"]] = true
+		}
+	}
+}
+
+func TestSubscriptionUsageQueryHonorsRequestCancellation(t *testing.T) {
+	_, handler := newSubscriptionFixture(t, subscriptionTestConfig(config.Hysteria2InboundType), []string{"direct"}, nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	request := httptest.NewRequest(http.MethodGet, "/sub/subscription-token", nil).WithContext(ctx)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code == http.StatusOK || strings.Contains(response.Body.String(), "test:password") || response.Header().Get("Subscription-Userinfo") != "" {
+		t.Fatal("canceled usage lookup published subscription data")
+	}
+}
+
+func TestSubscriptionExpiryDate(t *testing.T) {
+	cfg := subscriptionTestConfig(config.Hysteria2InboundType)
+	cfg.Timezone = "Asia/Shanghai"
+	store, _ := newSubscriptionFixture(t, cfg, []string{"direct"}, nil)
+	expires := time.Date(2099, time.January, 1, 18, 0, 0, 0, time.UTC)
+	if err := store.UpdateUser(storage.ManagedUserInput{Username: "alice", Password: "test:password", ExpiresAt: &expires, MonthlyBytes: 1024, Routes: []string{"direct"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FlushTraffic([]storage.TrafficRecord{{UserID: "alice", NodeID: "direct", TxBytes: 100, RxBytes: 200, Timestamp: time.Now()}}); err != nil {
+		t.Fatal(err)
+	}
+	h := NewDatabaseSubscriptionHandler(cfg, store, map[string]config.UserConfig{"alice": {Routes: []string{"direct"}}}, nil, zap.NewNop())
+	response := requestTestSubscription(h.Handler(), "subscription-token")
+	decoded := decodeClientSubscription(t, response)
+	if decoded.Proxies[1]["name"] != "到期时间：2099-01-02" {
+		t.Fatalf("expiry date = %v", decoded.Proxies[1]["name"])
+	}
+	wantUserinfo := "upload=100; download=200; total=1024; expire=" + strconv.FormatInt(expires.Unix(), 10)
+	if got := response.Header().Get("Subscription-Userinfo"); got != wantUserinfo {
+		t.Fatalf("Subscription-Userinfo = %q", got)
 	}
 }
 
@@ -226,10 +342,10 @@ func TestDatabaseSubscriptionMixedInbounds(t *testing.T) {
 	store, handler := newSubscriptionFixture(t, cfg, []string{"node1", "direct"}, nodes)
 	response := requestTestSubscription(handler, "subscription-token")
 	decoded := decodeClientSubscription(t, response)
-	if len(decoded.Proxies) != 4 {
-		t.Fatalf("proxy count = %d, want two authorized routes through two published inbounds", len(decoded.Proxies))
+	if len(decoded.Proxies) != 6 {
+		t.Fatalf("proxy count = %d, want four route entries and two information entries", len(decoded.Proxies))
 	}
-	for i, proxy := range decoded.Proxies {
+	for i, proxy := range decoded.Proxies[:4] {
 		route, alias := "node1", "Node One"
 		if i >= 2 {
 			route, alias = "direct", "direct"
@@ -250,7 +366,7 @@ func TestDatabaseSubscriptionMixedInbounds(t *testing.T) {
 			}
 		}
 	}
-	if len(decoded.ProxyGroups) != 1 || len(decoded.ProxyGroups[0].Proxies) != 5 {
+	if len(decoded.ProxyGroups) != 1 || len(decoded.ProxyGroups[0].Proxies) != 7 {
 		t.Fatal("selection group must include every proxy and local DIRECT")
 	}
 	for i, proxy := range decoded.Proxies {
@@ -258,7 +374,7 @@ func TestDatabaseSubscriptionMixedInbounds(t *testing.T) {
 			t.Fatal("selection group references the wrong proxy")
 		}
 	}
-	if decoded.ProxyGroups[0].Proxies[4] != "DIRECT" {
+	if decoded.ProxyGroups[0].Proxies[6] != "DIRECT" {
 		t.Fatal("local DIRECT option was lost")
 	}
 	if err := store.ResetUserToken("alice", "rotated-token"); err != nil {
@@ -290,13 +406,13 @@ func TestDatabaseSubscriptionUniqueNamesAndSnapshot(t *testing.T) {
 	delete(nodes, "node1")
 	response := requestTestSubscription(handler, "subscription-token")
 	decoded := decodeClientSubscription(t, response)
-	if len(decoded.Proxies) != 4 {
+	if len(decoded.Proxies) != 6 {
 		t.Fatal("node mutation changed the applied subscription snapshot")
 	}
 	seen := map[string]bool{}
 	for i, proxy := range decoded.Proxies {
 		name := proxy["name"].(string)
-		if seen[name] || !strings.Contains(name, "-trojan-") {
+		if seen[name] || (i < 4 && !strings.Contains(name, "-trojan-")) {
 			t.Fatalf("proxy name %q does not distinguish protocol and inbound", name)
 		}
 		seen[name] = true
@@ -317,7 +433,7 @@ func TestDatabaseSubscriptionReservedAliases(t *testing.T) {
 			}
 			_, handler := newSubscriptionFixture(t, subscriptionTestConfig(config.Hysteria2InboundType), []string{"node"}, nodes)
 			decoded := decodeClientSubscription(t, requestTestSubscription(handler, "subscription-token"))
-			if len(decoded.Proxies) != 1 || decoded.Proxies[0]["name"] == alias || decoded.ProxyGroups[0].Proxies[0] != decoded.Proxies[0]["name"] {
+			if len(decoded.Proxies) != 3 || decoded.Proxies[0]["name"] == alias || decoded.ProxyGroups[0].Proxies[0] != decoded.Proxies[0]["name"] {
 				t.Fatal("node alias shadows a built-in outbound or selection group")
 			}
 		})
@@ -368,7 +484,7 @@ func TestDatabaseSubscriptionMatchesWebsiteALPN(t *testing.T) {
 	}
 	_, handler := newSubscriptionFixture(t, cfg, []string{"direct"}, nil)
 	proxies := decodeClientSubscription(t, requestTestSubscription(handler, "subscription-token")).Proxies
-	if len(proxies) != 3 {
+	if len(proxies) != 5 {
 		t.Fatal("subscription did not publish all configured endpoints")
 	}
 	for i, proxy := range proxies {
