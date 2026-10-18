@@ -1,19 +1,15 @@
 package api
 
 import (
-	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/clayicarus/proxy-gateway/internal/config"
 	"github.com/clayicarus/proxy-gateway/internal/storage"
-	"github.com/clayicarus/proxy-gateway/internal/traffic"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
@@ -161,67 +157,8 @@ func TestDatabaseSubscriptionEscapesYAMLSpecialCharacters(t *testing.T) {
 	if len(decoded.Proxies) != 3 || decoded.Proxies[0].Name != node.Alias || decoded.Proxies[0].Auth != "alice:node1:"+password {
 		t.Fatalf("special characters did not round trip: %#v", decoded.Proxies)
 	}
-	if decoded.Proxies[1].Name != "有效期剩余：长期有效" || decoded.Proxies[2].Name != "本月已用流量：0 B" {
+	if decoded.Proxies[1].Name != "到期时间：长期有效" || decoded.Proxies[2].Name != "本月已用流量：0 B" {
 		t.Fatalf("subscription information proxies = %#v", decoded.Proxies[1:])
-	}
-}
-
-func TestDatabaseSubscriptionShowsExpiryAndNonDirectMonthlyUsage(t *testing.T) {
-	store, err := storage.NewSQLiteStore(t.TempDir()+"/managed.db", zap.NewNop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	node := config.NodeConfig{Type: "hysteria2", Alias: "Node One", Hysteria2: &config.Hysteria2OutboundConfig{Addr: "node1.example:443", Auth: "node-password"}}
-	if err := store.SaveNode("node1", node, true); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UTC().Truncate(time.Second)
-	expiresAt := now.Add(49 * time.Hour)
-	if err := store.CreateUser(storage.ManagedUserInput{
-		Username: "alice", Password: "gateway-password", ExpiresAt: &expiresAt,
-		MonthlyBytes: 10 * 1024, Routes: []string{"direct", "node1"},
-	}, "subscription-token"); err != nil {
-		t.Fatal(err)
-	}
-	users := map[string]config.UserConfig{"alice": {
-		Password: "gateway-password", ExpiresAt: &expiresAt,
-		MaxBytes: 10 * 1024, Routes: []string{"direct", "node1"},
-	}}
-	trafficLogger := traffic.NewTrafficLoggerWithLocation(users, store, zap.NewNop(), time.UTC)
-	if !trafficLogger.LogTraffic("alice:node1", 3*1024, 1024) {
-		t.Fatal("non-direct traffic rejected")
-	}
-	if !trafficLogger.LogTraffic("alice:direct", 10, 20) {
-		t.Fatal("direct traffic rejected")
-	}
-	cfg := subscriptionTestConfig(config.Hysteria2InboundType)
-	cfg.Timezone = "UTC"
-	handler := NewDatabaseSubscriptionHandler(cfg, store, users, map[string]config.NodeConfig{"node1": node}, zap.NewNop(), trafficLogger)
-	handler.now = func() time.Time { return now }
-
-	response := httptest.NewRecorder()
-	handler.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://sub.example/sub/subscription-token", nil))
-	if response.Code != http.StatusOK {
-		t.Fatalf("subscription status = %d: %s", response.Code, response.Body.String())
-	}
-	var decoded managedClashConfig
-	if err := yaml.Unmarshal(response.Body.Bytes(), &decoded); err != nil {
-		t.Fatal(err)
-	}
-	if len(decoded.Proxies) != 4 {
-		t.Fatalf("proxy count = %d, want 4", len(decoded.Proxies))
-	}
-	if decoded.Proxies[2].Name != "有效期剩余：3 天" || decoded.Proxies[3].Name != "本月已用流量：4.00 KB" {
-		t.Fatalf("information proxies = %#v", decoded.Proxies[2:])
-	}
-	group := decoded.ProxyGroups[0].Proxies
-	if group[2] != decoded.Proxies[2].Name || group[3] != decoded.Proxies[3].Name {
-		t.Fatalf("information proxies missing from group: %#v", group)
-	}
-	wantUserinfo := "upload=3072; download=1024; total=10240; expire=" + strconv.FormatInt(expiresAt.Unix(), 10)
-	if got := response.Header().Get("Subscription-Userinfo"); got != wantUserinfo {
-		t.Fatalf("Subscription-Userinfo = %q, want %q", got, wantUserinfo)
 	}
 }
 
@@ -247,38 +184,19 @@ func TestSubscriptionMonthlyWindowAndUserIsolation(t *testing.T) {
 	h.now = func() time.Time { return now }
 	response := requestTestSubscription(h.Handler(), "subscription-token")
 	decoded := decodeClientSubscription(t, response)
-	if got := response.Header().Get("Subscription-Userinfo"); got != "upload=110; download=220" {
-		t.Fatalf("current-month user usage = %q", got)
-	}
-	if decoded.Proxies[2]["name"] != "本月已用流量：330 B" {
-		t.Fatal("card usage did not match header")
+	if decoded.Proxies[2]["name"] != "本月已用流量：4.23 KiB" {
+		t.Fatal("card usage did not include all persisted user routes")
 	}
 	h.now = func() time.Time { return end }
 	response = requestTestSubscription(h.Handler(), "subscription-token")
-	decodeClientSubscription(t, response)
-	if got := response.Header().Get("Subscription-Userinfo"); got != "upload=2000; download=0" {
-		t.Fatalf("new-month user usage = %q", got)
-	}
-}
-
-type failedSubscriptionFlush struct{}
-
-func (failedSubscriptionFlush) FlushContext(context.Context) error {
-	return errors.New("test flush failure")
-}
-
-func TestSubscriptionDoesNotPublishStaleUsageOnFlushFailure(t *testing.T) {
-	cfg := subscriptionTestConfig(config.TrojanInboundType)
-	store, _ := newSubscriptionFixture(t, cfg, []string{"direct"}, nil)
-	h := NewDatabaseSubscriptionHandler(cfg, store, map[string]config.UserConfig{"alice": {Routes: []string{"direct"}}}, nil, zap.NewNop(), failedSubscriptionFlush{})
-	response := requestTestSubscription(h.Handler(), "subscription-token")
-	if response.Code != http.StatusServiceUnavailable || response.Header().Get("Subscription-Userinfo") != "" || strings.Contains(response.Body.String(), "test:password") {
-		t.Fatal("failed flush published usage or credentials")
+	decoded = decodeClientSubscription(t, response)
+	if decoded.Proxies[2]["name"] != "本月已用流量：1.95 KiB" {
+		t.Fatalf("new-month user usage = %v", decoded.Proxies[2]["name"])
 	}
 }
 
 func TestSubscriptionInformationNamesCannotCollide(t *testing.T) {
-	for _, alias := range []string{"有效期剩余：长期有效", "本月已用流量：0 B"} {
+	for _, alias := range []string{"到期时间：长期有效", "本月已用流量：0 B"} {
 		nodes := map[string]config.NodeConfig{"node": {
 			Type: "hysteria2", Alias: alias,
 			Hysteria2: &config.Hysteria2OutboundConfig{Addr: "node.example:443", Auth: "secret"},
@@ -295,21 +213,22 @@ func TestSubscriptionInformationNamesCannotCollide(t *testing.T) {
 	}
 }
 
-func TestSubscriptionExpiryLabels(t *testing.T) {
-	now := time.Date(2026, time.September, 18, 12, 0, 0, 0, time.UTC)
-	for _, test := range []struct {
-		remaining time.Duration
-		want      string
-	}{
-		{time.Second, "有效期剩余：1 天"},
-		{24 * time.Hour, "有效期剩余：1 天"},
-		{24*time.Hour + time.Second, "有效期剩余：2 天"},
-		{0, "有效期剩余：已到期"},
-	} {
-		expires := now.Add(test.remaining)
-		if got := subscriptionExpiryLabel(&expires, now); got != test.want {
-			t.Fatalf("expiry %s: got %q, want %q", test.remaining, got, test.want)
-		}
+func TestSubscriptionExpiryDate(t *testing.T) {
+	cfg := subscriptionTestConfig(config.Hysteria2InboundType)
+	cfg.Timezone = "Asia/Shanghai"
+	store, _ := newSubscriptionFixture(t, cfg, []string{"direct"}, nil)
+	expires := time.Date(2099, time.January, 1, 18, 0, 0, 0, time.UTC)
+	if err := store.UpdateUser(storage.ManagedUserInput{Username: "alice", Password: "test:password", ExpiresAt: &expires, MonthlyBytes: 1024, Routes: []string{"direct"}}); err != nil {
+		t.Fatal(err)
+	}
+	h := NewDatabaseSubscriptionHandler(cfg, store, map[string]config.UserConfig{"alice": {Routes: []string{"direct"}}}, nil, zap.NewNop())
+	response := requestTestSubscription(h.Handler(), "subscription-token")
+	decoded := decodeClientSubscription(t, response)
+	if decoded.Proxies[1]["name"] != "到期时间：2099-01-02" {
+		t.Fatalf("expiry date = %v", decoded.Proxies[1]["name"])
+	}
+	if got := response.Header().Get("Subscription-Userinfo"); got != "upload=0; download=0; total=1024" {
+		t.Fatalf("Subscription-Userinfo = %q", got)
 	}
 }
 
