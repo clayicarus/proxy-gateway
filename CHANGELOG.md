@@ -33,6 +33,10 @@
 
 ### Features
 
+- Admin user creation and editing support GB, MB, KB and B for monthly quotas
+  and download limits (per second), defaulting to MB. Units use powers of 1024;
+  decimal inputs round partial bytes up. Existing values render exactly in MB,
+  zero still means unlimited, and older byte-only forms remain compatible.
 - Trojan inbounds accept optional `trojan.fallback` to serve an HTTP/1.1 website
   over the same TLS listener, following official initial-request classification.
   Both the complete request structure and credentials must pass before a proxy
