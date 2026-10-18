@@ -20,11 +20,15 @@
 - [x] systemd watchdog 和优雅停机
 - [x] 节点并发预热、故障隔离、运行状态、DNS 刷新和后台退避重连
 - [x] 单元、集成、真实 Hysteria2 链路和路由并发测试
+- [x] 入站协议与策略内核重构：Hysteria2 adapter、共享 session、策略拨号、计量和生命周期
+- [x] Trojan TCP CONNECT / UDP ASSOCIATE 入站与共享额度、下载限速
+- [x] Hysteria2 / Trojan 混合订阅、Hysteria2 HTTP/3 伪装与 Trojan HTTPS 网站回退
+- [x] 管理页创建/编辑用户支持 GB、MB、KB、B 月额度及下载限速输入，默认 MB
 
 ## 近期候选
 
-- [ ] 入站协议与策略内核重构：从 master 将 Hysteria2 封装为 adapter，统一 session、策略拨号、计量和生命周期；详见 [重构提案](INBOUND_POLICY_REFACTOR.md)
-- [ ] 在策略内核稳定后，以独立 adapter 交付 Trojan TCP/UDP；`9b93d10` 仅作为实现和测试参考
+- [ ] 订阅剩余有效期与本月非 direct 用量：PR #5 已实现，尚未合入上游
+- [ ] 补齐可归属用户的协议头与失败路径计量：见 `INBOUND_REFACTOR_REVISED.md` 的 TODO-TRAFFIC-01
 - [ ] 流量明细保留策略：把历史 `traffic_logs` 聚合为日桶并删除过细记录
 - [ ] 数据库备份、恢复和完整性检查操作手册
 - [ ] 审计日志：记录管理员写操作，不记录用户明文密码或订阅 token

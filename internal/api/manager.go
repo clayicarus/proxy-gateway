@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -155,7 +154,8 @@ func NewManager(cfg *config.Config, store *storage.SQLiteStore, trafficLogger *t
 		m.connections = trackers[0]
 	}
 	m.tmpl = template.Must(template.New("dashboard").Funcs(template.FuncMap{
-		"bytes": formatBytes,
+		"bytes":     formatBytes,
+		"megabytes": formatMegabytes,
 		"date": func(value *time.Time) string {
 			if value == nil {
 				return "never"
@@ -691,11 +691,11 @@ func (m *Manager) userAction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) userInputFromForm(r *http.Request, password string) (storage.ManagedUserInput, error) {
-	monthly, err := parseUint(r.Form.Get("monthly_bytes"))
+	monthly, err := parseByteQuantity(r.Form.Get("monthly_bytes"), r.Form.Get("monthly_bytes_unit"))
 	if err != nil {
 		return storage.ManagedUserInput{}, fmt.Errorf("monthly bytes: %w", err)
 	}
-	speed, err := parseUint(r.Form.Get("download_speed"))
+	speed, err := parseByteQuantity(r.Form.Get("download_speed"), r.Form.Get("download_speed_unit"))
 	if err != nil {
 		return storage.ManagedUserInput{}, fmt.Errorf("download speed: %w", err)
 	}
@@ -716,13 +716,6 @@ func (m *Manager) userInputFromForm(r *http.Request, password string) (storage.M
 		DownloadSpeed: speed,
 		Routes:        r.Form["routes"],
 	}, nil
-}
-
-func parseUint(value string) (uint64, error) {
-	if value == "" {
-		return 0, nil
-	}
-	return strconv.ParseUint(value, 10, 64)
 }
 
 func (m *Manager) saveNode(w http.ResponseWriter, r *http.Request) {
